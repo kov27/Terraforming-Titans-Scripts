@@ -18,6 +18,120 @@
 
 (function () {
   'use strict';
+// ===================== TT Shared Runtime (cross-script contract) =====================
+// Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
+// Persists masterEnabled via localStorage key: tt.masterEnabled
+const TT = (() => {
+  const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  const LS = (() => {
+    try { return W.localStorage; } catch { return null; }
+  })();
+
+  const scriptName =
+    (typeof GM_info !== 'undefined' && GM_info?.script?.name) ? GM_info.script.name :
+    'TT-Script';
+
+  const shared = W.__TT_SHARED__ || (W.__TT_SHARED__ = {
+    masterEnabled: true,
+    pauseUntil: 0,
+    locks: {},        // { [name]: { owner, expiresAt } }
+    lastAction: '',   // string
+    lastError: '',    // string
+  });
+
+  // Load persisted masterEnabled once (best-effort)
+  if (LS && LS.getItem('tt.masterEnabled') != null) {
+    shared.masterEnabled = LS.getItem('tt.masterEnabled') === '1';
+  }
+
+  function setMasterEnabled(enabled) {
+    shared.masterEnabled = !!enabled;
+    if (LS) LS.setItem('tt.masterEnabled', shared.masterEnabled ? '1' : '0');
+    note(`MASTER ${shared.masterEnabled ? 'ON' : 'OFF'}`);
+  }
+
+  function isPaused() {
+    return Date.now() < (shared.pauseUntil || 0);
+  }
+
+  function pause(ms, reason = '') {
+    const until = Date.now() + Math.max(0, ms | 0);
+    shared.pauseUntil = Math.max(shared.pauseUntil || 0, until);
+    note(`PAUSE ${ms}ms${reason ? `: ${reason}` : ''}`);
+  }
+
+  function note(msg) {
+    const line = `[${new Date().toISOString()}] ${scriptName}: ${msg}`;
+    shared.lastAction = line;
+    // Keep console noise low; comment out if you want it quieter.
+    console.debug(line);
+  }
+
+  function error(msg, err) {
+    const line = `[${new Date().toISOString()}] ${scriptName}: ERROR ${msg}${err ? ` | ${String(err)}` : ''}`;
+    shared.lastError = line;
+    console.warn(line);
+  }
+
+  // Best-effort lock with TTL. Prevents two scripts changing the same subsystem simultaneously.
+  function tryLock(name, ttlMs = 4000) {
+    const now = Date.now();
+    const lock = shared.locks[name];
+    if (lock && lock.expiresAt > now && lock.owner !== scriptName) return false;
+
+    shared.locks[name] = { owner: scriptName, expiresAt: now + Math.max(250, ttlMs | 0) };
+    return true;
+  }
+
+  function unlock(name) {
+    const lock = shared.locks[name];
+    if (lock && lock.owner === scriptName) delete shared.locks[name];
+  }
+
+  function shouldRun() {
+    return !!shared.masterEnabled && !isPaused();
+  }
+
+  // Convenience wrapper: runs fn only if enabled+not paused+lock acquired.
+  function runExclusive(lockName, ttlMs, fn) {
+    if (!shouldRun()) return false;
+    if (!tryLock(lockName, ttlMs)) return false;
+
+    try {
+      fn();
+      return true;
+    } catch (e) {
+      error(`runExclusive(${lockName})`, e);
+      // Auto-pause briefly on repeated failures to avoid runaway loops
+      pause(2000, `exception in ${lockName}`);
+      return false;
+    } finally {
+      unlock(lockName);
+    }
+  }
+
+  // Optional: quick console helpers
+  W.__TT = {
+    shared,
+    setMasterEnabled,
+    pause,
+  };
+
+  return {
+    shared,
+    scriptName,
+    setMasterEnabled,
+    isPaused,
+    pause,
+    note,
+    error,
+    tryLock,
+    unlock,
+    shouldRun,
+    runExclusive,
+  };
+})();
+// ===================== /TT Shared Runtime =====================
 
   /**
    * MAINTENANCE NOTES (for ChatGPT / future automated edits)
