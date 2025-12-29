@@ -1,12 +1,14 @@
 // ==UserScript==
-// @name         Terraforming Titans Worker Allocator (Dock + Modes + Market)
-// @namespace    tt-scripts
-// @version      2.0.0
-// @description  Worker allocation with On/Balance/Off modes + Market Buy/Sell + left dock UI.
-// @author       you
+// @name         Terraforming Titans Worker Allocator (Resources + Market + Left Dock)
+// @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
+// @version      2.0.1
+// @description  Resource-centric worker allocation + smarter Galactic Market buy/sell + left hover dock that resizes the game (no overlay covering).
+// @author       kov27 (modified by ChatGPT)
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
+// @match        https://*.hwcdn.net/html/*/index.html
+// @run-at       document-idle
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -15,299 +17,404 @@
 (function () {
   'use strict';
 
-  // ---------------- Storage ----------------
-  const STORE_PREFIX = 'ttwa_v2__';
+  // -------------------- Shared Runtime (compatible with kov27 scripts) --------------------
+  const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  const TT = (() => {
+    const LS = (() => { try { return W.localStorage; } catch { return null; } })();
+    const shared = W.__TT_SHARED__ || (W.__TT_SHARED__ = {
+      masterEnabled: true,
+      pauseUntil: 0,
+      locks: {},
+      lastAction: '',
+      lastError: '',
+    });
+    function now() { return Date.now(); }
+    function isPaused() { return now() < (shared.pauseUntil || 0); }
+    function setPaused(ms, reason) { shared.pauseUntil = now() + Math.max(0, ms|0); shared.lastAction = `paused:${reason||''}`; }
+    function setError(msg) { shared.lastError = String(msg||''); }
+    function isMasterEnabled() {
+      if (!LS) return shared.masterEnabled !== false;
+      const v = LS.getItem('tt.masterEnabled');
+      if (v === null) return shared.masterEnabled !== false;
+      return v !== '0';
+    }
+    return { shared, isPaused, setPaused, setError, isMasterEnabled };
+  })();
+
+  // -------------------- Storage --------------------
+  const STORE_KEY = 'ttwa_v2__';
   const hasGM = (typeof GM_getValue === 'function') && (typeof GM_setValue === 'function');
 
   function getVal(key, def) {
     try {
-      if (hasGM) return GM_getValue(STORE_PREFIX + key, def);
-      const raw = localStorage.getItem(STORE_PREFIX + key);
-      return raw == null ? def : JSON.parse(raw);
-    } catch (e) {
-      return def;
-    }
+      if (hasGM) return GM_getValue(STORE_KEY + key, def);
+      const raw = localStorage.getItem(STORE_KEY + key);
+      return (raw == null) ? def : JSON.parse(raw);
+    } catch { return def; }
   }
   function setVal(key, val) {
     try {
-      if (hasGM) return GM_setValue(STORE_PREFIX + key, val);
-      localStorage.setItem(STORE_PREFIX + key, JSON.stringify(val));
-    } catch (e) {}
+      if (hasGM) return GM_setValue(STORE_KEY + key, val);
+      localStorage.setItem(STORE_KEY + key, JSON.stringify(val));
+    } catch {}
   }
 
-  // ---------------- Settings ----------------
+  // -------------------- Utils --------------------
+  const SUFFIX_FMT = [[1e24,'Y'],[1e21,'Z'],[1e18,'E'],[1e15,'P'],[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']];
+  function fmtNum(x) {
+    if (!Number.isFinite(x)) return String(x);
+    const ax = Math.abs(x);
+    for (const [v,s] of SUFFIX_FMT) {
+      if (ax >= v) {
+        const d = (ax >= v * 100) ? 0 : (ax >= v * 10) ? 1 : 2;
+        return (x / v).toFixed(d) + s;
+      }
+    }
+    if (ax >= 100) return x.toFixed(0);
+    if (ax >= 10) return x.toFixed(1);
+    if (ax >= 1) return x.toFixed(2);
+    if (ax === 0) return '0';
+    return x.toExponential(3);
+  }
+  function clamp(x, a, b) {
+    const n = Number(x);
+    if (!Number.isFinite(n)) return a;
+    return Math.max(a, Math.min(b, n));
+  }
+  function toNum(x, d=0) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : d;
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function rkParts(rk){ const i=rk.indexOf(':'); return i>0 ? [rk.slice(0,i), rk.slice(i+1)] : ['','']; }
+
+  // -------------------- Defaults --------------------
   const DEFAULTS = {
-    running: false,
-    pinnedOpen: false,
-    showOnlyUnlocked: true,
-    dockCollapsedPx: 44,
-    dockExpandedPx: 320,
+    running: true,
+    pinned: false,
+    collapsedWidth: 26,
+    expandedWidth: 320,
+    tickMs: 750,
+
+    // Worker allocation
+    reserveWorkersPct: 0, // % of workerCap to keep free (0-50)
+    defaultWeight: 1,
+
+    // Market tuning
+    marketEnabled: true,
+    fundingBufferSeconds: 15,   // keep enough funds for N seconds of market spending
+    sellDrainHorizonSeconds: 120, // how quickly we're allowed to drain "excess" stock via selling
+    sellMinFill: 0.35,          // never sell below this fill if cap exists (unless cap==0)
+    sellHighFill: 0.88,         // start bleeding above this
+    sellTargetFill: 0.75,       // aim to bleed down toward this
+    buyTargetFillOnShortage: 0.35,
+    buyRefillSeconds: 20,
+    buyBufferSeconds: 30,
+    buyMaxFill: 0.60,           // buffer fill cap (avoid buying to 99% just for buffer)
   };
 
-  const state = (() => {
-    const s = getVal('settings', DEFAULTS);
-    return Object.assign({}, DEFAULTS, s || {});
-  })();
+  const settings = Object.assign({}, DEFAULTS, getVal('settings', {}));
 
-  // Per building settings: { mode:'on'|'balance'|'off', weight:number }
-  const bState = getVal('buildings', {});
-  // Per resource settings: { buy:boolean, sell:boolean }
-  const rState = getVal('resources', {});
+  // Resource config is stored per-planet (planet key) to avoid cross-planet confusion.
+  // shape: { [planetKey]: { [rk]: { mode, weight, marketBuy, marketSell, producerKey } } }
+  const cfgByPlanet = getVal('cfgByPlanet', {});
+  function saveSettings(){ setVal('settings', settings); }
+  function saveCfg(){ setVal('cfgByPlanet', cfgByPlanet); }
 
-  function saveSettings() { setVal('settings', state); }
-  function saveBState() { setVal('buildings', bState); }
-  function saveRState() { setVal('resources', rState); }
-
-  // ---------------- Helpers ----------------
-  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-  const toNum = (x, d=0) => (typeof x === 'number' && isFinite(x)) ? x : d;
-
-  function fmtNum(n) {
-    n = toNum(n, 0);
-    const abs = Math.abs(n);
-    if (abs >= 1e12) return (n/1e12).toFixed(2) + 'T';
-    if (abs >= 1e9)  return (n/1e9).toFixed(2) + 'B';
-    if (abs >= 1e6)  return (n/1e6).toFixed(2) + 'M';
-    if (abs >= 1e3)  return (n/1e3).toFixed(2) + 'K';
-    return (abs >= 10 ? n.toFixed(0) : n.toFixed(2));
+  function getPlanetCfg(planetKey){
+    const pk = planetKey || 'default';
+    if (!cfgByPlanet[pk]) cfgByPlanet[pk] = {};
+    return cfgByPlanet[pk];
   }
 
-  function resKeyLabel(rk) {
-    const parts = String(rk || '').split(':');
-    return parts.length >= 2 ? parts[1] : String(rk || '');
-  }
-
-  function parseResKey(rk) {
-    const [cat, res] = String(rk||'').split(':');
-    return { category: cat || 'colony', resource: res || rk };
-  }
-
-  // ---------------- Bridge Injection ----------------
-  function getApi() {
-    return (unsafeWindow && unsafeWindow.__TTWA_V2__) ? unsafeWindow.__TTWA_V2__ : null;
-  }
+  // -------------------- Page-context Bridge --------------------
+  const BRIDGE_NAME = '__TTWA_V2__';
 
   function injectBridge() {
-    if (getApi()) return;
+    if (W[BRIDGE_NAME]) return;
 
     const code = `
       (function(){
-        if (window.__TTWA_V2__) return;
+        if (window.${BRIDGE_NAME}) return;
 
         function safeNumber(x){ return (typeof x==='number' && isFinite(x)) ? x : 0; }
-
-        function getPath(root, path){
-          try { var cur=root; for (var i=0;i<path.length;i++){ if(!cur) return undefined; cur=cur[path[i]]; } return cur; }
-          catch(e){ return undefined; }
-        }
+        function getPath(root, path){ try{ var cur=root; for(var i=0;i<path.length;i++){ if(!cur) return undefined; cur=cur[path[i]]; } return cur; }catch(e){ return undefined; } }
 
         function effectiveWorkerNeed(b){
           try{
-            var base = safeNumber(b.workerNeed || b.workers || b.workerCost || 0);
-            if (typeof b.getEffectiveWorkerNeed === 'function') return safeNumber(b.getEffectiveWorkerNeed());
-            if (typeof b.getWorkerNeed === 'function') return safeNumber(b.getWorkerNeed());
-            // fallback: use field
-            var mult = 1;
-            if (b.workerNeedMultiplier) mult *= safeNumber(b.workerNeedMultiplier);
-            return base * mult;
+            var base=0;
+            if(b && typeof b.getTotalWorkerNeed==='function') base=safeNumber(b.getTotalWorkerNeed());
+            else base=safeNumber(b ? b.requiresWorker : 0);
+            var mult=1;
+            if(b && typeof b.getEffectiveWorkerMultiplier==='function') mult=safeNumber(b.getEffectiveWorkerMultiplier());
+            if(!mult) mult=1;
+            return base*mult;
           }catch(e){ return 0; }
         }
 
-        function computeTargetCount(b, pop, workerCap, collection) {
-          try {
-            var basis = String((b && b.autoBuildBasis) ? b.autoBuildBasis : 'population');
-            if (basis === 'max') return Infinity;
-            var base = 0;
-            if (b && typeof b.getAutoBuildBase === 'function') {
-              base = safeNumber(b.getAutoBuildBase(pop, workerCap, collection));
-            } else {
-              // best effort: workers basis uses workerCap, population basis uses pop
-              base = (basis === 'workers') ? workerCap : pop;
-            }
-            var pct = safeNumber(b.autoBuildPercent || 0);
-            return Math.ceil((pct * safeNumber(base)) / 100);
-          } catch(e) { return 0; }
+        function isNonZeroConsumptionEntry(v){
+          if(v==null) return false;
+          if(typeof v==='number') return v!==0;
+          if(typeof v==='object'){
+            if(typeof v.amount==='number') return v.amount!==0;
+            for(var k in v){ if(typeof v[k]==='number' && v[k]!==0) return true; }
+          }
+          return false;
         }
 
         function collectProducedKeys(b){
           var out=[];
-          try{
-            var prod = b && (b.production || b.produces || b.output || null);
-            if (!prod) return out;
-            // if structured like {colony:{electronics:123}}
-            for (var cat in prod){
-              var obj = prod[cat];
-              if (!obj || typeof obj!=='object') continue;
-              for (var res in obj){
-                out.push(cat+':'+res);
-              }
-            }
-          }catch(e){}
+          var prod=b&&b.production?b.production:{};
+          for(var cat in prod){
+            if(cat!=='colony' && cat!=='special') continue;
+            var obj=prod[cat];
+            if(!obj||typeof obj!=='object') continue;
+            for(var res in obj){ out.push(cat+':'+res); }
+          }
           return out;
         }
 
-        function getMarketKeysFallback(){
+        function hasExternalInputs(b){
+          var cons=b&&b.consumption?b.consumption:{};
+          for(var cat in cons){
+            if(cat==='colony'||cat==='special') continue;
+            var obj=cons[cat];
+            if(!obj||typeof obj!=='object') continue;
+            for(var res in obj){
+              if(isNonZeroConsumptionEntry(obj[res])) return true;
+            }
+          }
+          return false;
+        }
+
+        function getAutobuildAvg(cat,res){
           try{
-            var pp = (typeof projectParameters!=='undefined') ? projectParameters : null;
-            var cfg = pp && pp.galactic_market && pp.galactic_market.attributes && pp.galactic_market.attributes.resourceChoiceGainCost;
-            if (!cfg) return [];
+            if(typeof autobuildCostTracker==='undefined' || !autobuildCostTracker) return 0;
+            if(cat!=='colony') return 0;
+            if(typeof autobuildCostTracker.getAverageCost!=='function') return 0;
+            return safeNumber(autobuildCostTracker.getAverageCost(cat,res));
+          }catch(e){ return 0; }
+        }
+
+        function getResState(cat,res){
+          try{
+            var r=resources&&resources[cat]?resources[cat][res]:null;
+            if(!r) return null;
+            var prod=safeNumber(r.productionRate);
+            var cons=safeNumber(r.consumptionRate);
+            var ab=getAutobuildAvg(cat,res);
+            var net=(cat==='colony') ? (prod-cons-ab) : (prod-cons);
+            return {
+              category:cat,
+              name:res,
+              displayName:(r.displayName||res),
+              value:safeNumber(r.value),
+              cap:safeNumber(r.cap),
+              reserved:safeNumber(r.reserved),
+              prod:prod,
+              cons:cons,
+              autobuildAvg:ab,
+              net:net,
+              overflow:safeNumber(r.overflowRate),
+              unlocked:!!r.unlocked,
+              autobuildShortage:!!r.autobuildShortage,
+              automationLimited:!!r.automationLimited
+            };
+          }catch(e){ return null; }
+        }
+
+        function getMarketKeys(){
+          try{
+            var p = (typeof projectParameters!=='undefined' && projectParameters && projectParameters.galactic_market) ? projectParameters.galactic_market : null;
+            if(!p || !p.attributes || !p.attributes.resourceChoiceGainCost) return [];
             var out=[];
-            for (var cat in cfg){
-              for (var res in cfg[cat]){
-                out.push(cat+':'+res);
-              }
+            var rc = p.attributes.resourceChoiceGainCost;
+            for(var cat in rc){
+              var obj=rc[cat];
+              if(!obj||typeof obj!=='object') continue;
+              for(var res in obj){ out.push(cat+':'+res); }
             }
             return out;
           }catch(e){ return []; }
         }
 
-        function getMarketInstance(){
+        function getPlanetKey(){
           try{
-            var pm = (typeof projectManager!=='undefined') ? projectManager : null;
-            return pm && pm.projects ? pm.projects.galactic_market : null;
-          }catch(e){ return null; }
+            var sm = (typeof spaceManager!=='undefined' && spaceManager) ? spaceManager : (globalThis.spaceManager||null);
+            if(sm && typeof sm.getCurrentPlanetKey==='function') return String(sm.getCurrentPlanetKey()||'');
+            if(sm && sm.currentPlanetKey) return String(sm.currentPlanetKey||'');
+            var cp = (typeof currentPlanetParameters!=='undefined' && currentPlanetParameters) ? currentPlanetParameters : (globalThis.currentPlanetParameters||null);
+            if(cp && (cp.key||cp.planetKey)) return String(cp.key||cp.planetKey||'');
+          }catch(e){}
+          return '';
         }
 
-        window.__TTWA_V2__ = {
-          ready: function(){
-            try{
-              return (typeof buildings!=='undefined') && (typeof resources!=='undefined') && resources && resources.colony && resources.colony.workers;
-            }catch(e){ return false; }
+        function getMarket(){
+          try{
+            var pm = (typeof projectManager!=='undefined' && projectManager) ? projectManager : (globalThis.projectManager||null);
+            if(pm && pm.projects && pm.projects.galactic_market) return pm.projects.galactic_market;
+          }catch(e){}
+          return null;
+        }
+
+        window.${BRIDGE_NAME} = {
+          ready:function(){
+            try{ return (typeof buildings!=='undefined')&&(typeof resources!=='undefined')&&resources&&resources.colony&&resources.colony.workers; }catch(e){ return false; }
           },
 
-          marketInfo: function(){
-            try{
-              var market = getMarketInstance();
-              var keys=[];
-              var unlocked=false;
-              var has=false;
-              if (market){
-                has=true;
-                unlocked=!!market.unlocked;
-                var cfg = market.attributes && market.attributes.resourceChoiceGainCost;
-                if (cfg){
-                  for (var cat in cfg) for (var res in cfg[cat]) keys.push(cat+':'+res);
-                }
-              }
-              if (!keys.length) keys = getMarketKeysFallback();
-              return { ok:true, has:has, unlocked:unlocked, keys:keys };
-            }catch(e){ return { ok:false, error:String(e), keys:[] }; }
-          },
-
-          snapshot: function(){
+          snapshot:function(){
             var popV=safeNumber(getPath(resources,['colony','colonists','value']));
             var popC=safeNumber(getPath(resources,['colony','colonists','cap']));
             var workerCap=safeNumber(getPath(resources,['colony','workers','cap']));
             var workerFree=safeNumber(getPath(resources,['colony','workers','value']));
+            var fundV=safeNumber(getPath(resources,['colony','funding','value']));
+            var out={
+              planetKey:getPlanetKey(),
+              pop:popV, popCap:popC,
+              workerCap:workerCap, workerFree:workerFree,
+              funding:fundV,
+              buildings:[],
+              res:{},
+              market:{ unlocked:false, active:false, autoStart:false, keys:getMarketKeys() }
+            };
 
-            var out={ pop:popV, popCap:popC, workerCap:workerCap, workerFree:workerFree, buildings:[], res:{} };
-
-            // include market keys even if not produced by worker buildings
             var producedSet={};
-            var mi = this.marketInfo();
-            if (mi && mi.keys) mi.keys.forEach(k => producedSet[k]=true);
+            // Always include market keys + funding for UI/logic
+            var mk = out.market.keys;
+            for(var i=0;i<mk.length;i++){ producedSet[mk[i]]=true; }
+            producedSet['colony:funding']=true;
 
-            // add worker-basis buildings
             var collection=(typeof buildings!=='undefined')?buildings:{};
-            for (var key in collection){
+            for(var key in collection){
               var b=collection[key];
-              if(!b || b.isHidden) continue;
-              var eff = effectiveWorkerNeed(b);
-              if(!(eff>0)) continue; // worker-using buildings only
-
-              var prodKeys = collectProducedKeys(b);
-              for (var i=0;i<prodKeys.length;i++) producedSet[prodKeys[i]]=true;
+              if(!b) continue;
+              var eff=effectiveWorkerNeed(b);
+              if(!(eff>0)) continue;
+              var prodKeys=collectProducedKeys(b);
+              for(var j=0;j<prodKeys.length;j++){ producedSet[prodKeys[j]]=true; }
 
               out.buildings.push({
                 key:key,
-                displayName:(b.displayName || b.name || key),
+                displayName:(b.displayName||b.name||key),
                 category:(b.category||''),
                 unlocked:!!b.unlocked,
+                effNeed:eff,
                 count:safeNumber(b.count),
                 active:safeNumber(b.active),
-                effNeed:eff,
-                produces:prodKeys,
                 autoBuildEnabled:!!b.autoBuildEnabled,
-                autoActiveEnabled:!!b.autoActiveEnabled,
-                autoBuildBasis:String(b.autoBuildBasis || 'population'),
+                autoBuildBasis:String(b.autoBuildBasis||'population'),
                 autoBuildPercent:safeNumber(b.autoBuildPercent),
-                targetCount:computeTargetCount(b, popV, workerCap, collection)
+                autoActiveEnabled:!!b.autoActiveEnabled,
+                produces:prodKeys,
+                hasExternalInputs:hasExternalInputs(b)
               });
             }
 
-            // fill resource states
-            for (var rk in producedSet){
+            for(var rk in producedSet){
               if(!producedSet[rk]) continue;
               var parts=rk.split(':');
-              var cat=parts[0], res=parts[1];
-              var rObj = resources && resources[cat] ? resources[cat][res] : null;
-              if(!rObj) continue;
-              out.res[rk] = {
-                value: safeNumber(rObj.value),
-                cap: safeNumber(rObj.cap),
-                net: safeNumber(rObj.net),
-                prod: safeNumber(rObj.production),
-                cons: safeNumber(rObj.consumption)
-              };
+              var st=getResState(parts[0],parts[1]);
+              if(st) out.res[rk]=st;
             }
+
+            var m = getMarket();
+            if(m){
+              out.market.unlocked = !!m.unlocked;
+              out.market.active = !!m.isActive;
+              out.market.autoStart = !!m.autoStart;
+            }
+
+            out.buildings.sort(function(a,b){
+              var c=String(a.category||'').localeCompare(String(b.category||''));
+              if(c) return c;
+              return String(a.displayName||'').localeCompare(String(b.displayName||''));
+            });
 
             return out;
           },
 
-          applyBuildings: function(updates){
+          applyBuildings:function(updates){
             try{
               var collection=(typeof buildings!=='undefined')?buildings:{};
-              for (var key in updates){
+              for(var key in updates){
                 var u=updates[key];
                 var b=collection[key];
-                if(!b || !u) continue;
-                if (u.hasOwnProperty('autoBuildBasis')) b.autoBuildBasis = String(u.autoBuildBasis);
-                if (u.hasOwnProperty('autoBuildEnabled')) b.autoBuildEnabled = !!u.autoBuildEnabled;
-                if (u.hasOwnProperty('autoActiveEnabled')) b.autoActiveEnabled = !!u.autoActiveEnabled;
-                if (u.hasOwnProperty('autoBuildPercent')){
+                if(!b||!u) continue;
+
+                if(u.hasOwnProperty('autoBuildBasis')) b.autoBuildBasis = String(u.autoBuildBasis||'workers');
+                if(u.hasOwnProperty('autoBuildPercent')){
                   var v=Number(u.autoBuildPercent);
-                  if (isFinite(v)) b.autoBuildPercent = v;
+                  if(isFinite(v)) b.autoBuildPercent = v;
                 }
+                if(u.hasOwnProperty('autoBuildEnabled')) b.autoBuildEnabled = !!u.autoBuildEnabled;
+                if(u.hasOwnProperty('autoActiveEnabled')) b.autoActiveEnabled = !!u.autoActiveEnabled;
               }
-              return { ok:true };
-            }catch(e){ return { ok:false, error:String(e) }; }
+              return {ok:true};
+            }catch(e){ return {ok:false,error:String(e)}; }
           },
 
-          applyMarket: function(buys, sells){
+          getMarketQuotes:function(req){
             try{
-              var pm = (typeof projectManager!=='undefined') ? projectManager : null;
-              var market = getMarketInstance();
-              if (!pm || !market) return { ok:false, error:'Market not available' };
-
-              // normalize entries: {category,resource,quantity}
-              function norm(arr){
-                var out=[];
-                (arr||[]).forEach(function(x){
-                  if(!x) return;
-                  var cat=String(x.category||'colony');
-                  var res=String(x.resource||'');
-                  var qty=Math.max(0, Math.floor(Number(x.quantity)||0));
-                  if(!res || qty<=0) return;
-                  out.push({category:cat, resource:res, quantity:qty});
-                });
-                return out;
+              var m=getMarket();
+              if(!m || typeof m.getBuyPrice!=='function' || typeof m.getSellPrice!=='function') return {ok:false, error:'market unavailable'};
+              var out={ ok:true, quotes:{} };
+              var arr = (req && req.entries && Array.isArray(req.entries)) ? req.entries : [];
+              for(var i=0;i<arr.length;i++){
+                var e=arr[i]||{};
+                var cat=String(e.category||'');
+                var res=String(e.resource||'');
+                var qty=safeNumber(e.qty);
+                var key=cat+':'+res;
+                out.quotes[key]={
+                  buyPrice:safeNumber(m.getBuyPrice(cat,res)),
+                  sellPrice:safeNumber(m.getSellPrice(cat,res,qty)),
+                  saturation:safeNumber(m.getSaturationAmount(cat,res))
+                };
               }
+              return out;
+            }catch(e){ return {ok:false,error:String(e)}; }
+          },
 
-              market.buySelections = norm(buys);
-              market.sellSelections = norm(sells);
+          applyMarket:function(payload){
+            try{
+              var m=getMarket();
+              if(!m) return {ok:false, error:'market missing'};
+              var buys = payload && Array.isArray(payload.buySelections) ? payload.buySelections : [];
+              var sells = payload && Array.isArray(payload.sellSelections) ? payload.sellSelections : [];
 
-              market.autoStart = true;
-              market.isPaused = false;
+              // Normalize: {category, resource, quantity}
+              function norm(x){
+                return {
+                  category:String(x.category||''),
+                  resource:String(x.resource||''),
+                  quantity:safeNumber(x.quantity)
+                };
+              }
+              m.buySelections = buys.map(norm);
+              m.sellSelections = sells.map(norm);
 
-              if (!market.isActive) {
-                // start only if there are selections (canStart depends on that)
-                if (market.buySelections.length || market.sellSelections.length) {
-                  pm.startProject && pm.startProject('galactic_market');
+              // Ensure running if asked
+              var any = false;
+              for(var i=0;i<m.buySelections.length;i++){ if(m.buySelections[i].quantity>0){ any=true; break; } }
+              if(!any){ for(var j=0;j<m.sellSelections.length;j++){ if(m.sellSelections[j].quantity>0){ any=true; break; } } }
+
+              if(payload && payload.forceStart && any){
+                if(!m.isActive && typeof m.canStart==='function' && m.canStart()){
+                  if(typeof m.start==='function') m.start(resources);
                 }
+                // keep continuous if possible
+                m.autoStart = true;
               }
 
-              return { ok:true };
-            }catch(e){ return { ok:false, error:String(e) }; }
+              // Refresh UI if possible
+              if(typeof m.updateSelectedResources==='function') m.updateSelectedResources();
+              if(typeof m.applySelectionsToInputs==='function') m.applySelectionsToInputs();
+              if(typeof updateProjectUI==='function') updateProjectUI('galactic_market');
+
+              return {ok:true};
+            }catch(e){ return {ok:false,error:String(e)}; }
           }
         };
       })();
@@ -319,606 +426,897 @@
     s.remove();
   }
 
-  // ---------------- UI Dock ----------------
-  const ui = {};
-  const rt = { hovered:false, lastKeySig:'' };
+  function api(){ return W[BRIDGE_NAME]; }
 
-  function addStyle(css) {
-    const s = document.createElement('style');
-    s.textContent = css;
-    document.head.appendChild(s);
+  function ensureBridgeReady(){
+    injectBridge();
+    const A = api();
+    return A && typeof A.ready === 'function' && A.ready();
   }
 
-  function el(tag, attrs={}, kids=[]) {
-    const e = document.createElement(tag);
-    for (const k in attrs) {
-      if (k === 'class') e.className = attrs[k];
-      else if (k === 'text') e.textContent = attrs[k];
-      else e.setAttribute(k, attrs[k]);
+  // -------------------- UI (left hover dock) --------------------
+  const UI = {
+    root: null,
+    body: null,
+    statusLine: null,
+    resourceList: null,
+    planetKey: '',
+    rows: new Map(), // rk -> {els...}
+    lastSnapshot: null,
+  };
+
+  function applyDockLayout(open){
+    const cw = clamp(settings.collapsedWidth, 18, 80);
+    const ew = clamp(settings.expandedWidth, 220, 520);
+    const rail = open ? ew : cw;
+    document.documentElement.style.setProperty('--ttwa-rail', rail + 'px');
+
+    const gc = document.getElementById('game-container');
+    if (gc) {
+      gc.style.marginLeft = rail + 'px';
+      gc.style.width = `calc(100% - ${rail}px)`;
+      gc.style.transition = 'margin-left 140ms ease, width 140ms ease';
     }
-    (kids||[]).forEach(c => e.appendChild(c));
-    return e;
   }
 
-  function buildUI() {
-    addStyle(`
-      :root {
-        --ttwa-collapsed: ${state.dockCollapsedPx}px;
-        --ttwa-expanded: ${state.dockExpandedPx}px;
-        --ttwa-dockw: var(--ttwa-collapsed);
-      }
+  function buildUI(){
+    if (UI.root) return;
 
-      #ttwa-root {
-        position: fixed;
-        left: 0; top: 0;
-        height: 100vh;
-        width: var(--ttwa-dockw);
-        z-index: 99999;
-        font-family: system-ui, sans-serif;
-        color: #e9eef5;
-        pointer-events: auto;
+    const style = document.createElement('style');
+    style.textContent = `
+      :root{ --ttwa-rail: ${clamp(settings.collapsedWidth,18,80)}px; }
+      #ttwa2-root{
+        position:fixed; left:0; top:0; bottom:0;
+        width:${clamp(settings.expandedWidth,220,520)}px;
+        transform: translateX(calc(var(--ttwa-rail) - ${clamp(settings.expandedWidth,220,520)}px));
+        transition: transform 140ms ease;
+        z-index:999999;
+        pointer-events:auto;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       }
-
-      #ttwa-panel {
-        height: 100%;
-        background: rgba(18, 20, 26, 0.96);
-        border-right: 1px solid rgba(255,255,255,0.08);
-        box-shadow: 2px 0 14px rgba(0,0,0,0.35);
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
+      body.ttwa2-open #ttwa2-root{ transform: translateX(0); }
+      #ttwa2-panel{
+        height:100%;
+        background: rgba(18,18,22,0.94);
+        color:#eaeaf0;
+        border-right:1px solid rgba(255,255,255,0.12);
+        box-shadow: 0 0 24px rgba(0,0,0,0.35);
+        display:flex;
+        flex-direction:column;
       }
-
-      #ttwa-header {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px;
-        border-bottom: 1px solid rgba(255,255,255,0.08);
-        background: rgba(30,33,40,0.9);
+      #ttwa2-header{
+        display:flex; align-items:center; gap:8px;
+        padding:8px 10px;
+        border-bottom:1px solid rgba(255,255,255,0.10);
+        background: rgba(0,0,0,0.18);
       }
-
-      #ttwa-title {
-        font-weight: 800;
-        font-size: 12px;
-        letter-spacing: 0.2px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        flex: 1;
-      }
-
-      .ttwa-btn {
-        appearance: none;
-        border: 1px solid rgba(255,255,255,0.12);
+      #ttwa2-title{ font-weight:900; font-size:13px; letter-spacing:0.2px; }
+      #ttwa2-spacer{ flex:1; }
+      .ttwa2-btn{
+        border:1px solid rgba(255,255,255,0.14);
         background: rgba(255,255,255,0.06);
-        color: #e9eef5;
-        border-radius: 8px;
-        padding: 6px 8px;
-        font-size: 12px;
-        cursor: pointer;
+        color:#eaeaf0;
+        border-radius:8px;
+        padding:4px 8px;
+        font-size:12px;
+        cursor:pointer;
       }
-      .ttwa-btn.primary {
-        background: rgba(66, 165, 245, 0.25);
-        border-color: rgba(66, 165, 245, 0.55);
-      }
+      .ttwa2-btn.primary{ background: rgba(84,190,116,0.18); border-color: rgba(84,190,116,0.35); }
+      .ttwa2-btn.danger{ background: rgba(230,90,90,0.14); border-color: rgba(230,90,90,0.35); }
+      .ttwa2-btn.small{ padding:3px 7px; font-size:11px; border-radius:8px; }
+      .ttwa2-btn:active{ transform: translateY(1px); }
 
-      #ttwa-body {
-        flex: 1;
-        overflow: auto;
-        padding: 8px;
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-      }
-
-      .ttwa-card {
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 10px;
-        padding: 8px;
-      }
-
-      .ttwa-row {
-        display: grid;
-        grid-template-columns: 1fr auto;
-        gap: 8px;
-        align-items: center;
+      #ttwa2-body{ padding:10px; overflow:auto; display:flex; flex-direction:column; gap:10px; }
+      .ttwa2-card{ border:1px solid rgba(255,255,255,0.10); border-radius:12px; background: rgba(255,255,255,0.04); padding:10px; }
+      .ttwa2-mini{ font-size:11px; opacity:0.86; }
+      .ttwa2-muted{ opacity:0.70; }
+      .ttwa2-kv{ display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+      .ttwa2-badge{
+        display:inline-block;
+        padding:2px 6px;
+        border:1px solid rgba(255,255,255,0.14);
+        border-radius:999px;
+        font-size:11px;
+        opacity:0.92;
+        background: rgba(255,255,255,0.04);
+        margin-right:6px;
       }
 
-      .ttwa-mini { font-size: 11px; opacity: 0.85; }
-      .ttwa-muted { opacity: 0.65; }
-
-      .ttwa-resrow {
-        border-top: 1px solid rgba(255,255,255,0.06);
-        padding-top: 8px;
-        margin-top: 8px;
+      .ttwa2-reslist{ display:flex; flex-direction:column; gap:8px; }
+      .ttwa2-row{
+        border:1px solid rgba(255,255,255,0.10);
+        border-radius:12px;
+        background: rgba(0,0,0,0.10);
+        padding:8px;
+        display:flex;
+        flex-direction:column;
+        gap:8px;
       }
-
-      .ttwa-resname {
-        font-weight: 800;
-        font-size: 12px;
+      .ttwa2-topline{ display:flex; gap:8px; align-items:baseline; }
+      .ttwa2-rname{ font-weight:800; font-size:12px; flex:1; text-transform:none; }
+      .ttwa2-right{ text-align:right; }
+      .ttwa2-controls{
+        display:grid;
+        grid-template-columns: 1fr 90px 74px;
+        gap:8px;
+        align-items:center;
       }
-
-      .ttwa-sub {
-        font-size: 11px;
-        opacity: 0.7;
+      .ttwa2-subcontrols{
+        display:flex; gap:10px; align-items:center; flex-wrap:wrap;
       }
-
-      .ttwa-controls {
-        display: grid;
-        grid-template-columns: 1fr 68px;
-        gap: 6px;
-        margin-top: 6px;
+      .ttwa2-select, .ttwa2-input{
+        width:100%;
+        background: rgba(0,0,0,0.22);
+        border:1px solid rgba(255,255,255,0.14);
+        color:#eaeaf0;
+        border-radius:10px;
+        padding:5px 7px;
+        font-size:12px;
+        outline:none;
       }
-
-      select.ttwa-mode, input.ttwa-weight {
-        width: 100%;
-        box-sizing: border-box;
-        padding: 5px 6px;
-        border-radius: 8px;
-        border: 1px solid rgba(255,255,255,0.12);
-        background: rgba(0,0,0,0.25);
-        color: #e9eef5;
-        font-size: 12px;
+      .ttwa2-input{ text-align:right; }
+      .ttwa2-check{ display:flex; gap:6px; align-items:center; font-size:12px; opacity:0.92; }
+      .ttwa2-check input{ transform: translateY(1px); }
+      .ttwa2-disabled{ opacity:0.55; pointer-events:none; }
+      .ttwa2-tag{
+        font-size:11px;
+        opacity:0.75;
+        border:1px solid rgba(255,255,255,0.10);
+        padding:2px 6px;
+        border-radius:999px;
       }
+    `;
+    document.head.appendChild(style);
 
-      .ttwa-toggles {
-        display: flex;
-        gap: 10px;
-        margin-top: 6px;
-        flex-wrap: wrap;
-        font-size: 11px;
-        opacity: 0.9;
+    // Apply initial rail to game container
+    applyDockLayout(false);
+
+    const root = document.createElement('div');
+    root.id = 'ttwa2-root';
+    root.innerHTML = `
+      <div id="ttwa2-panel">
+        <div id="ttwa2-header">
+          <div id="ttwa2-title">TT Worker Allocator</div>
+          <div class="ttwa2-mini ttwa2-muted" id="ttwa2-planet" style="margin-left:6px"></div>
+          <div id="ttwa2-spacer"></div>
+          <button id="ttwa2-run" class="ttwa2-btn primary">Running</button>
+          <button id="ttwa2-pin" class="ttwa2-btn small">Pin</button>
+        </div>
+        <div id="ttwa2-body">
+          <div class="ttwa2-card">
+            <div class="ttwa2-kv"><div class="ttwa2-mini">Workers</div><div class="ttwa2-mini" id="ttwa2-workers"></div></div>
+            <div class="ttwa2-kv"><div class="ttwa2-mini">Funding</div><div class="ttwa2-mini" id="ttwa2-funding"></div></div>
+            <div class="ttwa2-mini ttwa2-muted" id="ttwa2-status" style="margin-top:6px"></div>
+          </div>
+          <div class="ttwa2-card">
+            <div style="font-weight:900; font-size:12px; margin-bottom:8px">Resources (modes + market)</div>
+            <div class="ttwa2-reslist" id="ttwa2-reslist"></div>
+          </div>
+          <div class="ttwa2-card">
+            <div style="font-weight:900; font-size:12px; margin-bottom:6px">Tuning</div>
+            <div class="ttwa2-kv ttwa2-mini"><div class="ttwa2-muted">Reserve workers</div><div><input id="ttwa2-reserve" class="ttwa2-input" type="number" min="0" max="50" step="0.5" style="width:90px" /></div></div>
+            <div class="ttwa2-kv ttwa2-mini" style="margin-top:6px"><div class="ttwa2-muted">Funding buffer (s)</div><div><input id="ttwa2-fundbuf" class="ttwa2-input" type="number" min="0" max="120" step="1" style="width:90px" /></div></div>
+          </div>
+          <div class="ttwa2-mini ttwa2-muted" style="padding:2px 2px 10px 2px">
+            Tip: Hover left edge to open. Pin keeps it open. Modes: <b>On</b>=build+activate, <b>Balance</b>=activate only, <b>Off</b>=script leaves it alone.
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(root);
+
+    UI.root = root;
+    UI.body = root.querySelector('#ttwa2-body');
+    UI.statusLine = root.querySelector('#ttwa2-status');
+    UI.resourceList = root.querySelector('#ttwa2-reslist');
+
+    const planetEl = root.querySelector('#ttwa2-planet');
+    const runBtn = root.querySelector('#ttwa2-run');
+    const pinBtn = root.querySelector('#ttwa2-pin');
+    const reserveInp = root.querySelector('#ttwa2-reserve');
+    const fundBufInp = root.querySelector('#ttwa2-fundbuf');
+
+    reserveInp.value = String(settings.reserveWorkersPct);
+    fundBufInp.value = String(settings.fundingBufferSeconds);
+
+    function refreshButtons(){
+      runBtn.textContent = settings.running ? 'Running' : 'Stopped';
+      runBtn.classList.toggle('danger', !settings.running);
+      runBtn.classList.toggle('primary', settings.running);
+
+      pinBtn.textContent = settings.pinned ? 'Unpin' : 'Pin';
+      pinBtn.classList.toggle('primary', settings.pinned);
+    }
+    refreshButtons();
+
+    runBtn.addEventListener('click', () => {
+      settings.running = !settings.running;
+      saveSettings();
+      refreshButtons();
+    });
+    pinBtn.addEventListener('click', () => {
+      settings.pinned = !settings.pinned;
+      saveSettings();
+      refreshButtons();
+      if (settings.pinned) {
+        document.body.classList.add('ttwa2-open');
+        applyDockLayout(true);
       }
-      .ttwa-toggles label { cursor:pointer; }
-
-      .ttwa-bar {
-        position: relative;
-        height: 14px;
-        border-radius: 8px;
-        background: rgba(255,255,255,0.08);
-        overflow: hidden;
-        margin-top: 6px;
-      }
-      .ttwa-barfill {
-        position: absolute;
-        left:0; top:0; bottom:0;
-        width:0%;
-        background: rgba(76, 175, 80, 0.5);
-      }
-      .ttwa-bartext {
-        position: relative;
-        z-index: 1;
-        font-size: 11px;
-        padding-left: 6px;
-        line-height: 14px;
-        white-space: nowrap;
-      }
-
-      /* Dock behavior: shift game instead of overlay */
-      #game-container {
-        margin-left: var(--ttwa-dockw) !important;
-        width: calc(100vw - var(--ttwa-dockw)) !important;
-        max-width: calc(100vw - var(--ttwa-dockw)) !important;
-      }
-      body { overflow-x: hidden !important; }
-    `);
-
-    ui.root = el('div', { id:'ttwa-root' });
-    ui.panel = el('div', { id:'ttwa-panel' });
-    ui.header = el('div', { id:'ttwa-header' });
-    ui.title = el('div', { id:'ttwa-title', text:'TTWA' });
-
-    ui.runBtn = el('button', { class:'ttwa-btn primary', text: state.running ? 'Stop' : 'Start' });
-    ui.pinBtn = el('button', { class:'ttwa-btn', text: state.pinnedOpen ? 'Unpin' : 'Pin' });
-
-    ui.header.append(ui.title, ui.runBtn, ui.pinBtn);
-
-    ui.body = el('div', { id:'ttwa-body' });
-
-    ui.statusCard = el('div', { class:'ttwa-card' });
-    ui.listCard = el('div', { class:'ttwa-card' });
-
-    ui.body.append(ui.statusCard, ui.listCard);
-
-    ui.panel.append(ui.header, ui.body);
-    ui.root.append(ui.panel);
-    document.body.appendChild(ui.root);
-
-    ui.root.addEventListener('mouseenter', () => { rt.hovered=true; updateDockWidth(); });
-    ui.root.addEventListener('mouseleave', () => { rt.hovered=false; updateDockWidth(); });
-
-    ui.runBtn.addEventListener('click', () => {
-      state.running = !state.running;
-      ui.runBtn.textContent = state.running ? 'Stop' : 'Start';
+    });
+    reserveInp.addEventListener('change', () => {
+      settings.reserveWorkersPct = clamp(reserveInp.value, 0, 50);
+      reserveInp.value = String(settings.reserveWorkersPct);
+      saveSettings();
+    });
+    fundBufInp.addEventListener('change', () => {
+      settings.fundingBufferSeconds = clamp(fundBufInp.value, 0, 120);
+      fundBufInp.value = String(settings.fundingBufferSeconds);
       saveSettings();
     });
 
-    ui.pinBtn.addEventListener('click', () => {
-      state.pinnedOpen = !state.pinnedOpen;
-      ui.pinBtn.textContent = state.pinnedOpen ? 'Unpin' : 'Pin';
-      updateDockWidth();
-      saveSettings();
+    // Hover open behavior
+    let hoverOpen = false;
+    const onOpen = () => {
+      if (settings.pinned) return;
+      if (hoverOpen) return;
+      hoverOpen = true;
+      document.body.classList.add('ttwa2-open');
+      applyDockLayout(true);
+    };
+    const onClose = () => {
+      if (settings.pinned) return;
+      if (!hoverOpen) return;
+      hoverOpen = false;
+      document.body.classList.remove('ttwa2-open');
+      applyDockLayout(false);
+    };
+
+    // Entering the rail opens; leaving the entire panel closes
+    const rail = document.createElement('div');
+    rail.style.position = 'fixed';
+    rail.style.left = '0';
+    rail.style.top = '0';
+    rail.style.bottom = '0';
+    rail.style.width = clamp(settings.collapsedWidth, 18, 80) + 'px';
+    rail.style.zIndex = '999998';
+    rail.style.background = 'transparent';
+    rail.addEventListener('mouseenter', onOpen);
+    document.body.appendChild(rail);
+
+    root.addEventListener('mouseleave', () => {
+      // allow a small grace so quick moves don't jitter
+      setTimeout(() => { if (!settings.pinned) onClose(); }, 120);
     });
+    root.addEventListener('mouseenter', onOpen);
 
-    updateDockWidth();
+    // Update planet label
+    UI.setPlanet = (pk) => { planetEl.textContent = pk ? `(${pk})` : ''; };
+    UI.refreshButtons = refreshButtons;
   }
 
-  function updateDockWidth() {
-    const expanded = state.pinnedOpen || rt.hovered;
-    const w = expanded ? state.dockExpandedPx : state.dockCollapsedPx;
-    document.documentElement.style.setProperty('--ttwa-dockw', w + 'px');
-    ui.title.textContent = expanded ? 'TT Worker Allocator' : 'TTWA';
-  }
+  function ensureResourceRow(rk, cfg, producers){
+    if (UI.rows.has(rk)) return UI.rows.get(rk);
 
-  // ---------------- Allocation Logic ----------------
-  function normalizeBuildingState(bkey) {
-    if (!bState[bkey]) bState[bkey] = {};
-    const s = bState[bkey];
-    if (!s.mode) {
-      // migration from old enabled boolean if present
-      if (s.enabled === false) s.mode = 'off';
-      else s.mode = 'on';
-    }
-    if (typeof s.weight !== 'number' || !isFinite(s.weight)) s.weight = 0;
-    // cleanup legacy
-    if ('enabled' in s) delete s.enabled;
-  }
+    const row = document.createElement('div');
+    row.className = 'ttwa2-row';
+    row.dataset.rk = rk;
 
-  function normalizeResourceState(rk) {
-    if (!rState[rk]) rState[rk] = {};
-    if (typeof rState[rk].buy !== 'boolean') rState[rk].buy = false;
-    if (typeof rState[rk].sell !== 'boolean') rState[rk].sell = false;
-  }
+    const [cat,res] = rkParts(rk);
 
-  function pickPrimaryResourceKey(b) {
-    // prefer first produced key, if any
-    const pr = (b && b.produces) ? b.produces : [];
-    return pr && pr.length ? pr[0] : '';
-  }
+    row.innerHTML = `
+      <div class="ttwa2-topline">
+        <div class="ttwa2-rname" id="n"></div>
+        <div class="ttwa2-right">
+          <div class="ttwa2-mini" id="fill"></div>
+          <div class="ttwa2-mini ttwa2-muted" id="net"></div>
+        </div>
+      </div>
+      <div class="ttwa2-controls">
+        <div>
+          <select class="ttwa2-select" id="mode">
+            <option value="off">Off</option>
+            <option value="on">On</option>
+            <option value="balance">Balance</option>
+          </select>
+        </div>
+        <div>
+          <input class="ttwa2-input" id="weight" type="number" min="0" step="0.1" />
+        </div>
+        <div class="ttwa2-mini ttwa2-muted ttwa2-right" id="producerTag"></div>
+      </div>
+      <div class="ttwa2-subcontrols" id="sub"></div>
+    `;
 
-  function computePlan(snapshot, marketKeysSet) {
-    const workerCap = toNum(snapshot.workerCap, 0);
-    const allocBuildings = snapshot.buildings.slice();
+    const els = {
+      row,
+      name: row.querySelector('#n'),
+      fill: row.querySelector('#fill'),
+      net: row.querySelector('#net'),
+      mode: row.querySelector('#mode'),
+      weight: row.querySelector('#weight'),
+      producerTag: row.querySelector('#producerTag'),
+      sub: row.querySelector('#sub'),
+      producerSel: null,
+      buyChk: null,
+      sellChk: null,
+      marketOnlyTag: null,
+    };
 
-    // reserve “off” buildings as fixed usage (based on expected active)
-    let offWorkers = 0;
-    const controlled = [];
+    UI.resourceList.appendChild(row);
 
-    for (const b of allocBuildings) {
-      normalizeBuildingState(b.key);
-      const bs = bState[b.key];
-      if (state.showOnlyUnlocked && !b.unlocked) continue;
-
-      if (bs.mode === 'off') {
-        const expectedActive = b.autoActiveEnabled ? Math.min(toNum(b.targetCount,0), toNum(b.count,0)) : toNum(b.active,0);
-        offWorkers += expectedActive * toNum(b.effNeed, 0);
-      } else {
-        controlled.push(b);
-      }
-    }
-
-    const remainder = Math.max(0, workerCap - offWorkers);
-
-    // weight distribution
-    let sumW = 0;
-    const entries = [];
-    for (const b of controlled) {
-      const bs = bState[b.key];
-      const w = Math.max(0, toNum(bs.weight, 0));
-      if (w <= 0) continue;
-      entries.push({ b, w, mode: bs.mode });
-      sumW += w;
-    }
-
-    const targetCountByKey = {};
-    const percentByKey = {};
-
-    if (sumW > 0 && remainder > 0) {
-      for (const e of entries) {
-        const b = e.b;
-        const eff = Math.max(1e-9, toNum(b.effNeed, 0));
-        const shareWorkers = remainder * (e.w / sumW);
-        let tgtCount = Math.floor(shareWorkers / eff);
-        if (e.mode === 'balance') {
-          tgtCount = Math.min(tgtCount, Math.floor(toNum(b.count, 0)));
+    // Subcontrols: Producer dropdown (if needed), Market checkboxes.
+    // Producer selector
+    const hasProducer = producers && producers.length > 0;
+    if (hasProducer) {
+      if (producers.length > 1) {
+        const sel = document.createElement('select');
+        sel.className = 'ttwa2-select';
+        sel.style.flex = '1';
+        sel.title = 'Producer building';
+        for (const b of producers) {
+          const o = document.createElement('option');
+          o.value = b.key;
+          o.textContent = b.displayName;
+          sel.appendChild(o);
         }
-        targetCountByKey[b.key] = tgtCount;
-        percentByKey[b.key] = (workerCap > 0) ? (tgtCount * 100 / workerCap) : 0;
+        els.sub.appendChild(sel);
+        els.producerSel = sel;
+      } else {
+        const tag = document.createElement('div');
+        tag.className = 'ttwa2-tag';
+        tag.textContent = producers[0].displayName;
+        // Put in same line as checkboxes
+        els.sub.appendChild(tag);
+      }
+    } else {
+      const tag = document.createElement('div');
+      tag.className = 'ttwa2-tag';
+      tag.textContent = 'Market only';
+      els.sub.appendChild(tag);
+      els.marketOnlyTag = tag;
+    }
+
+    // Market toggles
+    const buyLbl = document.createElement('label');
+    buyLbl.className = 'ttwa2-check';
+    buyLbl.innerHTML = `<input type="checkbox" /> <span>Market Buy</span>`;
+    const sellLbl = document.createElement('label');
+    sellLbl.className = 'ttwa2-check';
+    sellLbl.innerHTML = `<input type="checkbox" /> <span>Market Sell</span>`;
+    els.sub.appendChild(buyLbl);
+    els.sub.appendChild(sellLbl);
+    els.buyChk = buyLbl.querySelector('input');
+    els.sellChk = sellLbl.querySelector('input');
+
+    // Apply initial cfg values
+    els.mode.value = (cfg && cfg.mode) ? cfg.mode : 'off';
+    els.weight.value = String((cfg && typeof cfg.weight==='number') ? cfg.weight : settings.defaultWeight);
+    els.buyChk.checked = !!(cfg && cfg.marketBuy);
+    els.sellChk.checked = !!(cfg && cfg.marketSell);
+
+    // Producer select initial
+    if (els.producerSel) {
+      const pk = (cfg && cfg.producerKey) ? cfg.producerKey : producers[0].key;
+      els.producerSel.value = pk;
+    }
+
+    function persist(){
+      const planetCfg = getPlanetCfg(UI.planetKey);
+      const cur = planetCfg[rk] || {};
+      cur.mode = els.mode.value;
+      cur.weight = clamp(els.weight.value, 0, 1e9);
+      cur.marketBuy = !!els.buyChk.checked;
+      cur.marketSell = !!els.sellChk.checked;
+      if (els.producerSel) cur.producerKey = els.producerSel.value;
+      else if (hasProducer) cur.producerKey = producers[0].key;
+      planetCfg[rk] = cur;
+      saveCfg();
+    }
+
+    els.mode.addEventListener('change', () => {
+      // Off / On / Balance is already mutually exclusive via dropdown.
+      persist();
+      updateRowEnabledState(els, hasProducer);
+    });
+    els.weight.addEventListener('change', () => {
+      els.weight.value = String(clamp(els.weight.value, 0, 1e9));
+      persist();
+    });
+    els.buyChk.addEventListener('change', persist);
+    els.sellChk.addEventListener('change', persist);
+    if (els.producerSel) els.producerSel.addEventListener('change', persist);
+
+    updateRowEnabledState(els, hasProducer);
+
+    UI.rows.set(rk, els);
+    return els;
+  }
+
+  function updateRowEnabledState(els, hasProducer){
+    const mode = els.mode.value;
+    // If no producer, disable mode/weight/producer but allow market toggles.
+    if (!hasProducer) {
+      els.mode.classList.add('ttwa2-disabled');
+      els.weight.classList.add('ttwa2-disabled');
+      if (els.producerSel) els.producerSel.classList.add('ttwa2-disabled');
+      els.producerTag.textContent = '';
+      return;
+    }
+    // If producer exists, controls available; weight disabled only if Off.
+    els.mode.classList.remove('ttwa2-disabled');
+    const weightDisabled = (mode === 'off');
+    els.weight.classList.toggle('ttwa2-disabled', weightDisabled);
+    if (els.producerSel) els.producerSel.classList.remove('ttwa2-disabled');
+    els.producerTag.textContent = (mode === 'on') ? 'On' : (mode === 'balance') ? 'Balance' : 'Off';
+  }
+
+  // -------------------- Core Logic --------------------
+  function computeDesiredAutoBuildPercent(workerCap, desiredWorkers, effNeed){
+    if (!(workerCap > 0) || !(effNeed > 0) || !(desiredWorkers >= 0)) return 0;
+    const desiredCount = desiredWorkers / effNeed;
+    const pct = (desiredCount / workerCap) * 100;
+    // Percent can be tiny; keep a lot of precision.
+    return Math.max(0, pct);
+  }
+
+  function buildProducerMap(snapshot){
+    const producersByRk = new Map(); // rk -> buildings[]
+    for (const b of snapshot.buildings || []) {
+      for (const rk of (b.produces || [])) {
+        if (!producersByRk.has(rk)) producersByRk.set(rk, []);
+        producersByRk.get(rk).push(b);
+      }
+    }
+    return producersByRk;
+  }
+
+  function chooseProducer(rk, cfg, producers){
+    if (!producers || producers.length === 0) return null;
+    const want = cfg && cfg.producerKey;
+    if (want) {
+      const found = producers.find(p => p.key === want);
+      if (found) return found;
+    }
+    // Prefer the largest existing line (count), else first.
+    let best = producers[0];
+    for (const p of producers) {
+      if ((p.count||0) > (best.count||0)) best = p;
+    }
+    return best;
+  }
+
+  function updateUIFromSnapshot(snapshot){
+    UI.lastSnapshot = snapshot;
+    UI.planetKey = snapshot.planetKey || 'default';
+    UI.setPlanet && UI.setPlanet(UI.planetKey);
+
+    const workersEl = UI.root.querySelector('#ttwa2-workers');
+    const fundingEl = UI.root.querySelector('#ttwa2-funding');
+
+    const wc = toNum(snapshot.workerCap);
+    const wf = toNum(snapshot.workerFree);
+    workersEl.innerHTML = `<span class="ttwa2-badge">cap ${escapeHtml(fmtNum(wc))}</span><span class="ttwa2-badge">free ${escapeHtml(fmtNum(wf))}</span>`;
+    fundingEl.innerHTML = `<span class="ttwa2-badge">${escapeHtml(fmtNum(toNum(snapshot.funding)))}</span>`;
+
+    const planetCfg = getPlanetCfg(UI.planetKey);
+    const producersByRk = buildProducerMap(snapshot);
+
+    // Market keys define which resources we show.
+    const marketKeys = (snapshot.market && Array.isArray(snapshot.market.keys)) ? snapshot.market.keys.slice() : [];
+    marketKeys.sort((a,b)=>a.localeCompare(b));
+
+    const existing = new Set(UI.rows.keys());
+    for (const rk of marketKeys) {
+      const producers = producersByRk.get(rk) || [];
+      const cfg = planetCfg[rk] || {};
+      // ensure default weight exists once you turn it on
+      if (cfg.weight == null) cfg.weight = settings.defaultWeight;
+
+      const els = ensureResourceRow(rk, cfg, producers);
+
+      // Update producer select options if the producer set changed
+      if (els.producerSel) {
+        const existingOptions = Array.from(els.producerSel.options).map(o => o.value).join('|');
+        const newOptions = producers.map(p => p.key).join('|');
+        if (existingOptions !== newOptions) {
+          els.producerSel.innerHTML = '';
+          for (const b of producers) {
+            const o = document.createElement('option');
+            o.value = b.key;
+            o.textContent = b.displayName;
+            els.producerSel.appendChild(o);
+          }
+        }
+        const picked = (cfg.producerKey && producers.find(p => p.key === cfg.producerKey)) ? cfg.producerKey : producers[0]?.key;
+        if (picked && els.producerSel.value !== picked) els.producerSel.value = picked;
+      }
+
+      // Update labels with live resource state
+      const st = snapshot.res && snapshot.res[rk];
+      if (st) {
+        els.name.textContent = st.displayName || rk;
+        if (st.cap > 0 && Number.isFinite(st.cap)) {
+          const fill = (st.value / st.cap) * 100;
+          els.fill.textContent = `${fill.toFixed(1)}%`;
+        } else {
+          els.fill.textContent = fmtNum(st.value);
+        }
+        const net = toNum(st.net);
+        els.net.textContent = `${net>=0?'+':''}${fmtNum(net)}/s`;
+      } else {
+        els.name.textContent = rk;
+        els.fill.textContent = '';
+        els.net.textContent = '';
+      }
+
+      // Enable/disable based on producer existence
+      updateRowEnabledState(els, producers.length > 0);
+
+      existing.delete(rk);
+    }
+
+    // Remove stale rows
+    for (const rk of existing) {
+      const els = UI.rows.get(rk);
+      if (els && els.row && els.row.parentNode) els.row.parentNode.removeChild(els.row);
+      UI.rows.delete(rk);
+    }
+  }
+
+  function desiredBuyQty(st){
+    // st: resource state
+    if (!st || !st.unlocked) return 0;
+    const cap = toNum(st.cap);
+    const val = toNum(st.value);
+    const net = toNum(st.net);
+    const shortage = !!st.autobuildShortage;
+    let qty = 0;
+
+    if (cap > 0 && Number.isFinite(cap)) {
+      const fill = val / cap;
+      if (shortage) {
+        const targetFill = clamp(settings.buyTargetFillOnShortage, 0.05, 0.95);
+        const want = Math.max(0, targetFill * cap - val);
+        qty = Math.max(qty, want / Math.max(3, settings.buyRefillSeconds));
+      }
+      if (net < 0) {
+        qty = Math.max(qty, -net);
+
+        const bufferSec = Math.max(5, settings.buyBufferSeconds);
+        let desiredStock = (-net) * bufferSec;
+        const maxFill = clamp(settings.buyMaxFill, 0.1, 0.95);
+        desiredStock = Math.min(desiredStock, cap * maxFill);
+        if (val < desiredStock) {
+          qty += (desiredStock - val) / bufferSec;
+        }
+      }
+    } else {
+      if (shortage && val <= 0) qty = 1;
+      if (net < 0) qty = Math.max(qty, -net);
+    }
+
+    // clamp & sanitize
+    if (!Number.isFinite(qty) || qty < 0) qty = 0;
+    // avoid extremely noisy sub-unit buys
+    return Math.floor(qty);
+  }
+
+  function baselineSellQty(st){
+    if (!st || !st.unlocked) return 0;
+    if (st.autobuildShortage) return 0; // never sell while construction is short
+    const cap = toNum(st.cap);
+    const val = toNum(st.value);
+    const net = toNum(st.net);
+
+    let qty = 0;
+
+    // Always allow selling "surplus flow"
+    if (net > 0) qty += net;
+
+    // Bleed down if very full
+    if (cap > 0 && Number.isFinite(cap)) {
+      const fill = val / cap;
+      const high = clamp(settings.sellHighFill, 0.1, 0.99);
+      const target = clamp(settings.sellTargetFill, 0.1, 0.99);
+      const horizon = Math.max(10, settings.sellDrainHorizonSeconds);
+      if (fill > high && target < fill) {
+        qty += ((fill - target) * cap) / horizon;
       }
     }
 
-    return { workerCap, remainder, offWorkers, allocBuildings, controlled, targetCountByKey, percentByKey };
+    if (!Number.isFinite(qty) || qty < 0) qty = 0;
+    return Math.floor(qty);
   }
 
-  function applyPlan(plan) {
-    if (!state.running) return;
-    const api = getApi();
-    if (!api) return;
+  function computeMaxExtraSellRate(st){
+    if (!st || !st.unlocked) return 0;
+    if (st.autobuildShortage) return 0;
+    const cap = toNum(st.cap);
+    const val = toNum(st.value);
+    const net = toNum(st.net);
+    const horizon = Math.max(10, settings.sellDrainHorizonSeconds);
+    const minFill = clamp(settings.sellMinFill, 0, 0.95);
 
+    let drain = 0;
+    if (cap > 0 && Number.isFinite(cap)) {
+      const minStock = cap * minFill;
+      drain = Math.max(0, val - minStock) / horizon;
+    } else {
+      drain = Math.max(0, val) / horizon;
+    }
+
+    // allow selling beyond net by draining stock, but never below minFill.
+    return Math.max(0, net) + drain;
+  }
+
+  function scaleDownBuysByFunding(buys, quotes, fundingValue){
+    // Keep some buffer: totalSpendPerSec <= fundingValue / bufferSeconds.
+    const buf = Math.max(1, settings.fundingBufferSeconds);
+    const maxSpend = Math.max(0, fundingValue) / buf;
+
+    let spend = 0;
+    for (const [rk, qty] of Object.entries(buys)) {
+      if (!(qty > 0)) continue;
+      const q = quotes[rk];
+      if (!q) continue;
+      spend += qty * toNum(q.buyPrice);
+    }
+    if (spend <= maxSpend || spend <= 0) return buys;
+
+    const f = maxSpend / spend;
+    const out = {};
+    for (const [rk, qty] of Object.entries(buys)) {
+      out[rk] = Math.floor(qty * f);
+    }
+    return out;
+  }
+
+  function computeMarketPlan(snapshot, planetCfg){
+    const market = snapshot.market || {unlocked:false};
+    const enabled = settings.marketEnabled && market.unlocked;
+    if (!enabled) return { buySelections:[], sellSelections:[], debug:'' };
+
+    // Desired quantities (per second)
+    const buys = {};
+    const sells = {};
+
+    const keys = (market.keys || []).slice();
+
+    for (const rk of keys) {
+      const cfg = planetCfg[rk] || {};
+      const st = snapshot.res ? snapshot.res[rk] : null;
+      if (cfg.marketBuy) buys[rk] = desiredBuyQty(st);
+      if (cfg.marketSell) sells[rk] = baselineSellQty(st);
+    }
+
+    // Quote all involved resources
+    const quoteEntries = [];
+    for (const rk of keys) {
+      if ((buys[rk] > 0) || (sells[rk] > 0)) {
+        const [cat,res] = rkParts(rk);
+        quoteEntries.push({category:cat, resource:res, qty: Math.max(1, sells[rk]||0)});
+      }
+    }
+    const quoteResp = api().getMarketQuotes({entries: quoteEntries});
+    const quotes = (quoteResp && quoteResp.ok && quoteResp.quotes) ? quoteResp.quotes : {};
+
+    // Funding safety: scale buys by buffer
+    const fundingValue = toNum(snapshot.funding);
+    const scaledBuys = scaleDownBuysByFunding(buys, quotes, fundingValue);
+
+    // Recompute cost/revenue and then add more sells to cover if possible.
+    function totals(curBuys, curSells){
+      let cost = 0, rev = 0;
+      for (const [rk, qty] of Object.entries(curBuys)) {
+        if (!(qty>0)) continue;
+        const q = quotes[rk]; if (!q) continue;
+        cost += qty * toNum(q.buyPrice);
+      }
+      for (const [rk, qty] of Object.entries(curSells)) {
+        if (!(qty>0)) continue;
+        const q = quotes[rk]; if (!q) continue;
+        // sell price depends on qty; re-quote with current qty if needed
+        // (quotes already computed at qty), acceptable approximation.
+        rev += qty * toNum(q.sellPrice);
+      }
+      return {cost, rev};
+    }
+
+    const curSells = Object.assign({}, sells);
+    let {cost, rev} = totals(scaledBuys, curSells);
+
+    // If cost > rev, try to raise sells (prefer those with large available extra capacity).
+    let iterations = 0;
+    const sellCandidates = keys
+      .filter(rk => (planetCfg[rk] && planetCfg[rk].marketSell))
+      .map(rk => ({rk}))
+      .filter(x => snapshot.res && snapshot.res[x.rk]);
+
+    while (cost > rev && iterations < 12 && sellCandidates.length > 0) {
+      const short = cost - rev;
+
+      // Pick best candidate by (sellPrice * maxExtraRate)
+      let best = null;
+      for (const c of sellCandidates) {
+        const st = snapshot.res[c.rk];
+        if (!st || st.autobuildShortage) continue;
+
+        const maxRate = computeMaxExtraSellRate(st);
+        const cur = curSells[c.rk] || 0;
+        const extraCap = Math.max(0, maxRate - cur);
+        if (!(extraCap > 0)) continue;
+
+        const q = quotes[c.rk];
+        const price = q ? toNum(q.sellPrice) : 0;
+        const score = price * extraCap;
+        if (!best || score > best.score) best = {rk:c.rk, score, extraCap, price};
+      }
+
+      if (!best || !(best.price > 0) || !(best.extraCap > 0)) break;
+
+      const needUnits = short / best.price;
+      const add = Math.min(best.extraCap, needUnits * 1.05); // small cushion
+      curSells[best.rk] = Math.floor((curSells[best.rk] || 0) + add);
+
+      // Update that resource's sell quote for better accuracy (price changes with qty)
+      const [cat,res] = rkParts(best.rk);
+      const reQuote = api().getMarketQuotes({entries:[{category:cat, resource:res, qty: Math.max(1, curSells[best.rk])}]});
+      if (reQuote && reQuote.ok && reQuote.quotes && reQuote.quotes[best.rk]) {
+        quotes[best.rk].sellPrice = reQuote.quotes[best.rk].sellPrice;
+      }
+
+      ({cost, rev} = totals(scaledBuys, curSells));
+      iterations++;
+    }
+
+    // Build selections arrays
+    const buySelections = [];
+    const sellSelections = [];
+
+    for (const rk of keys) {
+      const [cat,res] = rkParts(rk);
+      const bq = scaledBuys[rk] || 0;
+      const sq = curSells[rk] || 0;
+      buySelections.push({category:cat, resource:res, quantity: bq});
+      sellSelections.push({category:cat, resource:res, quantity: sq});
+    }
+
+    const net = rev - cost;
+    const debug = `Market: cost ${fmtNum(cost)}/s, rev ${fmtNum(rev)}/s, net ${net>=0?'+':''}${fmtNum(net)}/s`;
+    return { buySelections, sellSelections, debug, any: (cost>0 || rev>0) };
+  }
+
+  function applyWorkerPlan(snapshot){
+    const planetCfg = getPlanetCfg(UI.planetKey);
+
+    const producersByRk = buildProducerMap(snapshot);
+    const workerCap = toNum(snapshot.workerCap);
+    if (!(workerCap > 0)) return {ok:true, changed:0};
+
+    // Allocation pool
+    const reservePct = clamp(settings.reserveWorkersPct, 0, 50) / 100;
+    const allocWorkers = workerCap * (1 - reservePct);
+
+    // Collect resources with mode On/Balance and having a producer
+    const items = [];
+    for (const [rk, cfg] of Object.entries(planetCfg)) {
+      if (!cfg) continue;
+      const mode = cfg.mode || 'off';
+      if (mode === 'off') continue;
+      const producers = producersByRk.get(rk) || [];
+      if (!producers.length) continue;
+      const prod = chooseProducer(rk, cfg, producers);
+      if (!prod) continue;
+      const weight = Math.max(0, toNum(cfg.weight, settings.defaultWeight));
+      items.push({rk, cfg, mode, weight, prod});
+    }
+
+    // If nothing enabled, do nothing.
+    if (!items.length) return {ok:true, changed:0};
+
+    let sumW = items.reduce((a,x)=>a + x.weight, 0);
+    if (!(sumW > 0)) sumW = items.length;
+
+    // Build updates for buildings
     const updates = {};
-    for (const b of plan.controlled) {
-      normalizeBuildingState(b.key);
-      const bs = bState[b.key];
-      if (bs.mode === 'off') continue;
 
-      const pct = toNum(plan.percentByKey[b.key], 0);
-
-      updates[b.key] = {
+    for (const it of items) {
+      const share = (it.weight > 0 ? it.weight : 1) / sumW;
+      const desiredWorkers = allocWorkers * share;
+      const pct = computeDesiredAutoBuildPercent(workerCap, desiredWorkers, toNum(it.prod.effNeed));
+      updates[it.prod.key] = {
         autoBuildBasis: 'workers',
         autoBuildPercent: pct,
         autoActiveEnabled: true,
-        autoBuildEnabled: (bs.mode === 'on')
+        autoBuildEnabled: (it.mode === 'on')
       };
     }
 
-    const keys = Object.keys(updates);
-    if (!keys.length) return;
-
-    const res = api.applyBuildings(updates);
-    if (res && res.ok === false) {
-      // fail-safe: stop running if apply fails
-      state.running = false;
-      saveSettings();
-      ui.runBtn.textContent = 'Start';
+    // Also handle Off: if a cfg row is explicitly off AND it has a producer, turn off automation for that producer,
+    // but only if that producer is selected for that resource. This prevents leaving stale flags behind.
+    for (const [rk, cfg] of Object.entries(planetCfg)) {
+      if (!cfg) continue;
+      const mode = cfg.mode || 'off';
+      if (mode !== 'off') continue;
+      const producers = producersByRk.get(rk) || [];
+      if (!producers.length) continue;
+      const prod = chooseProducer(rk, cfg, producers);
+      if (!prod) continue;
+      // Only disable if we previously controlled it (basis workers or auto flags on). Safe but conservative.
+      if (prod.autoBuildBasis === 'workers' || prod.autoBuildEnabled || prod.autoActiveEnabled) {
+        updates[prod.key] = Object.assign(updates[prod.key] || {}, {
+          autoActiveEnabled: false,
+          autoBuildEnabled: false
+        });
+      }
     }
+
+    const resp = api().applyBuildings(updates);
+    if (!resp || !resp.ok) {
+      TT.setError(resp ? resp.error : 'applyBuildings failed');
+      return {ok:false, error: resp ? resp.error : 'applyBuildings failed'};
+    }
+    return {ok:true, changed:Object.keys(updates).length};
   }
 
-  // ---------------- Market Logic ----------------
-  function applyMarket(snapshot, marketKeys) {
-    if (!state.running) return;
-    const api = getApi();
-    if (!api) return;
+  function applyMarketPlan(snapshot){
+    const planetCfg = getPlanetCfg(UI.planetKey);
+    const plan = computeMarketPlan(snapshot, planetCfg);
 
-    // Build buy/sell selection arrays (rates per second)
-    const buyMap = new Map();
-    const sellMap = new Map();
-
-    for (const rk of marketKeys) {
-      normalizeResourceState(rk);
-      const cfg = rState[rk];
-      if (!cfg.buy && !cfg.sell) continue;
-
-      const st = snapshot.res ? snapshot.res[rk] : null;
-      if (!st) continue;
-
-      const cap = toNum(st.cap, 0);
-      const val = toNum(st.value, 0);
-      const net = toNum(st.net, 0);
-      const fill = (cap > 0) ? (val / cap) : 0;
-
-      let buyRate = 0;
-      let sellRate = 0;
-
-      if (cfg.buy) {
-        // buy if net negative or buffer low (<30%)
-        const deficit = Math.max(0, -net);
-        const bufferTarget = 0.30;
-        const refill = (cap > 0 && fill < bufferTarget) ? ((bufferTarget - fill) * cap / 180) : 0; // refill in ~3 min
-        buyRate = deficit + refill;
-      }
-
-      if (cfg.sell) {
-        // keep under 90%
-        const sellTarget = 0.90;
-        const excess = (cap > 0 && fill > sellTarget) ? ((fill - sellTarget) * cap) : 0;
-        const bleed = (excess > 0) ? (excess / 180) : 0; // drain in ~3 min
-        sellRate = Math.max(0, net) + bleed;
-      }
-
-      // avoid simultaneous buy+sell insanity (prefer buy when starving)
-      if (buyRate > 0 && sellRate > 0) {
-        if (net < 0 || fill < 0.6) sellRate = 0;
-        else buyRate = 0;
-      }
-
-      const pr = parseResKey(rk);
-      if (buyRate > 0) buyMap.set(rk, { category: pr.category, resource: pr.resource, quantity: Math.floor(buyRate) });
-      if (sellRate > 0) sellMap.set(rk, { category: pr.category, resource: pr.resource, quantity: Math.floor(sellRate) });
+    if (UI.statusLine) {
+      UI.statusLine.textContent = plan.debug || '';
     }
 
-    const buys = Array.from(buyMap.values()).filter(x => x.quantity > 0);
-    const sells = Array.from(sellMap.values()).filter(x => x.quantity > 0);
+    if (!settings.running) return {ok:true};
+    if (!settings.marketEnabled) return {ok:true};
+    if (!snapshot.market || !snapshot.market.unlocked) return {ok:true};
 
-    api.applyMarket(buys, sells);
-  }
-
-  // ---------------- UI Row Rendering ----------------
-  function ensureRows(snapshot, marketKeys) {
-    const alloc = snapshot.buildings || [];
-
-    // Map resource -> building (first match)
-    const resToBuilding = {};
-    const miscBuildings = [];
-
-    for (const b of alloc) {
-      normalizeBuildingState(b.key);
-      if (state.showOnlyUnlocked && !b.unlocked) continue;
-
-      const rk = pickPrimaryResourceKey(b);
-      if (rk) {
-        if (!resToBuilding[rk]) resToBuilding[rk] = b;
-      } else {
-        miscBuildings.push(b);
-      }
-    }
-
-    // Include market resources as main list
-    const allResKeys = Array.from(new Set([...(marketKeys||[]), ...Object.keys(resToBuilding)]));
-    allResKeys.sort();
-
-    const sig = JSON.stringify({ res: allResKeys, misc: miscBuildings.map(b=>b.key).sort() });
-    if (sig === rt.lastKeySig) return;
-    rt.lastKeySig = sig;
-
-    ui.listCard.innerHTML = '';
-
-    const title = el('div', { class:'ttwa-mini ttwa-muted', text:'Resources (modes + market)' });
-    ui.listCard.appendChild(title);
-
-    allResKeys.forEach(rk => {
-      normalizeResourceState(rk);
-      const b = resToBuilding[rk] || null;
-      const row = el('div', { class:'ttwa-resrow', 'data-rk': rk, 'data-bkey': b ? b.key : '' });
-
-      const top = el('div', { class:'ttwa-row' }, [
-        el('div', { class:'ttwa-resname', text: resKeyLabel(rk) }),
-        el('div', { class:'ttwa-mini ttwa-muted', text: b ? b.displayName : 'Market only' })
-      ]);
-
-      row.appendChild(top);
-
-      const st = snapshot.res ? snapshot.res[rk] : null;
-      const cap = st ? toNum(st.cap,0) : 0;
-      const val = st ? toNum(st.value,0) : 0;
-      const net = st ? toNum(st.net,0) : 0;
-      const fill = cap > 0 ? clamp(val/cap, 0, 1) : 0;
-
-      const bar = el('div', { class:'ttwa-bar' }, [
-        el('div', { class:'ttwa-barfill' }),
-        el('div', { class:'ttwa-bartext', text: cap>0 ? `${(fill*100).toFixed(1)}% · net ${fmtNum(net)}/s` : `net ${fmtNum(net)}/s` })
-      ]);
-      row.appendChild(bar);
-
-      const controls = el('div', { class:'ttwa-controls' });
-      const modeSel = el('select', { class:'ttwa-mode' });
-      ['on','balance','off'].forEach(m => {
-        const opt = el('option', { value:m, text: m[0].toUpperCase()+m.slice(1) });
-        modeSel.appendChild(opt);
-      });
-
-      const weightInp = el('input', { class:'ttwa-weight', type:'number', step:'0.1', min:'0', value:'0' });
-
-      if (!b) {
-        modeSel.disabled = true;
-        weightInp.disabled = true;
-      } else {
-        const bs = bState[b.key];
-        modeSel.value = bs.mode || 'on';
-        weightInp.value = String(toNum(bs.weight,0));
-      }
-
-      controls.append(modeSel, weightInp);
-      row.appendChild(controls);
-
-      const toggles = el('div', { class:'ttwa-toggles' });
-
-      const buyCb = el('input', { type:'checkbox' });
-      buyCb.checked = !!rState[rk].buy;
-
-      const sellCb = el('input', { type:'checkbox' });
-      sellCb.checked = !!rState[rk].sell;
-
-      toggles.append(
-        el('label', {}, [buyCb, document.createTextNode(' Market Buy')]),
-        el('label', {}, [sellCb, document.createTextNode(' Market Sell')])
-      );
-
-      row.appendChild(toggles);
-
-      modeSel.addEventListener('change', () => {
-        if (!b) return;
-        normalizeBuildingState(b.key);
-        bState[b.key].mode = modeSel.value;
-        saveBState();
-      });
-
-      weightInp.addEventListener('input', () => {
-        if (!b) return;
-        normalizeBuildingState(b.key);
-        bState[b.key].weight = Math.max(0, Number(weightInp.value)||0);
-        saveBState();
-      });
-
-      buyCb.addEventListener('change', () => {
-        normalizeResourceState(rk);
-        rState[rk].buy = buyCb.checked;
-        saveRState();
-      });
-
-      sellCb.addEventListener('change', () => {
-        normalizeResourceState(rk);
-        rState[rk].sell = sellCb.checked;
-        saveRState();
-      });
-
-      ui.listCard.appendChild(row);
+    const resp = api().applyMarket({
+      buySelections: plan.buySelections,
+      sellSelections: plan.sellSelections,
+      forceStart: !!plan.any
     });
+    if (!resp || !resp.ok) {
+      TT.setError(resp ? resp.error : 'applyMarket failed');
+      return {ok:false, error: resp ? resp.error : 'applyMarket failed'};
+    }
+    return {ok:true};
+  }
 
-    if (miscBuildings.length) {
-      ui.listCard.appendChild(el('div', { class:'ttwa-mini ttwa-muted', text:'Other worker buildings (no resource output detected)' }));
+  // -------------------- Main Loop --------------------
+  let loopTimer = null;
+  function loop(){
+    try{
+      if (!TT.isMasterEnabled()) return;
+      if (TT.isPaused()) return;
 
-      miscBuildings.forEach(b => {
-        normalizeBuildingState(b.key);
-        const row = el('div', { class:'ttwa-resrow', 'data-bkey': b.key });
+      if (!ensureBridgeReady()) return;
 
-        row.appendChild(el('div', { class:'ttwa-resname', text: b.displayName }));
-        row.appendChild(el('div', { class:'ttwa-sub', text: `key: ${b.key}` }));
+      buildUI();
 
-        const controls = el('div', { class:'ttwa-controls' });
-        const modeSel = el('select', { class:'ttwa-mode' });
-        ['on','balance','off'].forEach(m => modeSel.appendChild(el('option', { value:m, text:m[0].toUpperCase()+m.slice(1) })));
+      const snap = api().snapshot();
+      if (!snap) return;
 
-        const weightInp = el('input', { class:'ttwa-weight', type:'number', step:'0.1', min:'0' });
+      updateUIFromSnapshot(snap);
 
-        modeSel.value = bState[b.key].mode || 'on';
-        weightInp.value = String(toNum(bState[b.key].weight,0));
+      if (!settings.running) return;
 
-        modeSel.addEventListener('change', () => { bState[b.key].mode = modeSel.value; saveBState(); });
-        weightInp.addEventListener('input', () => { bState[b.key].weight = Math.max(0, Number(weightInp.value)||0); saveBState(); });
-
-        controls.append(modeSel, weightInp);
-        row.appendChild(controls);
-
-        ui.listCard.appendChild(row);
-      });
+      // Apply building plan first (affects net rates), then market.
+      applyWorkerPlan(snap);
+      applyMarketPlan(snap);
+    } catch (e) {
+      TT.setError(String(e && e.message ? e.message : e));
+      // pause briefly to avoid spam
+      TT.setPaused(2000, 'error');
     }
   }
 
-  function renderStatus(snapshot, plan, marketInfo) {
-    const workerCap = toNum(snapshot.workerCap, 0);
-    const free = toNum(snapshot.workerFree, 0);
-
-    const mi = marketInfo && marketInfo.ok ? marketInfo : null;
-    const marketText = mi
-      ? (mi.unlocked ? `Market: unlocked (${(mi.keys||[]).length} res)` : `Market: locked (${(mi.keys||[]).length} res known)`)
-      : 'Market: n/a';
-
-    ui.statusCard.innerHTML = `
-      <div class="ttwa-resname">Status</div>
-      <div class="ttwa-mini">Workers cap: <b>${fmtNum(workerCap)}</b> · free: <b>${fmtNum(free)}</b></div>
-      <div class="ttwa-mini ttwa-muted">Off-reserved: ${fmtNum(plan.offWorkers)} · remainder: ${fmtNum(plan.remainder)}</div>
-      <div class="ttwa-mini ttwa-muted">${marketText}</div>
-    `;
-  }
-
-  // ---------------- Main Loop ----------------
-  function tick() {
+  function start(){
     injectBridge();
-    const api = getApi();
-    if (!api || !api.ready || !api.ready()) return;
-
-    const marketInfo = api.marketInfo();
-    const marketKeys = (marketInfo && marketInfo.keys) ? marketInfo.keys : [];
-    const marketSet = new Set(marketKeys);
-
-    const snapshot = api.snapshot();
-    const plan = computePlan(snapshot, marketSet);
-
-    ensureRows(snapshot, marketKeys);
-    renderStatus(snapshot, plan, marketInfo);
-
-    applyPlan(plan);
-    applyMarket(snapshot, marketKeys);
-
-    updateDockWidth();
+    if (loopTimer) clearInterval(loopTimer);
+    loopTimer = setInterval(loop, clamp(settings.tickMs, 250, 5000));
+    loop();
   }
 
-  // ---------------- Boot ----------------
-  buildUI();
-  injectBridge();
-  setInterval(tick, 500);
-  tick();
-
+  start();
 })();
