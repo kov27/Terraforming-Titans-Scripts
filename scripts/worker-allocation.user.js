@@ -1,15 +1,16 @@
 // ==UserScript==
 // @name         Terraforming Titans Worker Allocator (Live + Scaled Safeguards + Max Learn) [Firefox Fixed + UI Dock]
-// @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
+// @version      1.0.1
 // @description  Worker allocator overlay + safeguards + MAX weight learning. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis buildings to realize a target allocation plan.
-// @author       Anonymous
+// @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
 // @match        https://*.hwcdn.net/html/*/index.html
-// @match        file://*/*index*.htm*
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/kov27/Terraforming-Titans-Scripts/main/scripts/worker-allocation.user.js
+// @updateURL    https://raw.githubusercontent.com/kov27/Terraforming-Titans-Scripts/main/scripts/worker-allocation.user.js
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
