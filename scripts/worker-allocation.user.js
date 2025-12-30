@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Terraforming Titans - TT Worker Allocator (Resources + Market) v3.1.0
+// @name         Terraforming Titans - TT Worker Allocator (Resources + Market) v3.1.1
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      3.1.0
+// @version      3.1.1
 // @description  Worker allocation by RESOURCE with Off/On/Balance + optional Market Buy/Sell. Only touches UNLOCKED/VISIBLE buildings. Left dock (hover expand) that RESIZES the game; no click-lock.
 // @author       ChatGPT
 // @match        https://html-classic.itch.zone/html/*/index.html
@@ -16,19 +16,17 @@
   'use strict';
 
   /**********************************************************************
-   * Fixes vs your notes:
-   * - Only considers buildings that are UNLOCKED & VISIBLE (no “recycling facility” on worlds where it's locked).
-   * - Producer dropdown finds Ore Mine / Glass Smelter / Water Pump / Vapor Collector / Ice Harvester (robust production parsing + aliases).
-   * - Weighting is stockpile-aware like v1 and allocation aims to use ALL workers (integer packing by worker-need).
-   * - UI wider, rows shorter, lighter dark background + better row separation.
-   * - Dropdown text visible (options have dark backgrounds + light text).
-   * - Resource list is only the ones we care about (no black dust/white dust/antimatter/energy).
+   * v3.1.1 UI hotfix:
+   * - The “messed up” layout in your screenshot was caused by the single-row grid
+   *   forcing the name column down to a few pixels (only 1 letter visible).
+   * - Rows are now 2-line cards:
+   *     line 1: resource name + stats (full width)
+   *     line 2: controls grid (Mode / Producer / Weight / Market)
    **********************************************************************/
 
-  const APP = 'ttwa31';
-  const STORAGE_KEY = 'ttwa31_state_v1';
+  const APP = 'ttwa311';
+  const STORAGE_KEY = 'ttwa31_state_v1'; // keep same to preserve your settings
 
-  // Only resources this allocator/market logic should care about.
   const RESOURCES = [
     { key: 'metal',       cat: 'colony',  label: 'Metal' },
     { key: 'glass',       cat: 'colony',  label: 'Glass' },
@@ -40,7 +38,6 @@
     { key: 'spaceships',  cat: 'special', label: 'Spaceships' },
   ];
   const RESOURCE_SET = new Set(RESOURCES.map(r => r.key));
-
   const MODES = { OFF: 'off', ON: 'on', BALANCE: 'balance' };
 
   const DEFAULT_STATE = {
@@ -49,12 +46,11 @@
     railWidth: 26,
     expandedWidth: 520,
 
-    // v1-ish feel: target fill influences weight strongly.
     targetFill: {
       metal: 0.70,
       glass: 0.55,
       water: 0.55,
-      food: 0.65,          // food treated “like v1”: higher target + stronger scaling
+      food: 0.65,
       components: 0.45,
       electronics: 0.35,
       androids: 0.35,
@@ -63,7 +59,7 @@
 
     resources: Object.fromEntries(RESOURCES.map(r => [r.key, {
       mode: MODES.OFF,
-      producer: '', // empty = Auto (choose best visible unlocked producer)
+      producer: '',
       weight: 1,
       marketBuy: false,
       marketSell: false,
@@ -91,7 +87,6 @@
       s.targetFill = { ...DEFAULT_STATE.targetFill, ...(parsed.targetFill || {}) };
       s.market = { ...DEFAULT_STATE.market, ...(parsed.market || {}) };
       s.resources = { ...DEFAULT_STATE.resources, ...(parsed.resources || {}) };
-
       for (const r of RESOURCES) if (!s.resources[r.key]) s.resources[r.key] = structuredClone(DEFAULT_STATE.resources[r.key]);
       return s;
     } catch {
@@ -99,36 +94,21 @@
     }
   }
 
-  function saveState() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
-  }
+  function saveState() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {} }
 
   const N = (v, d = 0) => (Number.isFinite(v) ? v : d);
   const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 
-  function gameReady() {
-    return !!(globalThis.resources && globalThis.buildings);
-  }
-
-  function getResObj(cat, key) {
-    return globalThis.resources?.[cat]?.[key] || null;
-  }
-
-  function getWorkersObj() {
-    return globalThis.resources?.colony?.workers || null;
-  }
-
-  function getFundingObj() {
-    return globalThis.resources?.colony?.funding || null;
-  }
+  function gameReady() { return !!(globalThis.resources && globalThis.buildings); }
+  function getResObj(cat, key) { return globalThis.resources?.[cat]?.[key] || null; }
+  function getWorkersObj() { return globalThis.resources?.colony?.workers || null; }
+  function getFundingObj() { return globalThis.resources?.colony?.funding || null; }
 
   function getMarketProject() {
     const pm = globalThis.projectManager;
     if (!pm) return null;
     if (pm.projects?.galactic_market) return pm.projects.galactic_market;
-    if (typeof pm.getProject === 'function') {
-      try { return pm.getProject('galactic_market'); } catch {}
-    }
+    if (typeof pm.getProject === 'function') { try { return pm.getProject('galactic_market'); } catch {} }
     const projects = pm.projects || {};
     for (const k of Object.keys(projects)) {
       const p = projects[k];
@@ -169,20 +149,14 @@
 
   function isBuildingVisibleUnlocked(b) {
     if (!b) return false;
-
-    // Hard requirement: must be unlocked on THIS world.
     const unlocked =
       (typeof b.isUnlocked === 'function') ? !!b.isUnlocked() :
       ('unlocked' in b) ? !!b.unlocked :
-      (N(b.count, 0) > 0); // fallback
-
+      (N(b.count, 0) > 0);
     if (!unlocked) return false;
 
-    // Also must be visible (not hidden / not “future tech” entry)
     if (b.isHidden) return false;
-    if (typeof b.isVisible === 'function') {
-      try { if (!b.isVisible()) return false; } catch {}
-    }
+    if (typeof b.isVisible === 'function') { try { if (!b.isVisible()) return false; } catch {} }
     return true;
   }
 
@@ -190,16 +164,7 @@
     try {
       const base =
         (typeof b.getTotalWorkerNeed === 'function') ? N(b.getTotalWorkerNeed(), 0) :
-        N(
-          b.totalWorkerNeed ??
-          b.workerNeed ??
-          b.workersRequired ??
-          b.requiresWorkers ??
-          b.requiresWorker ??
-          b.workers ??
-          0,
-          0
-        );
+        N(b.totalWorkerNeed ?? b.workerNeed ?? b.workersRequired ?? b.requiresWorkers ?? b.requiresWorker ?? b.workers ?? 0, 0);
 
       const mult =
         (typeof b.getEffectiveWorkerMultiplier === 'function') ? N(b.getEffectiveWorkerMultiplier(), 1) :
@@ -207,28 +172,17 @@
 
       const out = base * mult;
       return Number.isFinite(out) ? Math.max(0, out) : 0;
-    } catch {
-      return 0;
-    }
+    } catch { return 0; }
   }
 
-  // Robust “does this building produce resource X?” discovery:
-  // Traverses production object and collects keys matching our resources, with aliases.
   function extractProducedResourceKeys(prodObj) {
     const out = new Set();
     const seen = new Set();
 
-    const normKey = (k) => {
-      k = String(k);
-      if (k.includes(':')) k = k.split(':').pop();
-      return k.trim().toLowerCase().replace(/\s+/g, '').replace(/_/g, '');
-    };
-
-    // canonical map
+    const norm = (k) => String(k).toLowerCase().trim().replace(/\s+/g, '').replace(/_/g, '');
     const wanted = new Map();
-    for (const r of RESOURCE_SET) wanted.set(normKey(r), r);
+    for (const r of RESOURCE_SET) wanted.set(norm(r), r);
 
-    // aliases found in TT data in some builds/mods
     const alias = new Map([
       ['ore', 'metal'],
       ['iron', 'metal'],
@@ -255,7 +209,7 @@
       }
 
       for (const [k, v] of Object.entries(cur)) {
-        const nk = normKey(k);
+        const nk = norm(k);
 
         const canon = wanted.get(nk);
         if (canon) out.add(canon);
@@ -263,7 +217,6 @@
         const ali = alias.get(nk);
         if (ali && RESOURCE_SET.has(ali)) out.add(ali);
 
-        // plural fallback (e.g. "componentS")
         if (!canon && nk.endsWith('s')) {
           const sing = nk.slice(0, -1);
           const canon2 = wanted.get(sing);
@@ -273,7 +226,6 @@
         if (v && typeof v === 'object') stack.push(v);
       }
     }
-
     return [...out];
   }
 
@@ -294,9 +246,9 @@
       workersVal: 0,
       funding: { value: 0, netBaseline: 0, netTotal: 0 },
       marketUnlocked: false,
-      res: /** @type {Record<string, any>} */ ({}),
-      buildingMeta: /** @type {Record<string, any>} */ ({}),
-      producersByRes: /** @type {Record<string, string[]>} */ ({}),
+      res: {},
+      buildingMeta: {},
+      producersByRes: {},
     };
 
     const w = getWorkersObj();
@@ -335,15 +287,17 @@
       const b = buildings[id];
       if (!isBuildingVisibleUnlocked(b)) continue;
 
-      const workerNeed = getWorkerNeed(b);
       const produced = extractProducedResourceKeys(b.production || {});
+      if (!produced.length) continue;
+
       snap.buildingMeta[id] = {
         id,
         name: String(b.displayName || b.name || id),
         count: N(b.count, 0),
-        workerNeed,
+        workerNeed: getWorkerNeed(b),
         produced,
       };
+
       for (const k of produced) {
         if (!snap.producersByRes[k]) snap.producersByRes[k] = [];
         snap.producersByRes[k].push(id);
@@ -351,17 +305,12 @@
     }
 
     for (const k of Object.keys(snap.producersByRes)) {
-      snap.producersByRes[k].sort((a, b) => {
-        const an = snap.buildingMeta[a]?.name || a;
-        const bn = snap.buildingMeta[b]?.name || b;
-        return an.localeCompare(bn);
-      });
+      snap.producersByRes[k].sort((a, b) => (snap.buildingMeta[a]?.name || a).localeCompare(snap.buildingMeta[b]?.name || b));
     }
 
     return snap;
   }
 
-  // v1-ish dynamic weighting
   function dynamicWeight(resourceKey, baseWeight, rs) {
     if (!rs) return 0;
     const target = N(state.targetFill[resourceKey], 0.5);
@@ -370,7 +319,7 @@
     let f = 1;
 
     if (Number.isFinite(rs.cap) && rs.cap > 0) {
-      const diff = target - fill; // positive => need more
+      const diff = target - fill;
       if (diff >= 0) {
         const mult = (resourceKey === 'food') ? 6.0 : 5.0;
         f *= clamp(1 + diff * mult, 0.15, 6.0);
@@ -387,12 +336,11 @@
     return Math.max(0, N(baseWeight, 0)) * f;
   }
 
-  // Integer packing to use (almost) all workers
   function computeWorkerPlan(snap) {
     const Wcap = Math.floor(N(snap.workersCap, 0));
     if (Wcap <= 0) return [];
 
-    const buildingLines = new Map(); // id -> { id, mode, need, dynWeight }
+    const buildingLines = new Map();
 
     for (const r of RESOURCES) {
       const cfg = state.resources[r.key];
@@ -433,10 +381,8 @@
     if (sumW <= 0) return [];
 
     const desiredWorkers = lines.map(x => Wcap * (x.dynWeight / sumW));
-
     const counts = lines.map((x, i) => Math.max(0, Math.floor(desiredWorkers[i] / x.need)));
 
-    // Respect Balance caps
     for (let i = 0; i < counts.length; i++) {
       if (lines[i].mode !== MODES.BALANCE) continue;
       const built = Math.floor(N(snap.buildingMeta[lines[i].id]?.count, 0));
@@ -455,13 +401,11 @@
       return true;
     };
 
-    const maxIters = 5000;
     let iters = 0;
-    while (remaining > 0 && iters++ < maxIters) {
+    while (remaining > 0 && iters++ < 5000) {
       let bestIdx = -1;
       let bestScore = -Infinity;
 
-      // 1) Biggest deficit first (v1-ish balancing)
       for (let i = 0; i < lines.length; i++) {
         if (!canAdd(i)) continue;
         const alloc = counts[i] * lines[i].need;
@@ -470,7 +414,6 @@
         if (score > bestScore) { bestScore = score; bestIdx = i; }
       }
 
-      // 2) If everyone is at/over target, pack remaining into best “weight per worker”
       if (bestIdx === -1 || bestScore <= 0) {
         bestIdx = -1; bestScore = -Infinity;
         for (let i = 0; i < lines.length; i++) {
@@ -507,7 +450,6 @@
     }
   }
 
-  // Market: simple + funding-safe
   function planMarket(snap) {
     if (!state.market.enabled) return null;
     const proj = getMarketProject();
@@ -606,7 +548,6 @@
     } catch {}
   }
 
-  // UI
   let root = null;
   let closeTimer = null;
 
@@ -634,7 +575,7 @@
         --ttwa-row2:#313b4d;
         --ttwa-border:rgba(255,255,255,0.10);
         --ttwa-text:#e8edf7;
-        --ttwa-muted:rgba(232,237,247,0.72);
+        --ttwa-muted:rgba(232,237,247,0.70);
       }
       body{
         padding-left: var(--ttwa-rail) !important;
@@ -652,13 +593,20 @@
         overflow:hidden;
       }
       #${APP}-root.open{ width: var(--ttwa-wide); }
+
       #${APP}-header{
         display:flex; align-items:center; justify-content:space-between; gap:8px;
         padding:8px 10px;
         background: var(--ttwa-panel);
         border-bottom:1px solid var(--ttwa-border);
       }
-      #${APP}-title{ font-weight:800; letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      #${APP}-title{
+        font-weight:800;
+        letter-spacing:.2px;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+      }
       .ttwa-btn{
         border:1px solid var(--ttwa-border);
         background: rgba(255,255,255,0.06);
@@ -668,6 +616,7 @@
         cursor:pointer;
       }
       .ttwa-btn:hover{ background: rgba(255,255,255,0.10); }
+
       #${APP}-status{
         padding:8px 10px;
         border-bottom:1px solid var(--ttwa-border);
@@ -676,35 +625,54 @@
         display:grid;
         gap:3px;
       }
+
       #${APP}-list{
         height: calc(100vh - 88px);
         overflow:auto;
         padding:8px;
         display:flex;
         flex-direction:column;
-        gap:6px;
+        gap:7px;
       }
+
       .ttwa-row{
         border:1px solid var(--ttwa-border);
         border-radius:10px;
-        padding:6px 8px;
-        display:grid;
-        grid-template-columns: 1fr 92px 210px 62px 92px;
-        gap:6px;
-        align-items:center;
+        padding:7px 8px;
       }
       .ttwa-row:nth-child(odd){ background: var(--ttwa-row1); }
       .ttwa-row:nth-child(even){ background: var(--ttwa-row2); }
 
-      .ttwa-name{ min-width:0; }
-      .ttwa-name .label{ font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-      .ttwa-name .meta{
-        margin-top:2px;
-        color: var(--ttwa-muted);
-        font-size: 11px;
-        display:flex; gap:10px;
-        white-space:nowrap;
+      .ttwa-top{
+        display:flex;
+        align-items:baseline;
+        justify-content:space-between;
+        gap:10px;
+        min-width:0;
       }
+      .ttwa-label{
+        font-weight:900;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+      }
+      .ttwa-stats{
+        color: var(--ttwa-muted);
+        font-size:11px;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        text-align:right;
+      }
+
+      .ttwa-controls{
+        margin-top:6px;
+        display:grid;
+        grid-template-columns: 96px 1fr 66px 124px;
+        gap:6px;
+        align-items:center;
+      }
+
       .good{ color:#baf7d0; }
       .bad{ color:#ffb2b2; }
       .warn{ color:#ffe2a8; }
@@ -723,13 +691,20 @@
       input.ttwa-in{ text-align:right; }
 
       .ttwa-market{
-        display:grid;
-        grid-template-columns:1fr 1fr;
-        gap:6px;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
         font-size:11px;
         color: var(--ttwa-muted);
+        padding:0 2px;
       }
-      .ttwa-market label{ display:flex; gap:6px; align-items:center; user-select:none; white-space:nowrap; }
+      .ttwa-market label{
+        display:flex;
+        gap:6px;
+        align-items:center;
+        user-select:none;
+      }
 
       #${APP}-railTag{
         position:absolute; left:0; top:0; bottom:0;
@@ -786,6 +761,7 @@
       saveState();
       syncBtns();
     });
+
     pinBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       state.pinned = !state.pinned;
@@ -799,13 +775,13 @@
       if (closeTimer) clearTimeout(closeTimer);
       setOpen(true);
     });
+
     root.addEventListener('mouseleave', () => {
       if (state.pinned) return;
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = setTimeout(() => setOpen(false), 130);
     });
 
-    // Panic toggle: Ctrl+Shift+X
     window.addEventListener('keydown', (e) => {
       if (e.ctrlKey && e.shiftKey && (e.key === 'x' || e.key === 'X')) {
         state.enabled = !state.enabled;
@@ -819,6 +795,7 @@
 
   function render(snap) {
     if (!root) return;
+
     const status = root.querySelector(`#${APP}-status`);
     const list = root.querySelector(`#${APP}-list`);
 
@@ -829,21 +806,22 @@
 
     status.innerHTML = `
       <div>Workers: <b>${fmt(workersVal)}</b> / <b>${fmt(workersCap)}</b></div>
-      <div>Funding: <b>${fmt(funding)}</b>  <span style="opacity:.75">| Market: ${market}</span></div>
+      <div>Funding: <b>${fmt(funding)}</b> <span style="opacity:.75">| Market: ${market}</span></div>
     `;
 
     list.innerHTML = '';
+
     for (const r of RESOURCES) {
       const cfg = state.resources[r.key];
       const rs = snap?.res?.[r.key] || null;
-
       const unlocked = !!rs;
+
       const fillTxt = unlocked && Number.isFinite(rs.cap) ? `${Math.round(rs.fill * 100)}%` : '—';
       const net = unlocked ? N(rs.netBaseline, 0) : 0;
       const netCls = net < 0 ? 'bad' : (net > 0 ? 'good' : '');
-      const warn = unlocked
-        ? (rs.shortage ? '<span class="warn">shortage</span>' : (rs.limited ? '<span class="warn">limited</span>' : ''))
-        : '<span class="warn">locked</span>';
+      const flags = unlocked
+        ? (rs.shortage ? `<span class="warn">shortage</span>` : (rs.limited ? `<span class="warn">limited</span>` : ''))
+        : `<span class="warn">locked</span>`;
 
       const producers = snap?.producersByRes?.[r.key] || [];
       const nameOf = (id) => snap?.buildingMeta?.[id]?.name || id;
@@ -851,31 +829,32 @@
       const row = document.createElement('div');
       row.className = 'ttwa-row';
       row.innerHTML = `
-        <div class="ttwa-name">
-          <div class="label">${r.label}</div>
-          <div class="meta">
-            <span>Fill <b>${fillTxt}</b></span>
-            <span>Net <b class="${netCls}">${net >= 0 ? '+' : ''}${fmt(net)}/s</b></span>
-            ${warn ? `<span>${warn}</span>` : ''}
+        <div class="ttwa-top">
+          <div class="ttwa-label">${r.label}</div>
+          <div class="ttwa-stats">
+            Fill <b>${fillTxt}</b> · Net <b class="${netCls}">${net >= 0 ? '+' : ''}${fmt(net)}/s</b>
+            ${flags ? ` · ${flags}` : ''}
           </div>
         </div>
 
-        <select class="ttwa-sel" data-k="mode">
-          <option value="on">On</option>
-          <option value="balance">Balance</option>
-          <option value="off">Off</option>
-        </select>
+        <div class="ttwa-controls">
+          <select class="ttwa-sel" data-k="mode" title="Control mode">
+            <option value="on">On</option>
+            <option value="balance">Balance</option>
+            <option value="off">Off</option>
+          </select>
 
-        <select class="ttwa-sel" data-k="producer">
-          <option value="">Auto</option>
-          ${producers.map(id => `<option value="${id}">${nameOf(id)}</option>`).join('')}
-        </select>
+          <select class="ttwa-sel" data-k="producer" title="Producer building">
+            <option value="">Auto</option>
+            ${producers.map(id => `<option value="${id}">${nameOf(id)}</option>`).join('')}
+          </select>
 
-        <input class="ttwa-in" data-k="weight" type="number" min="0" max="100" step="0.25"/>
+          <input class="ttwa-in" data-k="weight" type="number" min="0" max="100" step="0.25" title="Weight"/>
 
-        <div class="ttwa-market">
-          <label title="Buy from Galactic Market when needed"><input type="checkbox" data-k="buy"/> Buy</label>
-          <label title="Sell surplus to Galactic Market"><input type="checkbox" data-k="sell"/> Sell</label>
+          <div class="ttwa-market">
+            <label title="Buy from Galactic Market when needed"><input type="checkbox" data-k="buy"/> Buy</label>
+            <label title="Sell surplus to Galactic Market"><input type="checkbox" data-k="sell"/> Sell</label>
+          </div>
         </div>
       `;
 
@@ -927,15 +906,10 @@
 
       if (!state.enabled) return;
 
-      const plan = computeWorkerPlan(snap);
-      applyWorkerPlan(plan);
-
-      if (snap.marketUnlocked) {
-        const mPlan = planMarket(snap);
-        applyMarket(mPlan);
-      }
+      applyWorkerPlan(computeWorkerPlan(snap));
+      if (snap.marketUnlocked) applyMarket(planMarket(snap));
     } catch {
-      // never lock the game on errors
+      // swallow errors - don't break the page
     }
   }
 
