@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.0.0a
+// @version      1.0.01
 // @description  Deterministic optimiser for WGC: stats, stances, difficulty, optional facilities + wgtEquipment spending.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
