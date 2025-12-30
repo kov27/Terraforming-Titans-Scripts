@@ -1,989 +1,945 @@
 // ==UserScript==
-// @name         Terraforming Titans Worker Allocator (Resources + Market) [Docked Left Popout Fix] v2.0.5
+// @name         Terraforming Titans - TT Worker Allocator (Resources + Market) v3.1.0
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      2.0.5
-// @description  Resource-centric worker allocator with Off/On/Balance + Market Buy/Sell. Docked left slide-out that RESIZES game. Fixes popout hover + avoids click-lock.
+// @version      3.1.0
+// @description  Worker allocation by RESOURCE with Off/On/Balance + optional Market Buy/Sell. Only touches UNLOCKED/VISIBLE buildings. Left dock (hover expand) that RESIZES the game; no click-lock.
 // @author       ChatGPT
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
 // @match        https://*.hwcdn.net/html/*/index.html
 // @run-at       document-idle
-// @grant        unsafeWindow
-// @grant        GM_getValue
-// @grant        GM_setValue
+// @grant        none
 // ==/UserScript==
 
-(function () {
+(() => {
   'use strict';
 
-  const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
-  const PAGE = (W && W.wrappedJSObject) ? W.wrappedJSObject : W;
+  /**********************************************************************
+   * Fixes vs your notes:
+   * - Only considers buildings that are UNLOCKED & VISIBLE (no “recycling facility” on worlds where it's locked).
+   * - Producer dropdown finds Ore Mine / Glass Smelter / Water Pump / Vapor Collector / Ice Harvester (robust production parsing + aliases).
+   * - Weighting is stockpile-aware like v1 and allocation aims to use ALL workers (integer packing by worker-need).
+   * - UI wider, rows shorter, lighter dark background + better row separation.
+   * - Dropdown text visible (options have dark backgrounds + light text).
+   * - Resource list is only the ones we care about (no black dust/white dust/antimatter/energy).
+   **********************************************************************/
 
-  // ---------------- Storage ----------------
-  const STORE_KEY = 'ttwa2_resource_state_v1';
-  const GLOBAL_KEY = 'ttwa2_global_v3';
+  const APP = 'ttwa31';
+  const STORAGE_KEY = 'ttwa31_state_v1';
 
-  const DEFAULT_GLOBAL = {
+  // Only resources this allocator/market logic should care about.
+  const RESOURCES = [
+    { key: 'metal',       cat: 'colony',  label: 'Metal' },
+    { key: 'glass',       cat: 'colony',  label: 'Glass' },
+    { key: 'water',       cat: 'colony',  label: 'Water' },
+    { key: 'food',        cat: 'colony',  label: 'Food' },
+    { key: 'components',  cat: 'colony',  label: 'Components' },
+    { key: 'electronics', cat: 'colony',  label: 'Electronics' },
+    { key: 'androids',    cat: 'colony',  label: 'Androids' },
+    { key: 'spaceships',  cat: 'special', label: 'Spaceships' },
+  ];
+  const RESOURCE_SET = new Set(RESOURCES.map(r => r.key));
+
+  const MODES = { OFF: 'off', ON: 'on', BALANCE: 'balance' };
+
+  const DEFAULT_STATE = {
     enabled: true,
     pinned: false,
-    expandedWidth: 320,
-    collapsedWidth: 44, // wider hotzone so hover works reliably
-    tickMs: 1200,
+    railWidth: 26,
+    expandedWidth: 520,
 
-    // Worker allocation
-    workerReservePct: 0.04, // keep a few workers free
+    // v1-ish feel: target fill influences weight strongly.
+    targetFill: {
+      metal: 0.70,
+      glass: 0.55,
+      water: 0.55,
+      food: 0.65,          // food treated “like v1”: higher target + stronger scaling
+      components: 0.45,
+      electronics: 0.35,
+      androids: 0.35,
+      spaceships: 0.10,
+    },
 
-    // Market tuning
-    marketHorizonSec: 20,
-    marketMaxBuyFracPerTick: 0.05,      // was too timid for big caps; still clamped by funding
-    marketSellKeepBase: 0.60,           // keep this much when not buying anything
-    marketSellKeepWhenBuying: 0.40,     // keep less when you have market-buy enabled somewhere
-    minFunding: 0,                      // keep funding >= this
+    resources: Object.fromEntries(RESOURCES.map(r => [r.key, {
+      mode: MODES.OFF,
+      producer: '', // empty = Auto (choose best visible unlocked producer)
+      weight: 1,
+      marketBuy: false,
+      marketSell: false,
+    }])),
+
+    market: {
+      enabled: true,
+      buyHorizonSec: 120,
+      sellHorizonSec: 180,
+      fundingHorizonSec: 60,
+      fundingBufferPct: 0.01,
+    },
   };
 
-  function gmGet(k, d) {
-    try { return (typeof GM_getValue === 'function') ? GM_getValue(k, d) : d; } catch { return d; }
-  }
-  function gmSet(k, v) {
-    try { if (typeof GM_setValue === 'function') GM_setValue(k, v); } catch {}
-  }
+  let state = loadState();
 
-  let rowState = gmGet(STORE_KEY, null);
-  if (!rowState || typeof rowState !== 'object') rowState = {};
-  let globalState = gmGet(GLOBAL_KEY, null);
-  if (!globalState || typeof globalState !== 'object') globalState = { ...DEFAULT_GLOBAL };
-  globalState = { ...DEFAULT_GLOBAL, ...globalState };
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return structuredClone(DEFAULT_STATE);
+      const parsed = JSON.parse(raw);
+      const s = structuredClone(DEFAULT_STATE);
 
-  function saveAll() {
-    gmSet(STORE_KEY, rowState);
-    gmSet(GLOBAL_KEY, globalState);
-  }
+      Object.assign(s, parsed);
+      s.targetFill = { ...DEFAULT_STATE.targetFill, ...(parsed.targetFill || {}) };
+      s.market = { ...DEFAULT_STATE.market, ...(parsed.market || {}) };
+      s.resources = { ...DEFAULT_STATE.resources, ...(parsed.resources || {}) };
 
-  // ---------------- Utils ----------------
-  function safeNum(x) { return (typeof x === 'number' && isFinite(x)) ? x : 0; }
-  function clamp(x, a, b) { x = Number(x); if (!isFinite(x)) return a; return Math.max(a, Math.min(b, x)); }
-
-  function formatNum(n) {
-    n = Number(n);
-    if (!isFinite(n)) return '0';
-    const abs = Math.abs(n);
-    const sign = n < 0 ? '-' : '';
-    const units = [
-      { v: 1e12, s: 'T' }, { v: 1e9, s: 'B' }, { v: 1e6, s: 'M' }, { v: 1e3, s: 'k' }
-    ];
-    for (const u of units) {
-      if (abs >= u.v) return `${sign}${(abs / u.v).toFixed(abs >= u.v * 10 ? 1 : 2)}${u.s}`;
-    }
-    return `${sign}${abs.toFixed(abs >= 100 ? 0 : 2)}`;
-  }
-
-  function humanResourceName(rk) {
-    const parts = String(rk).split(':');
-    const res = parts[1] || rk;
-    return res.replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase());
-  }
-
-  function ensureRowDefaults(rk) {
-    if (!rowState[rk]) {
-      rowState[rk] = { mode: 'off', producerKey: null, weight: 1, mBuy: false, mSell: false };
-      saveAll();
-    } else {
-      const r = rowState[rk];
-      if (!['off', 'on', 'balance'].includes(r.mode)) r.mode = 'off';
-      r.weight = clamp(r.weight, 0, 10);
-      r.mBuy = !!r.mBuy;
-      r.mSell = !!r.mSell;
-      if (r.producerKey != null && typeof r.producerKey !== 'string') r.producerKey = null;
+      for (const r of RESOURCES) if (!s.resources[r.key]) s.resources[r.key] = structuredClone(DEFAULT_STATE.resources[r.key]);
+      return s;
+    } catch {
+      return structuredClone(DEFAULT_STATE);
     }
   }
 
-  function getPageProp(name) {
-    try { if (PAGE && typeof PAGE[name] !== 'undefined') return PAGE[name]; } catch {}
-    try { if (W && typeof W[name] !== 'undefined') return W[name]; } catch {}
-    return undefined;
+  function saveState() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
   }
 
-  // ---------------- Game helpers ----------------
-  function effectiveWorkerNeed(b) {
-    // Be defensive: game builds sometimes rename these fields.
+  const N = (v, d = 0) => (Number.isFinite(v) ? v : d);
+  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+
+  function gameReady() {
+    return !!(globalThis.resources && globalThis.buildings);
+  }
+
+  function getResObj(cat, key) {
+    return globalThis.resources?.[cat]?.[key] || null;
+  }
+
+  function getWorkersObj() {
+    return globalThis.resources?.colony?.workers || null;
+  }
+
+  function getFundingObj() {
+    return globalThis.resources?.colony?.funding || null;
+  }
+
+  function getMarketProject() {
+    const pm = globalThis.projectManager;
+    if (!pm) return null;
+    if (pm.projects?.galactic_market) return pm.projects.galactic_market;
+    if (typeof pm.getProject === 'function') {
+      try { return pm.getProject('galactic_market'); } catch {}
+    }
+    const projects = pm.projects || {};
+    for (const k of Object.keys(projects)) {
+      const p = projects[k];
+      const name = String(p?.name || p?.displayName || '').toLowerCase();
+      if (name.includes('galactic') && name.includes('market')) return p;
+    }
+    return null;
+  }
+
+  function getAutobuildAvgCost(cat, key) {
+    if (cat !== 'colony') return 0;
+    const t = globalThis.autobuildCostTracker;
+    if (!t || typeof t.getAverageCost !== 'function') return 0;
+    try { return N(t.getAverageCost(cat, key), 0); } catch { return 0; }
+  }
+
+  function getByTypeNet(resObj, sourceName) {
+    let prod = 0, cons = 0;
+    const pbt = resObj.productionRateByType || {};
+    for (const t of Object.keys(pbt)) prod += N(pbt[t]?.[sourceName], 0);
+    const cbt = resObj.consumptionRateByType || {};
+    for (const t of Object.keys(cbt)) cons += N(cbt[t]?.[sourceName], 0);
+    return prod - cons;
+  }
+
+  function getBaselineNet(resObj) {
+    const totalNet = N(resObj.productionRate, 0) - N(resObj.consumptionRate, 0);
+    const gmNet = getByTypeNet(resObj, 'Galactic Market');
+    const ab = getAutobuildAvgCost(resObj.category, resObj.name);
+    return totalNet - gmNet - ab;
+  }
+
+  function getFill(resObj) {
+    const cap = N(resObj.cap, Infinity);
+    if (!Number.isFinite(cap) || cap <= 0) return 0;
+    return clamp(N(resObj.value, 0) / cap, 0, 1);
+  }
+
+  function isBuildingVisibleUnlocked(b) {
+    if (!b) return false;
+
+    // Hard requirement: must be unlocked on THIS world.
+    const unlocked =
+      (typeof b.isUnlocked === 'function') ? !!b.isUnlocked() :
+      ('unlocked' in b) ? !!b.unlocked :
+      (N(b.count, 0) > 0); // fallback
+
+    if (!unlocked) return false;
+
+    // Also must be visible (not hidden / not “future tech” entry)
+    if (b.isHidden) return false;
+    if (typeof b.isVisible === 'function') {
+      try { if (!b.isVisible()) return false; } catch {}
+    }
+    return true;
+  }
+
+  function getWorkerNeed(b) {
     try {
       const base =
-        (b && typeof b.getTotalWorkerNeed === 'function') ? safeNum(b.getTotalWorkerNeed()) :
-        safeNum(
-          b?.totalWorkerNeed ??
-          b?.workerNeed ??
-          b?.workersRequired ??
-          b?.requiresWorkers ??
-          b?.requiresWorker ??
-          b?.workers ??
-          b?.worker ??
+        (typeof b.getTotalWorkerNeed === 'function') ? N(b.getTotalWorkerNeed(), 0) :
+        N(
+          b.totalWorkerNeed ??
+          b.workerNeed ??
+          b.workersRequired ??
+          b.requiresWorkers ??
+          b.requiresWorker ??
+          b.workers ??
+          0,
           0
         );
 
       const mult =
-        (b && typeof b.getEffectiveWorkerMultiplier === 'function') ? safeNum(b.getEffectiveWorkerMultiplier()) :
-        safeNum(b?.workerMultiplier ?? b?.effectiveWorkerMultiplier ?? 1);
+        (typeof b.getEffectiveWorkerMultiplier === 'function') ? N(b.getEffectiveWorkerMultiplier(), 1) :
+        N(b.workerMultiplier ?? b.effectiveWorkerMultiplier ?? 1, 1);
 
-      const out = base * (mult || 1);
-      return isFinite(out) ? out : 0;
-    } catch { return 0; }
-  }
-
-  function collectProducedKeys(b) {
-    const out = [];
-    const prod = b && b.production ? b.production : {};
-    for (const cat in prod) {
-      if (!prod[cat] || typeof prod[cat] !== 'object') continue;
-      if (cat !== 'colony' && cat !== 'special') continue;
-      for (const res in prod[cat]) out.push(`${cat}:${res}`);
+      const out = base * mult;
+      return Number.isFinite(out) ? Math.max(0, out) : 0;
+    } catch {
+      return 0;
     }
-    return out;
   }
 
-  function getResState(resources, rk) {
-    const [cat, res] = rk.split(':');
-    try {
-      const r = resources?.[cat]?.[res];
-      if (!r) return null;
-      const prod = safeNum(r.productionRate);
-      const cons = safeNum(r.consumptionRate);
-      return {
-        displayName: r.displayName || humanResourceName(rk),
-        value: safeNum(r.value),
-        cap: safeNum(r.cap),
-        prod,
-        cons,
-        net: prod - cons,
-        unlocked: !!r.unlocked,
-      };
-    } catch { return null; }
-  }
+  // Robust “does this building produce resource X?” discovery:
+  // Traverses production object and collects keys matching our resources, with aliases.
+  function extractProducedResourceKeys(prodObj) {
+    const out = new Set();
+    const seen = new Set();
 
-  // ---------------- Market project discovery (best effort) ----------------
-  function findMarketProject() {
-    const pm = getPageProp('projectManager');
-    const projects = pm?.projects || getPageProp('projects') || {};
-    if (!projects || typeof projects !== 'object') return null;
+    const normKey = (k) => {
+      k = String(k);
+      if (k.includes(':')) k = k.split(':').pop();
+      return k.trim().toLowerCase().replace(/\s+/g, '').replace(/_/g, '');
+    };
 
-    if (projects.galactic_market) return projects.galactic_market;
+    // canonical map
+    const wanted = new Map();
+    for (const r of RESOURCE_SET) wanted.set(normKey(r), r);
 
-    for (const k of Object.keys(projects)) {
-      const p = projects[k];
-      if (!p) continue;
-      const hasSel = Array.isArray(p.buySelections) && Array.isArray(p.sellSelections);
-      const name = String(p.displayName || p.name || k).toLowerCase();
-      if (hasSel && name.includes('galactic') && name.includes('market')) return p;
-      if (hasSel && k.toLowerCase().includes('galactic') && k.toLowerCase().includes('market')) return p;
-    }
-    return null;
-  }
+    // aliases found in TT data in some builds/mods
+    const alias = new Map([
+      ['ore', 'metal'],
+      ['iron', 'metal'],
+      ['metalore', 'metal'],
+      ['watervapor', 'water'],
+      ['vapor', 'water'],
+      ['ice', 'water'],
+      ['component', 'components'],
+      ['electronic', 'electronics'],
+      ['android', 'androids'],
+      ['spaceship', 'spaceships'],
+    ]);
 
-  // Try not to “click” UI or do anything that can steal focus / lock inputs.
-  function bestEffortStartMarket(proj) {
-    if (!proj) return;
-    try {
-      if ('autoStart' in proj) proj.autoStart = true;
-      if ('isPaused' in proj) proj.isPaused = false;
-      if ('run' in proj) proj.run = true;
-      if (typeof proj.setEnabled === 'function') proj.setEnabled(true);
-    } catch {}
-  }
+    const stack = [prodObj];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (!cur || typeof cur !== 'object') continue;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
 
-  function priceFromProject(proj, side, key) {
-    if (!proj) return null;
-    const fnNames = side === 'buy' ? ['getBuyPrice', 'getBuyCost'] : ['getSellPrice', 'getSellGain'];
-    for (const fn of fnNames) {
-      try {
-        if (typeof proj[fn] === 'function') {
-          const v = proj[fn](key);
-          const n = Number(v);
-          if (isFinite(n) && n > 0) return n;
+      if (Array.isArray(cur)) {
+        for (const v of cur) if (v && typeof v === 'object') stack.push(v);
+        continue;
+      }
+
+      for (const [k, v] of Object.entries(cur)) {
+        const nk = normKey(k);
+
+        const canon = wanted.get(nk);
+        if (canon) out.add(canon);
+
+        const ali = alias.get(nk);
+        if (ali && RESOURCE_SET.has(ali)) out.add(ali);
+
+        // plural fallback (e.g. "componentS")
+        if (!canon && nk.endsWith('s')) {
+          const sing = nk.slice(0, -1);
+          const canon2 = wanted.get(sing);
+          if (canon2) out.add(canon2);
         }
-      } catch {}
-    }
-    const maps = side === 'buy'
-      ? ['buyPrices', 'buyPrice', 'buyPriceByResource', 'pricesBuy']
-      : ['sellPrices', 'sellPrice', 'sellPriceByResource', 'pricesSell'];
-    for (const m of maps) {
-      try {
-        const obj = proj[m];
-        if (!obj || typeof obj !== 'object') continue;
-        const n = Number(obj[key]);
-        if (isFinite(n) && n > 0) return n;
-      } catch {}
-    }
-    return null;
-  }
 
-  function marketKeyCandidates(rk) {
-    const parts = String(rk).split(':');
-    const short = parts[1] || rk;
-    const strip = rk.replace(/^colony:/, '').replace(/^special:/, '');
-    const arr = [rk, short, strip];
-    return Array.from(new Set(arr.filter(Boolean)));
-  }
-
-  const marketKeyCache = new Map();
-  function resolveMarketKey(proj, rk) {
-    if (!proj) return rk;
-    const cacheKey = `${rk}::${proj?.name || proj?.displayName || 'proj'}`;
-    if (marketKeyCache.has(cacheKey)) return marketKeyCache.get(cacheKey);
-
-    const cands = marketKeyCandidates(rk);
-    // Prefer the candidate that yields a price from the project
-    for (const c of cands) {
-      const pb = priceFromProject(proj, 'buy', c);
-      const ps = priceFromProject(proj, 'sell', c);
-      if ((pb != null && pb > 0) || (ps != null && ps > 0)) {
-        marketKeyCache.set(cacheKey, c);
-        return c;
+        if (v && typeof v === 'object') stack.push(v);
       }
     }
-    // Fall back to first
-    marketKeyCache.set(cacheKey, cands[0] || rk);
-    return marketKeyCache.get(cacheKey);
+
+    return [...out];
   }
 
-  function selectionShape(proj) {
-    // Try to match whatever shape the game uses in buySelections.
-    const sample = (Array.isArray(proj?.buySelections) && proj.buySelections.length) ? proj.buySelections[0] : null;
-    if (sample && typeof sample === 'object') {
-      const keyProp = ('resource' in sample) ? 'resource' : (('resourceKey' in sample) ? 'resourceKey' : (('key' in sample) ? 'key' : 'resource'));
-      const amtProp = ('amount' in sample) ? 'amount' : (('qty' in sample) ? 'qty' : (('value' in sample) ? 'value' : 'amount'));
-      return { keyProp, amtProp };
+  function chooseAutoProducer(snap, resourceKey) {
+    const ids = snap.producersByRes[resourceKey] || [];
+    if (!ids.length) return '';
+    let best = ids[0], bestCount = N(snap.buildingMeta[best]?.count, 0);
+    for (const id of ids) {
+      const c = N(snap.buildingMeta[id]?.count, 0);
+      if (c > bestCount) { best = id; bestCount = c; }
     }
-    return { keyProp: 'resource', amtProp: 'amount' };
+    return best;
   }
 
   function snapshot() {
-    const resources = getPageProp('resources');
-    const buildings = getPageProp('buildings') || {};
-    if (!resources || !resources.colony) return null;
+    const snap = {
+      workersCap: 0,
+      workersVal: 0,
+      funding: { value: 0, netBaseline: 0, netTotal: 0 },
+      marketUnlocked: false,
+      res: /** @type {Record<string, any>} */ ({}),
+      buildingMeta: /** @type {Record<string, any>} */ ({}),
+      producersByRes: /** @type {Record<string, string[]>} */ ({}),
+    };
 
-    const pop = safeNum(resources.colony.colonists?.value);
-    const popCap = safeNum(resources.colony.colonists?.cap);
-    const workerCap = safeNum(resources.colony.workers?.cap);
-    const workerFree = safeNum(resources.colony.workers?.value);
+    const w = getWorkersObj();
+    snap.workersCap = N(w?.cap, 0);
+    snap.workersVal = N(w?.value, 0);
 
-    // Always include common market resources (even if not produced yet)
-    const alwaysKeys = [
-      'colony:metal', 'colony:glass', 'colony:water', 'colony:food',
-      'colony:components', 'colony:electronics', 'colony:androids',
-      'special:spaceships'
-    ];
+    const f = getFundingObj();
+    if (f) {
+      const totalNet = N(f.productionRate, 0) - N(f.consumptionRate, 0);
+      const gmNet = getByTypeNet(f, 'Galactic Market');
+      snap.funding.value = N(f.value, 0);
+      snap.funding.netTotal = totalNet;
+      snap.funding.netBaseline = totalNet - gmNet;
+    }
 
-    const producedSet = {};
-    for (const rk of alwaysKeys) producedSet[rk] = true;
+    snap.marketUnlocked = !!getMarketProject();
 
-    const bList = [];
-    for (const key of Object.keys(buildings)) {
-      const b = buildings[key];
-      if (!b) continue;
-      const produces = collectProducedKeys(b);
-      for (const rk of produces) producedSet[rk] = true;
-      bList.push({
-        key,
-        name: String(b.displayName || b.name || key),
-        unlocked: !!b.unlocked,
-        effNeed: effectiveWorkerNeed(b),
-        count: safeNum(b.count),
-        produces,
-        autoBuildEnabled: !!b.autoBuildEnabled,
-        autoActiveEnabled: !!b.autoActiveEnabled,
-        autoBuildPercent: safeNum(b.autoBuildPercent),
-        autoBuildBasis: String(b.autoBuildBasis || 'population'),
+    for (const r of RESOURCES) {
+      const obj = getResObj(r.cat, r.key);
+      if (!obj || !obj.unlocked) continue;
+      snap.res[r.key] = {
+        key: r.key,
+        label: r.label,
+        cat: r.cat,
+        value: N(obj.value, 0),
+        cap: N(obj.cap, Infinity),
+        fill: getFill(obj),
+        netBaseline: getBaselineNet(obj),
+        shortage: !!obj.autobuildShortage,
+        limited: !!obj.automationLimited,
+      };
+    }
+
+    const buildings = globalThis.buildings || {};
+    for (const id of Object.keys(buildings)) {
+      const b = buildings[id];
+      if (!isBuildingVisibleUnlocked(b)) continue;
+
+      const workerNeed = getWorkerNeed(b);
+      const produced = extractProducedResourceKeys(b.production || {});
+      snap.buildingMeta[id] = {
+        id,
+        name: String(b.displayName || b.name || id),
+        count: N(b.count, 0),
+        workerNeed,
+        produced,
+      };
+      for (const k of produced) {
+        if (!snap.producersByRes[k]) snap.producersByRes[k] = [];
+        snap.producersByRes[k].push(id);
+      }
+    }
+
+    for (const k of Object.keys(snap.producersByRes)) {
+      snap.producersByRes[k].sort((a, b) => {
+        const an = snap.buildingMeta[a]?.name || a;
+        const bn = snap.buildingMeta[b]?.name || b;
+        return an.localeCompare(bn);
       });
     }
 
-    const res = {};
-    for (const rk of Object.keys(producedSet)) {
-      const st = getResState(resources, rk);
-      if (st) res[rk] = st;
-    }
-
-    return {
-      pop, popCap, workerCap, workerFree,
-      funding: safeNum(resources.colony.funding?.value),
-      buildings: bList,
-      res
-    };
+    return snap;
   }
 
-  function buildProducerMap(snap) {
-    const map = new Map();
-    for (const b of snap.buildings) {
-      if (!(b.effNeed > 0)) continue;
-      for (const rk of (b.produces || [])) {
-        if (!map.has(rk)) map.set(rk, []);
-        map.get(rk).push(b);
-      }
-    }
-    for (const [rk, arr] of map.entries()) arr.sort((a, b) => String(a.name).localeCompare(String(b.name)));
-    return map;
-  }
+  // v1-ish dynamic weighting
+  function dynamicWeight(resourceKey, baseWeight, rs) {
+    if (!rs) return 0;
+    const target = N(state.targetFill[resourceKey], 0.5);
+    const fill = N(rs.fill, 0);
 
-  function severityBoost(resSt) {
-    if (!resSt) return 1;
-    const cap = resSt.cap;
-    const fill = cap > 0 ? (resSt.value / cap) : 0;
-    const cons = Math.max(0, resSt.cons);
-    const net = resSt.net;
-    let sev = 0;
-    if (net < 0) {
-      const denom = Math.max(1, cons);
-      sev += Math.min(1.5, (-net) / denom);
-    }
-    if (cap > 0 && fill < 0.15) sev += 0.5;
-    if (cap > 0 && fill < 0.05) sev += 0.5;
-    return 1 + sev;
-  }
+    let f = 1;
 
-  function computeBuildingPlan(snap, producerMap) {
-    const workerCap = Math.max(1, snap.workerCap);
-    const reservePct = clamp(globalState.workerReservePct, 0, 0.30);
-    const workerBudget = Math.max(0, workerCap * (1 - reservePct));
-
-    const chosen = new Map();
-
-    for (const rk of Object.keys(snap.res)) {
-      ensureRowDefaults(rk);
-      const rCfg = rowState[rk];
-      if (rCfg.mode === 'off') continue;
-
-      const producers = producerMap.get(rk) || [];
-      if (!producers.length) continue;
-
-      const chosenKey = rCfg.producerKey && producers.some(p => p.key === rCfg.producerKey)
-        ? rCfg.producerKey
-        : producers[0].key;
-
-      const b = producers.find(p => p.key === chosenKey) || producers[0];
-
-      const w = Math.max(0, Number(rCfg.weight) || 0) * severityBoost(snap.res[rk]);
-      if (w <= 0) continue;
-
-      const ex = chosen.get(b.key);
-      if (!ex) {
-        chosen.set(b.key, {
-          key: b.key,
-          mode: rCfg.mode,
-          weight: w,
-          effNeed: Math.max(0.0001, b.effNeed || 1),
-          count: b.count || 0
-        });
+    if (Number.isFinite(rs.cap) && rs.cap > 0) {
+      const diff = target - fill; // positive => need more
+      if (diff >= 0) {
+        const mult = (resourceKey === 'food') ? 6.0 : 5.0;
+        f *= clamp(1 + diff * mult, 0.15, 6.0);
       } else {
-        ex.mode = (ex.mode === 'balance' || rCfg.mode === 'balance') ? 'balance' : 'on';
-        ex.weight += w;
+        const mult = (resourceKey === 'food') ? 3.5 : 4.0;
+        f *= clamp(1 / (1 + (-diff) * mult), 0.15, 3.0);
       }
     }
 
-    const items = Array.from(chosen.values());
-    const sumW = items.reduce((a, x) => a + x.weight, 0);
-    if (!(sumW > 0)) return {};
+    if (N(rs.netBaseline, 0) < 0) f *= (resourceKey === 'food') ? 1.55 : 1.30;
+    if (rs.shortage) f *= (resourceKey === 'food') ? 2.00 : 1.55;
+    if (rs.limited) f *= 0.85;
 
-    const targets = items.map(it => {
-      const share = it.weight / sumW;
-      const desiredWorkers = workerBudget * share;
-      let targetCount = Math.ceil(desiredWorkers / it.effNeed);
-      if (it.mode === 'balance') targetCount = Math.min(targetCount, Math.floor(it.count));
-      targetCount = Math.max(0, targetCount);
-      return { ...it, targetCount };
-    });
-
-    const totalWorkers = (arr) => arr.reduce((a, x) => a + x.targetCount * x.effNeed, 0);
-    let tw = totalWorkers(targets);
-    if (tw > workerBudget && tw > 0) {
-      const scale = workerBudget / tw;
-      for (const t of targets) t.targetCount = Math.max(0, Math.floor(t.targetCount * scale));
-    }
-
-    const updates = {};
-    for (const t of targets) {
-      const pct = (t.targetCount / workerCap) * 100;
-      updates[t.key] = {
-        autoBuildBasis: 'workers',
-        autoBuildPercent: Math.max(0, Math.min(100, pct)),
-        autoActiveEnabled: true,
-        autoBuildEnabled: (t.mode === 'on') // balance => false (no building)
-      };
-    }
-    return updates;
+    return Math.max(0, N(baseWeight, 0)) * f;
   }
 
-  function applyBuildingUpdates(updates) {
-    const buildings = getPageProp('buildings') || {};
-    for (const key of Object.keys(updates)) {
-      const u = updates[key];
-      const b = buildings[key];
-      if (!b || !u) continue;
-      try {
-        b.autoBuildBasis = 'workers';
-        if (typeof u.autoBuildEnabled === 'boolean') b.autoBuildEnabled = u.autoBuildEnabled;
-        if (typeof u.autoActiveEnabled === 'boolean') b.autoActiveEnabled = u.autoActiveEnabled;
-        if (u.hasOwnProperty('autoBuildPercent')) {
-          const v = Number(u.autoBuildPercent);
-          if (isFinite(v)) b.autoBuildPercent = v;
+  // Integer packing to use (almost) all workers
+  function computeWorkerPlan(snap) {
+    const Wcap = Math.floor(N(snap.workersCap, 0));
+    if (Wcap <= 0) return [];
+
+    const buildingLines = new Map(); // id -> { id, mode, need, dynWeight }
+
+    for (const r of RESOURCES) {
+      const cfg = state.resources[r.key];
+      if (!cfg || cfg.mode === MODES.OFF) continue;
+
+      const rs = snap.res[r.key];
+      if (!rs) continue;
+
+      const producerIds = snap.producersByRes[r.key] || [];
+      if (!producerIds.length) continue;
+
+      let pid = String(cfg.producer || '');
+      if (!pid || !producerIds.includes(pid)) pid = chooseAutoProducer(snap, r.key);
+      if (!pid) continue;
+
+      const bm = snap.buildingMeta[pid];
+      if (!bm) continue;
+
+      const need = N(bm.workerNeed, 0);
+      if (need <= 0) continue;
+
+      const dynW = dynamicWeight(r.key, N(cfg.weight, 1), rs);
+      if (dynW <= 0) continue;
+
+      const existing = buildingLines.get(pid);
+      if (!existing) {
+        buildingLines.set(pid, { id: pid, mode: cfg.mode, need, dynWeight: dynW });
+      } else {
+        existing.dynWeight += dynW;
+        if (existing.mode !== MODES.BALANCE && cfg.mode === MODES.BALANCE) existing.mode = MODES.BALANCE;
+      }
+    }
+
+    const lines = [...buildingLines.values()];
+    if (!lines.length) return [];
+
+    const sumW = lines.reduce((s, x) => s + x.dynWeight, 0);
+    if (sumW <= 0) return [];
+
+    const desiredWorkers = lines.map(x => Wcap * (x.dynWeight / sumW));
+
+    const counts = lines.map((x, i) => Math.max(0, Math.floor(desiredWorkers[i] / x.need)));
+
+    // Respect Balance caps
+    for (let i = 0; i < counts.length; i++) {
+      if (lines[i].mode !== MODES.BALANCE) continue;
+      const built = Math.floor(N(snap.buildingMeta[lines[i].id]?.count, 0));
+      if (counts[i] > built) counts[i] = built;
+    }
+
+    let used = counts.reduce((s, c, i) => s + c * lines[i].need, 0);
+    let remaining = Math.max(0, Wcap - used);
+
+    const canAdd = (i) => {
+      if (remaining + 1e-9 < lines[i].need) return false;
+      if (lines[i].mode === MODES.BALANCE) {
+        const built = Math.floor(N(snap.buildingMeta[lines[i].id]?.count, 0));
+        if (counts[i] + 1 > built) return false;
+      }
+      return true;
+    };
+
+    const maxIters = 5000;
+    let iters = 0;
+    while (remaining > 0 && iters++ < maxIters) {
+      let bestIdx = -1;
+      let bestScore = -Infinity;
+
+      // 1) Biggest deficit first (v1-ish balancing)
+      for (let i = 0; i < lines.length; i++) {
+        if (!canAdd(i)) continue;
+        const alloc = counts[i] * lines[i].need;
+        const deficit = desiredWorkers[i] - alloc;
+        const score = deficit / lines[i].need;
+        if (score > bestScore) { bestScore = score; bestIdx = i; }
+      }
+
+      // 2) If everyone is at/over target, pack remaining into best “weight per worker”
+      if (bestIdx === -1 || bestScore <= 0) {
+        bestIdx = -1; bestScore = -Infinity;
+        for (let i = 0; i < lines.length; i++) {
+          if (!canAdd(i)) continue;
+          const score = lines[i].dynWeight / lines[i].need;
+          if (score > bestScore) { bestScore = score; bestIdx = i; }
         }
+        if (bestIdx === -1) break;
+      }
+
+      counts[bestIdx] += 1;
+      remaining -= lines[bestIdx].need;
+    }
+
+    return lines.map((x, i) => {
+      const allocWorkers = counts[i] * x.need;
+      const pct = (Wcap > 0) ? (allocWorkers / Wcap) * 100 : 0;
+      return { id: x.id, mode: x.mode, percent: clamp(pct, 0, 100) };
+    });
+  }
+
+  function applyWorkerPlan(plan) {
+    const buildings = globalThis.buildings || {};
+    for (const step of plan) {
+      const b = buildings[step.id];
+      if (!isBuildingVisibleUnlocked(b)) continue;
+      try {
+        b.autoActiveEnabled = true;
+        b.autoBuildBasis = 'workers';
+        b.autoBuildPercent = N(step.percent, 0);
+        if (step.mode === MODES.ON) b.autoBuildEnabled = true;
+        if (step.mode === MODES.BALANCE) b.autoBuildEnabled = false;
       } catch {}
     }
   }
 
-  function computeMarketPlan(snap) {
-    const buys = {};
-    const sells = {};
-    const horizon = clamp(globalState.marketHorizonSec, 5, 120);
-    const baseMaxBuyFrac = clamp(globalState.marketMaxBuyFracPerTick, 0.001, 0.20);
-    const keepBase = clamp(globalState.marketSellKeepBase, 0.10, 0.95);
-    const keepAgg = clamp(globalState.marketSellKeepWhenBuying, 0.10, 0.95);
+  // Market: simple + funding-safe
+  function planMarket(snap) {
+    if (!state.market.enabled) return null;
+    const proj = getMarketProject();
+    if (!proj) return null;
 
-    let anyBuy = false;
-    for (const rk of Object.keys(snap.res)) if (rowState[rk]?.mBuy) { anyBuy = true; break; }
+    const buyH = Math.max(10, N(state.market.buyHorizonSec, 120));
+    const sellH = Math.max(10, N(state.market.sellHorizonSec, 180));
+    const horizon = Math.max(10, N(state.market.fundingHorizonSec, 60));
+    const buffer = Math.max(0, N(snap.funding.value, 0) * N(state.market.fundingBufferPct, 0.01));
 
-    for (const rk of Object.keys(snap.res)) {
-      ensureRowDefaults(rk);
-      const cfg = rowState[rk];
-      const rs = snap.res[rk];
-      if (!rs || !rs.unlocked) continue;
+    const buys = [];
+    const sells = [];
 
-      const cap = rs.cap;
-      const val = rs.value;
-      const net = rs.net;
-      const fill = cap > 0 ? (val / cap) : 0;
+    for (const r of RESOURCES) {
+      const cfg = state.resources[r.key];
+      const rs = snap.res[r.key];
+      if (!cfg || !rs) continue;
 
-      // --- BUY ---
-      if (cfg.mBuy) {
-        let want = 0;
+      const target = N(state.targetFill[r.key], 0.5);
 
-        if (cap > 0) {
-          const fillTarget = (net < 0) ? 0.14 : 0.08;
-          want += Math.max(0, cap * fillTarget - val);
-          want += Math.max(0, -net) * horizon;
-
-          // If critically low + negative net, allow bigger bite per tick
-          let maxBuyFrac = baseMaxBuyFrac;
-          if (net < 0 && fill < 0.05) maxBuyFrac = Math.max(maxBuyFrac, 0.12);
-          else if (net < 0 && fill < 0.10) maxBuyFrac = Math.max(maxBuyFrac, 0.08);
-
-          want = Math.min(want, cap * maxBuyFrac);
-          if (fill > fillTarget * 1.25) want = 0;
-        } else {
-          want = Math.max(0, -net) * horizon;
+      if (cfg.marketBuy) {
+        const deficitRate = Math.max(0, -N(rs.netBaseline, 0));
+        let refillRate = 0;
+        if (Number.isFinite(rs.cap) && rs.cap > 0) {
+          const desired = rs.cap * target;
+          if (rs.value < desired) refillRate = (desired - rs.value) / buyH;
         }
-
-        if (want > 0) buys[rk] = Math.floor(want);
+        let rate = deficitRate + refillRate;
+        if (rs.shortage) rate *= 1.35;
+        if (rate > 0) buys.push({ category: r.cat, resource: r.key, quantity: rate });
       }
 
-      // --- SELL ---
-      if (cfg.mSell) {
-        let want = 0;
-        if (cap > 0) {
-          let keepFrac = anyBuy ? keepAgg : keepBase;
-
-          // If very full and net positive, sell more aggressively (metal -> electronics use-case)
-          if (net > 0 && fill > 0.95) keepFrac = Math.min(keepFrac, 0.25);
-          if (net > 0 && fill > 0.985) keepFrac = Math.min(keepFrac, 0.15);
-
-          const keep = cap * keepFrac;
-          want = Math.max(0, val - keep);
-
-          // allow bigger per-tick sales when extremely full
-          const maxPerTick =
-            (fill > 0.985) ? cap * 0.50 :
-            (fill > 0.95)  ? cap * 0.35 :
-                             cap * 0.20;
-
-          want = Math.min(want, maxPerTick);
-
-          // If net negative, don't sell unless almost capped
-          if (net < 0 && fill < 0.98) want = 0;
-        } else {
-          if (net > 0 && val > 0) want = Math.min(val * 0.20, net * horizon);
+      if (cfg.marketSell) {
+        if (!rs.shortage) {
+          const surplusRate = Math.max(0, N(rs.netBaseline, 0));
+          let overfillRate = 0;
+          if (Number.isFinite(rs.cap) && rs.cap > 0) {
+            const desired = rs.cap * target;
+            if (rs.value > desired) overfillRate = (rs.value - desired) / sellH;
+          }
+          const rate = surplusRate + overfillRate;
+          if (rate > 0) sells.push({ category: r.cat, resource: r.key, quantity: rate });
         }
-
-        if (want > 0) sells[rk] = Math.floor(want);
       }
     }
 
-    return { buys, sells };
-  }
+    const roundQ = (q) => {
+      if (!Number.isFinite(q) || q <= 0) return 0;
+      if (q < 1) return Number(q.toFixed(3));
+      return Math.floor(q);
+    };
+    buys.forEach(x => x.quantity = roundQ(x.quantity));
+    sells.forEach(x => x.quantity = roundQ(x.quantity));
+    const buys2 = buys.filter(x => x.quantity > 0);
+    const sells2 = sells.filter(x => x.quantity > 0);
 
-  function clampMarketToFunding(snap, plan) {
-    const funding = safeNum(snap.funding);
-    const minFunding = Math.max(0, safeNum(globalState.minFunding));
-    if (funding <= minFunding + 1) return { ...plan, buys: {} };
+    const fundingNow = N(snap.funding.value, 0);
+    const baselineNet = N(snap.funding.netBaseline, 0);
 
-    const proj = findMarketProject();
-    if (!proj) return plan;
+    const buyCostPerUnit = (cat, res) => {
+      try { if (typeof proj.getBuyPrice === 'function') return N(proj.getBuyPrice(cat, res, 1), 0); } catch {}
+      return 1;
+    };
+    const sellRevPerUnit = (cat, res) => {
+      try { if (typeof proj.getSellPrice === 'function') return N(proj.getSellPrice(cat, res, 1), 0); } catch {}
+      return 1;
+    };
 
     let buyCost = 0, sellRev = 0;
-    let havePrice = false;
+    for (const b of buys2) buyCost += b.quantity * buyCostPerUnit(b.category, b.resource);
+    for (const s of sells2) sellRev += s.quantity * sellRevPerUnit(s.category, s.resource);
+    const marketNet = sellRev - buyCost;
 
-    for (const rk of Object.keys(plan.buys || {})) {
-      const amt = safeNum(plan.buys[rk]);
-      if (amt <= 0) continue;
-      const key = resolveMarketKey(proj, rk);
-      const p = priceFromProject(proj, 'buy', key);
-      if (p != null) { havePrice = true; buyCost += amt * p; }
-    }
-    for (const rk of Object.keys(plan.sells || {})) {
-      const amt = safeNum(plan.sells[rk]);
-      if (amt <= 0) continue;
-      const key = resolveMarketKey(proj, rk);
-      const p = priceFromProject(proj, 'sell', key);
-      if (p != null) { havePrice = true; sellRev += amt * p; }
+    const projected = fundingNow + (baselineNet + marketNet) * horizon;
+
+    if (projected < buffer && buyCost > 0) {
+      const needImprove = buffer - projected;
+      const maxBuyCost = buyCost - (needImprove / horizon);
+      const scale = clamp(maxBuyCost / buyCost, 0, 1);
+      for (const b of buys2) b.quantity = roundQ(b.quantity * scale);
     }
 
-    // If we can't price, be conservative when low funding.
-    if (!havePrice) {
-      if (funding < 1000) return { ...plan, buys: {} };
-      return plan;
-    }
-
-    const netCost = buyCost - sellRev;
-    const maxSpend = Math.max(0, funding - minFunding);
-    if (netCost <= maxSpend) return plan;
-
-    if (buyCost <= 0) return plan;
-
-    const allowedBuyCost = Math.max(0, maxSpend + sellRev);
-    const scale = clamp(allowedBuyCost / buyCost, 0, 1);
-
-    const newBuys = {};
-    for (const rk of Object.keys(plan.buys || {})) {
-      const scaled = Math.floor(safeNum(plan.buys[rk]) * scale);
-      if (scaled > 0) newBuys[rk] = scaled;
-    }
-    return { ...plan, buys: newBuys };
+    return { buys: buys2.filter(x => x.quantity > 0), sells: sells2 };
   }
 
-  function applyMarketPlan(plan) {
-    const proj = findMarketProject();
+  function applyMarket(plan) {
+    if (!plan) return;
+    const proj = getMarketProject();
     if (!proj) return;
-
-    const shape = selectionShape(proj);
-    const buySel = [];
-    const sellSel = [];
-
-    for (const rk of Object.keys(plan.buys || {})) {
-      const amt = Math.max(0, Number(plan.buys[rk]) || 0);
-      if (amt <= 0) continue;
-      const key = resolveMarketKey(proj, rk);
-      const obj = {};
-      obj[shape.keyProp] = key;
-      obj[shape.amtProp] = amt;
-      buySel.push(obj);
-    }
-
-    for (const rk of Object.keys(plan.sells || {})) {
-      const amt = Math.max(0, Number(plan.sells[rk]) || 0);
-      if (amt <= 0) continue;
-      const key = resolveMarketKey(proj, rk);
-      const obj = {};
-      obj[shape.keyProp] = key;
-      obj[shape.amtProp] = amt;
-      sellSel.push(obj);
-    }
-
     try {
-      if (Array.isArray(proj.buySelections)) proj.buySelections = buySel;
-      if (Array.isArray(proj.sellSelections)) proj.sellSelections = sellSel;
-
-      // Also support map-style internals if present
-      if (proj.buySelectionMap && typeof proj.buySelectionMap === 'object') {
-        proj.buySelectionMap = {};
-        for (const x of buySel) proj.buySelectionMap[x[shape.keyProp]] = x[shape.amtProp];
-      }
-      if (proj.sellSelectionMap && typeof proj.sellSelectionMap === 'object') {
-        proj.sellSelectionMap = {};
-        for (const x of sellSel) proj.sellSelectionMap[x[shape.keyProp]] = x[shape.amtProp];
-      }
-
-      bestEffortStartMarket(proj);
+      proj.buySelections = plan.buys.map(x => ({ category: x.category, resource: x.resource, quantity: x.quantity }));
+      proj.sellSelections = plan.sells.map(x => ({ category: x.category, resource: x.resource, quantity: x.quantity }));
+      proj.autoStart = true;
+      if ('run' in proj) proj.run = true;
+      if ('isPaused' in proj) proj.isPaused = false;
     } catch {}
   }
 
-  // ---------------- UI (Popout fixed: separate rail + panel) ----------------
-  const UI = {
-    panel: null,
-    rail: null,
-    rowsWrap: null,
-    rows: new Map(),
-    open: false,
-  };
+  // UI
+  let root = null;
+  let closeTimer = null;
+
+  function fmt(n) {
+    n = Number(n);
+    if (!Number.isFinite(n)) return '0';
+    const abs = Math.abs(n);
+    const sign = n < 0 ? '-' : '';
+    const units = [{ v: 1e12, s: 'T' }, { v: 1e9, s: 'B' }, { v: 1e6, s: 'M' }, { v: 1e3, s: 'k' }];
+    for (const u of units) if (abs >= u.v) return `${sign}${(abs / u.v).toFixed(abs >= u.v * 10 ? 1 : 2)}${u.s}`;
+    return `${sign}${abs.toFixed(abs >= 100 ? 0 : 2)}`;
+  }
 
   function ensureCSS() {
-    if (document.getElementById('ttwa2-css')) return;
+    if (document.getElementById(`${APP}-css`)) return;
     const css = document.createElement('style');
-    css.id = 'ttwa2-css';
+    css.id = `${APP}-css`;
     css.textContent = `
-      #ttwa2-rail{
-        position:fixed; top:0; left:0; height:100vh;
-        width: var(--ttwa2-railw, 44px);
-        z-index: 999998;
-        background: rgba(0,0,0,0.01);
-        cursor: pointer;
+      :root{
+        --ttwa-rail:${state.railWidth}px;
+        --ttwa-wide:${state.expandedWidth}px;
+        --ttwa-bg:#2b3240;
+        --ttwa-panel:#2f3747;
+        --ttwa-row1:#354155;
+        --ttwa-row2:#313b4d;
+        --ttwa-border:rgba(255,255,255,0.10);
+        --ttwa-text:#e8edf7;
+        --ttwa-muted:rgba(232,237,247,0.72);
       }
-      #ttwa2-panel{
+      body{
+        padding-left: var(--ttwa-rail) !important;
+        transition: padding-left 140ms ease;
+      }
+      #${APP}-root, #${APP}-root *{ box-sizing:border-box; }
+      #${APP}-root{
         position:fixed; top:0; left:0; height:100vh;
-        width: var(--ttwa2-panelw, 320px);
-        transform: translateX(calc(var(--ttwa2-railw, 44px) - var(--ttwa2-panelw, 320px)));
-        transition: transform 140ms ease;
-        z-index: 999999;
-        background: rgba(25,25,28,0.96);
-        color:#e6e6e6;
-        font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-        border-right: 1px solid rgba(255,255,255,0.08);
-        box-shadow: 2px 0 10px rgba(0,0,0,0.35);
+        width: var(--ttwa-rail);
+        z-index:2147483647;
+        background: var(--ttwa-bg);
+        border-right:1px solid var(--ttwa-border);
+        color: var(--ttwa-text);
+        font: 12px/1.25 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
         overflow:hidden;
       }
-      #ttwa2-panel.ttwa2-open{ transform: translateX(0); }
-      #ttwa2-panel .head{
-        display:flex; align-items:center; justify-content:space-between;
-        padding:8px 10px; gap:8px;
-        border-bottom: 1px solid rgba(255,255,255,0.08);
+      #${APP}-root.open{ width: var(--ttwa-wide); }
+      #${APP}-header{
+        display:flex; align-items:center; justify-content:space-between; gap:8px;
+        padding:8px 10px;
+        background: var(--ttwa-panel);
+        border-bottom:1px solid var(--ttwa-border);
       }
-      #ttwa2-panel .title{ font-weight:700; letter-spacing:.2px; }
-      #ttwa2-panel button{
-        background: rgba(255,255,255,0.08);
-        color:#eee;
-        border:1px solid rgba(255,255,255,0.10);
-        padding:4px 8px;
-        border-radius:6px;
+      #${APP}-title{ font-weight:800; letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .ttwa-btn{
+        border:1px solid var(--ttwa-border);
+        background: rgba(255,255,255,0.06);
+        color: var(--ttwa-text);
+        padding:5px 8px;
+        border-radius:8px;
         cursor:pointer;
       }
-      #ttwa2-panel button:hover{ background: rgba(255,255,255,0.12); }
-      #ttwa2-panel .body{
-        height: calc(100vh - 44px);
+      .ttwa-btn:hover{ background: rgba(255,255,255,0.10); }
+      #${APP}-status{
+        padding:8px 10px;
+        border-bottom:1px solid var(--ttwa-border);
+        background: rgba(0,0,0,0.10);
+        color: var(--ttwa-muted);
+        display:grid;
+        gap:3px;
+      }
+      #${APP}-list{
+        height: calc(100vh - 88px);
         overflow:auto;
-        padding:10px;
-      }
-      .card{
-        border:1px solid rgba(255,255,255,0.10);
-        background: rgba(0,0,0,0.18);
-        border-radius:10px;
         padding:8px;
-        margin-bottom:10px;
+        display:flex;
+        flex-direction:column;
+        gap:6px;
       }
-      .muted{ opacity:.8; }
-      .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; }
-      .rows{ display:flex; flex-direction:column; gap:8px; }
-      .row{
-        border:1px solid rgba(255,255,255,0.10);
+      .ttwa-row{
+        border:1px solid var(--ttwa-border);
         border-radius:10px;
-        padding:8px;
-        background: rgba(0,0,0,0.15);
+        padding:6px 8px;
+        display:grid;
+        grid-template-columns: 1fr 92px 210px 62px 92px;
+        gap:6px;
+        align-items:center;
       }
-      .row .top{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
-      .row .name{ font-weight:700; }
-      .row .bar{ height:6px; background: rgba(255,255,255,0.10); border-radius:99px; overflow:hidden; margin-top:6px; }
-      .row .bar > i{ display:block; height:100%; width:0%; background: rgba(120,220,120,0.9); }
-      .row .mini{ display:flex; gap:10px; margin-top:6px; opacity:.9; }
-      .row .mini span{ white-space:nowrap; }
-      .row .ctrl{
+      .ttwa-row:nth-child(odd){ background: var(--ttwa-row1); }
+      .ttwa-row:nth-child(even){ background: var(--ttwa-row2); }
+
+      .ttwa-name{ min-width:0; }
+      .ttwa-name .label{ font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .ttwa-name .meta{
+        margin-top:2px;
+        color: var(--ttwa-muted);
+        font-size: 11px;
+        display:flex; gap:10px;
+        white-space:nowrap;
+      }
+      .good{ color:#baf7d0; }
+      .bad{ color:#ffb2b2; }
+      .warn{ color:#ffe2a8; }
+
+      select.ttwa-sel, input.ttwa-in{
+        width:100%;
+        border-radius:8px;
+        border:1px solid rgba(255,255,255,0.16);
+        background: rgba(18, 22, 30, 0.55);
+        color: #f0f4ff;
+        padding:5px 7px;
+        font-size:12px;
+        outline:none;
+      }
+      select.ttwa-sel option{ background:#242b38; color:#f0f4ff; }
+      input.ttwa-in{ text-align:right; }
+
+      .ttwa-market{
         display:grid;
         grid-template-columns:1fr 1fr;
-        gap:6px 8px;
-        margin-top:8px;
+        gap:6px;
+        font-size:11px;
+        color: var(--ttwa-muted);
       }
-      .row select, .row input[type="number"]{
-        width:100%;
-        background: rgba(255,255,255,0.06);
-        color:#eee;
-        border:1px solid rgba(255,255,255,0.10);
-        border-radius:8px;
-        padding:4px 6px;
+      .ttwa-market label{ display:flex; gap:6px; align-items:center; user-select:none; white-space:nowrap; }
+
+      #${APP}-railTag{
+        position:absolute; left:0; top:0; bottom:0;
+        width: var(--ttwa-rail);
+        display:grid;
+        place-items:center;
+        font-weight:900;
+        letter-spacing:1px;
+        color: rgba(255,255,255,0.75);
+        pointer-events:none;
       }
-      .row label.chk{ display:flex; align-items:center; gap:6px; user-select:none; }
     `;
     document.head.appendChild(css);
   }
 
-  function applyDockShift(open) {
-    const shift = open ? globalState.expandedWidth : globalState.collapsedWidth;
-
-    // Prefer itch wrapper container
-    const gc = document.getElementById('game-container');
-    if (gc) {
-      gc.style.marginLeft = `${shift}px`;
-      gc.style.width = `calc(100% - ${shift}px)`;
-      gc.style.maxWidth = `calc(100% - ${shift}px)`;
-      gc.style.transition = 'margin-left 140ms ease, width 140ms ease';
-      return;
-    }
-
-    // Fallback
-    document.body.style.paddingLeft = `${shift}px`;
-  }
-
-  function setOpen(v) {
-    UI.open = !!v;
-    if (!UI.panel) return;
-    UI.panel.classList.toggle('ttwa2-open', UI.open);
-    applyDockShift(UI.open);
+  function setOpen(open) {
+    if (!root) return;
+    root.classList.toggle('open', open);
+    document.body.style.paddingLeft = open ? `${state.expandedWidth}px` : `${state.railWidth}px`;
   }
 
   function buildUI() {
+    if (root) return;
     ensureCSS();
-    if (UI.panel) return;
 
-    document.documentElement.style.setProperty('--ttwa2-panelw', `${globalState.expandedWidth}px`);
-    document.documentElement.style.setProperty('--ttwa2-railw', `${globalState.collapsedWidth}px`);
-
-    const rail = document.createElement('div');
-    rail.id = 'ttwa2-rail';
-    document.body.appendChild(rail);
-
-    const panel = document.createElement('div');
-    panel.id = 'ttwa2-panel';
-    panel.innerHTML = `
-      <div class="head">
-        <div class="title">TT Worker Allocator</div>
+    root = document.createElement('div');
+    root.id = `${APP}-root`;
+    root.innerHTML = `
+      <div id="${APP}-header">
+        <div id="${APP}-title">TT Worker Allocator</div>
         <div style="display:flex; gap:6px;">
-          <button id="ttwa2-run">${globalState.enabled ? 'Stop' : 'Start'}</button>
-          <button id="ttwa2-pin">${globalState.pinned ? 'Unpin' : 'Pin'}</button>
+          <button class="ttwa-btn" id="${APP}-run"></button>
+          <button class="ttwa-btn" id="${APP}-pin"></button>
         </div>
       </div>
-      <div class="body">
-        <div class="card">
-          <div class="grid2">
-            <div><span class="muted">Workers</span> <b id="ttwa2-workers">–</b></div>
-            <div><span class="muted">Free</span> <b id="ttwa2-free">–</b></div>
-            <div><span class="muted">Pop</span> <b id="ttwa2-pop">–</b></div>
-            <div><span class="muted">Funding</span> <b id="ttwa2-funding">–</b></div>
-          </div>
-          <div class="muted" style="margin-top:6px;">
-            Off = hands off. On = can build. Balance = no building (autobuild off) but balances activation.
-          </div>
-        </div>
-        <div class="card">
-          <div class="muted" style="margin-bottom:6px;">Resources</div>
-          <div class="rows" id="ttwa2-rows"></div>
-        </div>
-      </div>
+      <div id="${APP}-status"></div>
+      <div id="${APP}-list"></div>
+      <div id="${APP}-railTag">TT</div>
     `;
-    document.body.appendChild(panel);
+    document.body.appendChild(root);
 
-    UI.panel = panel;
-    UI.rail = rail;
-    UI.rowsWrap = panel.querySelector('#ttwa2-rows');
+    const runBtn = root.querySelector(`#${APP}-run`);
+    const pinBtn = root.querySelector(`#${APP}-pin`);
 
-    const runBtn = panel.querySelector('#ttwa2-run');
-    const pinBtn = panel.querySelector('#ttwa2-pin');
+    const syncBtns = () => {
+      runBtn.textContent = state.enabled ? 'Stop' : 'Run';
+      pinBtn.textContent = state.pinned ? 'Unpin' : 'Pin';
+    };
+    syncBtns();
 
-    runBtn.addEventListener('click', () => {
-      globalState.enabled = !globalState.enabled;
-      runBtn.textContent = globalState.enabled ? 'Stop' : 'Start';
-      saveAll();
+    runBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.enabled = !state.enabled;
+      saveState();
+      syncBtns();
+    });
+    pinBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.pinned = !state.pinned;
+      saveState();
+      setOpen(state.pinned);
+      syncBtns();
     });
 
-    pinBtn.addEventListener('click', () => {
-      globalState.pinned = !globalState.pinned;
-      pinBtn.textContent = globalState.pinned ? 'Unpin' : 'Pin';
-      saveAll();
-      setOpen(globalState.pinned);
+    root.addEventListener('mouseenter', () => {
+      if (state.pinned) return;
+      if (closeTimer) clearTimeout(closeTimer);
+      setOpen(true);
+    });
+    root.addEventListener('mouseleave', () => {
+      if (state.pinned) return;
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = setTimeout(() => setOpen(false), 130);
     });
 
-    // Hover open/close
-    let closeTimer = null;
-    const openIfAllowed = () => {
-      if (closeTimer) clearTimeout(closeTimer);
-      if (!globalState.pinned) setOpen(true);
-    };
-    const scheduleClose = () => {
-      if (globalState.pinned) return;
-      if (closeTimer) clearTimeout(closeTimer);
-      closeTimer = setTimeout(() => setOpen(false), 160);
-    };
-
-    rail.addEventListener('mouseenter', openIfAllowed);
-    panel.addEventListener('mouseenter', openIfAllowed);
-    rail.addEventListener('mouseleave', scheduleClose);
-    panel.addEventListener('mouseleave', scheduleClose);
-
-    // Safety panic switch: Ctrl+Shift+X toggles the script off/on (keeps UI).
+    // Panic toggle: Ctrl+Shift+X
     window.addEventListener('keydown', (e) => {
-      if (e.ctrlKey && e.shiftKey && (e.key === 'X' || e.key === 'x')) {
-        globalState.enabled = !globalState.enabled;
-        const b = UI.panel?.querySelector('#ttwa2-run');
-        if (b) b.textContent = globalState.enabled ? 'Stop' : 'Start';
-        saveAll();
+      if (e.ctrlKey && e.shiftKey && (e.key === 'x' || e.key === 'X')) {
+        state.enabled = !state.enabled;
+        saveState();
+        syncBtns();
       }
     }, true);
 
-    setOpen(!!globalState.pinned);
+    setOpen(!!state.pinned);
   }
 
-  function buildRow(rk) {
-    ensureRowDefaults(rk);
-    const s = rowState[rk];
+  function render(snap) {
+    if (!root) return;
+    const status = root.querySelector(`#${APP}-status`);
+    const list = root.querySelector(`#${APP}-list`);
 
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.dataset.rk = rk;
-    row.innerHTML = `
-      <div class="top">
-        <div class="name"></div>
-        <div class="muted" style="text-align:right;"><span class="fill">–</span></div>
-      </div>
-      <div class="bar"><i></i></div>
-      <div class="mini">
-        <span class="muted">net</span> <span class="net">–</span>
-        <span class="muted">cap</span> <span class="cap">–</span>
-      </div>
-      <div class="ctrl">
-        <div>
-          <div class="muted">Mode</div>
-          <select class="mode">
-            <option value="off">Off</option>
-            <option value="on">On</option>
-            <option value="balance">Balance</option>
-          </select>
-        </div>
-        <div>
-          <div class="muted">Producer</div>
-          <select class="producer"></select>
-        </div>
-        <div>
-          <div class="muted">Weight</div>
-          <input class="weight" type="number" min="0" max="10" step="0.1"/>
-        </div>
-        <div>
-          <div class="muted">Market</div>
-          <div style="display:flex; gap:10px; align-items:center; height:28px;">
-            <label class="chk"><input class="mbuy" type="checkbox"/> Buy</label>
-            <label class="chk"><input class="msell" type="checkbox"/> Sell</label>
-          </div>
-        </div>
-      </div>
+    const workersCap = snap ? snap.workersCap : 0;
+    const workersVal = snap ? snap.workersVal : 0;
+    const funding = snap ? snap.funding.value : 0;
+    const market = snap ? (snap.marketUnlocked ? 'unlocked' : 'locked') : '…';
+
+    status.innerHTML = `
+      <div>Workers: <b>${fmt(workersVal)}</b> / <b>${fmt(workersCap)}</b></div>
+      <div>Funding: <b>${fmt(funding)}</b>  <span style="opacity:.75">| Market: ${market}</span></div>
     `;
 
-    row.querySelector('.mode').value = s.mode;
-    row.querySelector('.weight').value = String(s.weight);
-    row.querySelector('.mbuy').checked = !!s.mBuy;
-    row.querySelector('.msell').checked = !!s.mSell;
+    list.innerHTML = '';
+    for (const r of RESOURCES) {
+      const cfg = state.resources[r.key];
+      const rs = snap?.res?.[r.key] || null;
 
-    row.querySelector('.mode').addEventListener('change', (e) => { s.mode = e.target.value; saveAll(); });
-    row.querySelector('.weight').addEventListener('change', (e) => { s.weight = clamp(e.target.value, 0, 10); e.target.value = String(s.weight); saveAll(); });
-    row.querySelector('.mbuy').addEventListener('change', (e) => { s.mBuy = !!e.target.checked; saveAll(); });
-    row.querySelector('.msell').addEventListener('change', (e) => { s.mSell = !!e.target.checked; saveAll(); });
-    row.querySelector('.producer').addEventListener('change', (e) => { s.producerKey = e.target.value || null; saveAll(); });
+      const unlocked = !!rs;
+      const fillTxt = unlocked && Number.isFinite(rs.cap) ? `${Math.round(rs.fill * 100)}%` : '—';
+      const net = unlocked ? N(rs.netBaseline, 0) : 0;
+      const netCls = net < 0 ? 'bad' : (net > 0 ? 'good' : '');
+      const warn = unlocked
+        ? (rs.shortage ? '<span class="warn">shortage</span>' : (rs.limited ? '<span class="warn">limited</span>' : ''))
+        : '<span class="warn">locked</span>';
 
-    UI.rows.set(rk, row);
-    return row;
-  }
+      const producers = snap?.producersByRes?.[r.key] || [];
+      const nameOf = (id) => snap?.buildingMeta?.[id]?.name || id;
 
-  function setProducerOptions(rowEl, rk, producers) {
-    const sel = rowEl.querySelector('.producer');
-    const s = rowState[rk];
-    const prev = s.producerKey;
-    sel.innerHTML = '';
+      const row = document.createElement('div');
+      row.className = 'ttwa-row';
+      row.innerHTML = `
+        <div class="ttwa-name">
+          <div class="label">${r.label}</div>
+          <div class="meta">
+            <span>Fill <b>${fillTxt}</b></span>
+            <span>Net <b class="${netCls}">${net >= 0 ? '+' : ''}${fmt(net)}/s</b></span>
+            ${warn ? `<span>${warn}</span>` : ''}
+          </div>
+        </div>
 
-    if (!producers || producers.length === 0) {
-      // IMPORTANT: only disable the producer dropdown, NOT mode/weight/market
-      const opt = document.createElement('option');
-      opt.value = '';
-      opt.textContent = '— (no worker building)';
-      sel.appendChild(opt);
-      sel.disabled = true;
-      return;
+        <select class="ttwa-sel" data-k="mode">
+          <option value="on">On</option>
+          <option value="balance">Balance</option>
+          <option value="off">Off</option>
+        </select>
+
+        <select class="ttwa-sel" data-k="producer">
+          <option value="">Auto</option>
+          ${producers.map(id => `<option value="${id}">${nameOf(id)}</option>`).join('')}
+        </select>
+
+        <input class="ttwa-in" data-k="weight" type="number" min="0" max="100" step="0.25"/>
+
+        <div class="ttwa-market">
+          <label title="Buy from Galactic Market when needed"><input type="checkbox" data-k="buy"/> Buy</label>
+          <label title="Sell surplus to Galactic Market"><input type="checkbox" data-k="sell"/> Sell</label>
+        </div>
+      `;
+
+      const modeSel = row.querySelector('select[data-k="mode"]');
+      const prodSel = row.querySelector('select[data-k="producer"]');
+      const wInp = row.querySelector('input[data-k="weight"]');
+      const buyChk = row.querySelector('input[data-k="buy"]');
+      const sellChk = row.querySelector('input[data-k="sell"]');
+
+      modeSel.value = cfg.mode;
+      prodSel.value = cfg.producer || '';
+      wInp.value = String(N(cfg.weight, 1));
+      buyChk.checked = !!cfg.marketBuy;
+      sellChk.checked = !!cfg.marketSell;
+
+      if (!producers.length) prodSel.disabled = true;
+
+      const onChange = () => {
+        cfg.mode = modeSel.value;
+        cfg.producer = prodSel.value;
+        cfg.weight = clamp(parseFloat(wInp.value), 0, 100);
+        cfg.marketBuy = !!buyChk.checked;
+        cfg.marketSell = !!sellChk.checked;
+        state.resources[r.key] = cfg;
+        saveState();
+      };
+
+      modeSel.addEventListener('change', onChange);
+      prodSel.addEventListener('change', onChange);
+      wInp.addEventListener('change', onChange);
+      buyChk.addEventListener('change', onChange);
+      sellChk.addEventListener('change', onChange);
+
+      list.appendChild(row);
     }
-
-    sel.disabled = false;
-
-    const auto = document.createElement('option');
-    auto.value = '';
-    auto.textContent = 'Auto';
-    sel.appendChild(auto);
-
-    for (const b of producers) {
-      const opt = document.createElement('option');
-      opt.value = b.key;
-      opt.textContent = b.name;
-      sel.appendChild(opt);
-    }
-
-    if (prev && producers.some(p => p.key === prev)) sel.value = prev;
-    else sel.value = '';
-  }
-
-  // ---------------- Main loop ----------------
-  let lastBuildSig = '';
-  let lastMarketSig = '';
-
-  function sig(obj) {
-    try {
-      const keys = Object.keys(obj).sort();
-      let s = '';
-      for (const k of keys) {
-        const v = obj[k];
-        if (v && typeof v === 'object' && !Array.isArray(v)) {
-          const kk = Object.keys(v).sort();
-          s += k + '{';
-          for (const x of kk) s += x + ':' + Math.floor(Number(v[x]) || 0) + ',';
-          s += '}';
-        } else s += k + ':' + String(v) + ';';
-      }
-      return s;
-    } catch { return String(Math.random()); }
   }
 
   function tick() {
-    buildUI();
-    const snap = snapshot();
-    if (!snap) return;
+    try {
+      if (!root) buildUI();
 
-    UI.panel.querySelector('#ttwa2-workers').textContent = formatNum(snap.workerCap);
-    UI.panel.querySelector('#ttwa2-free').textContent = formatNum(snap.workerFree);
-    UI.panel.querySelector('#ttwa2-pop').textContent = `${formatNum(snap.pop)}/${formatNum(snap.popCap)}`;
-    UI.panel.querySelector('#ttwa2-funding').textContent = formatNum(snap.funding);
+      if (!gameReady()) {
+        render(null);
+        return;
+      }
 
-    const producerMap = buildProducerMap(snap);
+      const snap = snapshot();
+      render(snap);
 
-    const rks = Object.keys(snap.res).sort((a, b) => humanResourceName(a).localeCompare(humanResourceName(b)));
-    for (const rk of rks) {
-      ensureRowDefaults(rk);
-      if (!UI.rows.has(rk)) UI.rowsWrap.appendChild(buildRow(rk));
-      const rowEl = UI.rows.get(rk);
+      if (!state.enabled) return;
 
-      const rs = snap.res[rk];
-      rowEl.querySelector('.name').textContent = rs.displayName || humanResourceName(rk);
+      const plan = computeWorkerPlan(snap);
+      applyWorkerPlan(plan);
 
-      const cap = rs.cap;
-      const val = rs.value;
-      const fill = cap > 0 ? (val / cap) : 0;
-      rowEl.querySelector('.fill').textContent = cap > 0 ? `${Math.floor(fill * 100)}%` : '—';
-      rowEl.querySelector('.cap').textContent = cap > 0 ? formatNum(cap) : '—';
-
-      const net = rs.net;
-      rowEl.querySelector('.net').textContent = (net >= 0 ? '+' : '') + formatNum(net) + '/s';
-
-      const bar = rowEl.querySelector('.bar > i');
-      bar.style.width = `${clamp(fill * 100, 0, 100)}%`;
-      bar.style.background = net < 0 ? 'rgba(255,120,120,0.9)' : 'rgba(120,220,120,0.9)';
-
-      setProducerOptions(rowEl, rk, producerMap.get(rk) || []);
-    }
-
-    if (!globalState.enabled) return;
-
-    const buildUpdates = computeBuildingPlan(snap, producerMap);
-    const buildS = sig(buildUpdates);
-    if (buildS !== lastBuildSig) {
-      applyBuildingUpdates(buildUpdates);
-      lastBuildSig = buildS;
-    }
-
-    let mPlan = computeMarketPlan(snap);
-    mPlan = clampMarketToFunding(snap, mPlan);
-    const mS = sig(mPlan);
-    if (mS !== lastMarketSig) {
-      applyMarketPlan(mPlan);
-      lastMarketSig = mS;
+      if (snap.marketUnlocked) {
+        const mPlan = planMarket(snap);
+        applyMarket(mPlan);
+      }
+    } catch {
+      // never lock the game on errors
     }
   }
 
-  setInterval(tick, clamp(globalState.tickMs, 500, 5000));
+  buildUI();
   tick();
-
+  setInterval(tick, 1100);
 })();
