@@ -3,9 +3,10 @@
 // @namespace    tt-wgc-optimizer
 // @version      1.0.0
 // @description  Deterministic optimiser for WGC: stats, stances, difficulty, optional facilities + wgtEquipment spending.
-// @match        *://terraforming.titans/*
-// @match        *://*.terraforming.titans/*
-// @match        *://*/*terraforming*titans*/*
+// @match        https://html-classic.itch.zone/html/*/index.html
+// @match        https://html.itch.zone/html/*/index.html
+// @match        https://*.ssl.hwcdn.net/html/*/index.html
+// @match        https://*.hwcdn.net/html/*/index.html
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
