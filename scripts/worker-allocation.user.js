@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Terraforming Titans - TT Worker Allocator (Resources + Market) v3.1.1
+// @name         Terraforming Titans - TT Worker Allocator (Resources + Market) v3.1.2
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      3.1.1
+// @version      3.1.2
 // @description  Worker allocation by RESOURCE with Off/On/Balance + optional Market Buy/Sell. Only touches UNLOCKED/VISIBLE buildings. Left dock (hover expand) that RESIZES the game; no click-lock.
 // @author       ChatGPT
 // @match        https://html-classic.itch.zone/html/*/index.html
@@ -16,15 +16,12 @@
   'use strict';
 
   /**********************************************************************
-   * v3.1.1 UI hotfix:
-   * - The “messed up” layout in your screenshot was caused by the single-row grid
-   *   forcing the name column down to a few pixels (only 1 letter visible).
-   * - Rows are now 2-line cards:
-   *     line 1: resource name + stats (full width)
-   *     line 2: controls grid (Mode / Producer / Weight / Market)
+   * v3.1.2 Fixes requested:
+   * 1) Game not shifting: use a real #gameHost container sized to remaining viewport.
+   * 2) Remove random "TT": rail tag removed.
    **********************************************************************/
 
-  const APP = 'ttwa311';
+  const APP = 'ttwa312';
   const STORAGE_KEY = 'ttwa31_state_v1'; // keep same to preserve your settings
 
   const RESOURCES = [
@@ -548,8 +545,10 @@
     } catch {}
   }
 
+  // ---------- UI + layout host ----------
   let root = null;
   let closeTimer = null;
+  let gameHost = null;
 
   function fmt(n) {
     n = Number(n);
@@ -569,6 +568,7 @@
       :root{
         --ttwa-rail:${state.railWidth}px;
         --ttwa-wide:${state.expandedWidth}px;
+        --ttwa-pad: var(--ttwa-rail);
         --ttwa-bg:#2b3240;
         --ttwa-panel:#2f3747;
         --ttwa-row1:#354155;
@@ -577,10 +577,21 @@
         --ttwa-text:#e8edf7;
         --ttwa-muted:rgba(232,237,247,0.70);
       }
-      body{
-        padding-left: var(--ttwa-rail) !important;
-        transition: padding-left 140ms ease;
+
+      html, body { height:100%; }
+      body{ margin:0 !important; overflow:hidden; }
+
+      /* Host the actual game in a constrained viewport (left offset) */
+      #${APP}-gameHost{
+        position:fixed;
+        top:0; bottom:0;
+        left: var(--ttwa-pad);
+        right:0;
+        overflow:hidden;
+        /* Make fixed-position children use this as containing block */
+        transform: translateZ(0);
       }
+
       #${APP}-root, #${APP}-root *{ box-sizing:border-box; }
       #${APP}-root{
         position:fixed; top:0; left:0; height:100vh;
@@ -705,30 +716,46 @@
         align-items:center;
         user-select:none;
       }
-
-      #${APP}-railTag{
-        position:absolute; left:0; top:0; bottom:0;
-        width: var(--ttwa-rail);
-        display:grid;
-        place-items:center;
-        font-weight:900;
-        letter-spacing:1px;
-        color: rgba(255,255,255,0.75);
-        pointer-events:none;
-      }
     `;
     document.head.appendChild(css);
+  }
+
+  function setPad(px) {
+    document.documentElement.style.setProperty('--ttwa-pad', `${px}px`);
+  }
+
+  function ensureGameHost() {
+    if (gameHost && document.body.contains(gameHost)) return;
+
+    gameHost = document.createElement('div');
+    gameHost.id = `${APP}-gameHost`;
+
+    // Move current body children into gameHost (except our own nodes if already injected)
+    const nodes = Array.from(document.body.childNodes);
+    for (const node of nodes) {
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+      const el = node;
+      if (el.id === `${APP}-root`) continue;
+      if (el.id === `${APP}-gameHost`) continue;
+      if (el.id && el.id.startsWith(APP)) continue;
+      gameHost.appendChild(el);
+    }
+
+    document.body.appendChild(gameHost);
   }
 
   function setOpen(open) {
     if (!root) return;
     root.classList.toggle('open', open);
-    document.body.style.paddingLeft = open ? `${state.expandedWidth}px` : `${state.railWidth}px`;
+    const pad = open ? state.expandedWidth : state.railWidth;
+    setPad(pad);
   }
 
   function buildUI() {
     if (root) return;
+
     ensureCSS();
+    ensureGameHost();
 
     root = document.createElement('div');
     root.id = `${APP}-root`;
@@ -742,7 +769,6 @@
       </div>
       <div id="${APP}-status"></div>
       <div id="${APP}-list"></div>
-      <div id="${APP}-railTag">TT</div>
     `;
     document.body.appendChild(root);
 
@@ -782,6 +808,7 @@
       closeTimer = setTimeout(() => setOpen(false), 130);
     });
 
+    // Panic toggle: Ctrl+Shift+X
     window.addEventListener('keydown', (e) => {
       if (e.ctrlKey && e.shiftKey && (e.key === 'x' || e.key === 'X')) {
         state.enabled = !state.enabled;
@@ -895,6 +922,7 @@
   function tick() {
     try {
       if (!root) buildUI();
+      ensureGameHost(); // in case the page replaced body contents
 
       if (!gameReady()) {
         render(null);
