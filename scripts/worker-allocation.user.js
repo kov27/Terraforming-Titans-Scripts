@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Terraforming Titans Worker Allocator (Live + Scaled Safeguards + Max Learn) [Firefox Fixed + UI Dock]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      1.0.2
-// @description  Worker allocator overlay + safeguards + MAX weight learning. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis buildings to realize a target allocation plan.
+// @version      1.0.3
+// @description  Worker allocator overlay + safeguards + MAX weight learning. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis structures to realize a target allocation plan.
 // @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -18,153 +18,149 @@
 
 (function () {
   'use strict';
-// ===================== TT Shared Runtime (cross-script contract) =====================
-// Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
-// Persists masterEnabled via localStorage key: tt.masterEnabled
-const TT = (() => {
-  const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-  const LS = (() => {
-    try { return W.localStorage; } catch { return null; }
-  })();
 
-  const scriptName =
-    (typeof GM_info !== 'undefined' && GM_info?.script?.name) ? GM_info.script.name :
-    'TT-Script';
+  // ===================== TT Shared Runtime (cross-script contract) =====================
+  // Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
+  // Persists masterEnabled via localStorage key: tt.masterEnabled
+  const TT = (() => {
+    const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const LS = (() => {
+      try { return W.localStorage; } catch { return null; }
+    })();
 
-  const shared = W.__TT_SHARED__ || (W.__TT_SHARED__ = {
-    masterEnabled: true,
-    pauseUntil: 0,
-    locks: {},        // { [name]: { owner, expiresAt } }
-    lastAction: '',   // string
-    lastError: '',    // string
-  });
+    const scriptName =
+      (typeof GM_info !== 'undefined' && GM_info?.script?.name) ? GM_info.script.name :
+        'TT-Script';
 
-  // Load persisted masterEnabled once (best-effort)
-  if (LS && LS.getItem('tt.masterEnabled') != null) {
-    shared.masterEnabled = LS.getItem('tt.masterEnabled') === '1';
-  }
+    const shared = W.__TT_SHARED__ || (W.__TT_SHARED__ = {
+      masterEnabled: true,
+      pauseUntil: 0,
+      locks: {},        // { [name]: { owner, expiresAt } }
+      lastAction: '',   // string
+      lastError: '',    // string
+    });
 
-  function setMasterEnabled(enabled) {
-    shared.masterEnabled = !!enabled;
-    if (LS) LS.setItem('tt.masterEnabled', shared.masterEnabled ? '1' : '0');
-    note(`MASTER ${shared.masterEnabled ? 'ON' : 'OFF'}`);
-  }
-
-  function isPaused() {
-    return Date.now() < (shared.pauseUntil || 0);
-  }
-
-  function pause(ms, reason = '') {
-    const until = Date.now() + Math.max(0, ms | 0);
-    shared.pauseUntil = Math.max(shared.pauseUntil || 0, until);
-    note(`PAUSE ${ms}ms${reason ? `: ${reason}` : ''}`);
-  }
-
-  function note(msg) {
-    const line = `[${new Date().toISOString()}] ${scriptName}: ${msg}`;
-    shared.lastAction = line;
-    // Keep console noise low; comment out if you want it quieter.
-    console.debug(line);
-  }
-
-  function error(msg, err) {
-    const line = `[${new Date().toISOString()}] ${scriptName}: ERROR ${msg}${err ? ` | ${String(err)}` : ''}`;
-    shared.lastError = line;
-    console.warn(line);
-  }
-
-  // Best-effort lock with TTL. Prevents two scripts changing the same subsystem simultaneously.
-  function tryLock(name, ttlMs = 4000) {
-    const now = Date.now();
-    const lock = shared.locks[name];
-    if (lock && lock.expiresAt > now && lock.owner !== scriptName) return false;
-
-    shared.locks[name] = { owner: scriptName, expiresAt: now + Math.max(250, ttlMs | 0) };
-    return true;
-  }
-
-  function unlock(name) {
-    const lock = shared.locks[name];
-    if (lock && lock.owner === scriptName) delete shared.locks[name];
-  }
-
-  function shouldRun() {
-    return !!shared.masterEnabled && !isPaused();
-  }
-
-  // Convenience wrapper: runs fn only if enabled+not paused+lock acquired.
-  function runExclusive(lockName, ttlMs, fn) {
-    if (!shouldRun()) return false;
-    if (!tryLock(lockName, ttlMs)) return false;
-
-    try {
-      fn();
-      return true;
-    } catch (e) {
-      error(`runExclusive(${lockName})`, e);
-      // Auto-pause briefly on repeated failures to avoid runaway loops
-      pause(2000, `exception in ${lockName}`);
-      return false;
-    } finally {
-      unlock(lockName);
+    // Load persisted masterEnabled once (best-effort)
+    if (LS && LS.getItem('tt.masterEnabled') != null) {
+      shared.masterEnabled = LS.getItem('tt.masterEnabled') === '1';
     }
-  }
 
-  // Optional: quick console helpers
-  W.__TT = {
-    shared,
-    setMasterEnabled,
-    pause,
-  };
+    function setMasterEnabled(enabled) {
+      shared.masterEnabled = !!enabled;
+      if (LS) LS.setItem('tt.masterEnabled', shared.masterEnabled ? '1' : '0');
+      note(`MASTER ${shared.masterEnabled ? 'ON' : 'OFF'}`);
+    }
 
-  return {
-    shared,
-    scriptName,
-    setMasterEnabled,
-    isPaused,
-    pause,
-    note,
-    error,
-    tryLock,
-    unlock,
-    shouldRun,
-    runExclusive,
-  };
-})();
-// ===================== /TT Shared Runtime =====================
+    function isPaused() {
+      return Date.now() < (shared.pauseUntil || 0);
+    }
+
+    function pause(ms, reason = '') {
+      const until = Date.now() + Math.max(0, ms | 0);
+      shared.pauseUntil = Math.max(shared.pauseUntil || 0, until);
+      note(`PAUSE ${ms}ms${reason ? `: ${reason}` : ''}`);
+    }
+
+    function note(msg) {
+      const line = `[${new Date().toISOString()}] ${scriptName}: ${msg}`;
+      shared.lastAction = line;
+      // Keep console noise low; comment out if you want it quieter.
+      console.debug(line);
+    }
+
+    function error(msg, err) {
+      const line = `[${new Date().toISOString()}] ${scriptName}: ERROR ${msg}${err ? ` | ${String(err)}` : ''}`;
+      shared.lastError = line;
+      console.warn(line);
+    }
+
+    // Best-effort lock with TTL. Prevents two scripts changing the same subsystem simultaneously.
+    function tryLock(name, ttlMs = 4000) {
+      const now = Date.now();
+      const lock = shared.locks[name];
+      if (lock && lock.expiresAt > now && lock.owner !== scriptName) return false;
+
+      shared.locks[name] = { owner: scriptName, expiresAt: now + Math.max(250, ttlMs | 0) };
+      return true;
+    }
+
+    function unlock(name) {
+      const lock = shared.locks[name];
+      if (lock && lock.owner === scriptName) delete shared.locks[name];
+    }
+
+    function shouldRun() {
+      return !!shared.masterEnabled && !isPaused();
+    }
+
+    // Convenience wrapper: runs fn only if enabled+not paused+lock acquired.
+    function runExclusive(lockName, ttlMs, fn) {
+      if (!shouldRun()) return false;
+      if (!tryLock(lockName, ttlMs)) return false;
+
+      try {
+        fn();
+        return true;
+      } catch (e) {
+        error(`runExclusive(${lockName})`, e);
+        // Auto-pause briefly on repeated failures to avoid runaway loops
+        pause(2000, `exception in ${lockName}`);
+        return false;
+      } finally {
+        unlock(lockName);
+      }
+    }
+
+    // Optional: quick console helpers
+    W.__TT = {
+      shared,
+      setMasterEnabled,
+      pause,
+    };
+
+    return {
+      shared,
+      scriptName,
+      setMasterEnabled,
+      isPaused,
+      pause,
+      note,
+      error,
+      tryLock,
+      unlock,
+      shouldRun,
+      runExclusive,
+    };
+  })();
+  // ===================== /TT Shared Runtime =====================
 
   /**
-   * MAINTENANCE NOTES (for ChatGPT / future automated edits)
+   * MAINTENANCE NOTES
    *
    * Dataflow:
-   *   (1) Bridge -> snapshot() reads live game state (resources + buildings)
+   *   (1) Bridge -> snapshot() reads live game state (resources + structures)
    *   (2) ensureRows(snapshot) syncs UI rows + persisted rowState (enabled/weight)
    *   (3) adjustSafeguards(snapshot) updates boostPctByKey (persistent %worker reserve) based on buffer logic
    *   (4) maxLearnTick(snapshot) optionally mutates weights via stochastic hill-climb to maximize selected output
-   *   (5) computePlan(snapshot) builds a targetCountByKey for worker-basis buildings, honoring:
-   *         - fixed-demand (non-workers basis) buildings (reserved first)
+   *   (5) computePlan(snapshot) builds a targetCountByKey for worker-basis structures, honoring:
+   *         - fixed-demand (non-workers basis) structures (reserved first)
    *         - minimum floors (Min toggles) with deficit-scaled strength
    *         - emergency floors (buffer + cap-deficit severity) distributed to producers
    *         - persistent boosts (boostPctByKey)
    *         - weights distributing remaining workers
    *         - final overshoot trimming + slack fill
-   *   (6) applyPlan(plan) writes autoBuildPercent for each worker-basis building:
-   *         pct = targetBuildingCount / workerCap * 100
+   *   (6) applyPlan(plan) writes autoBuildPercent for each worker-basis structure:
+   *         pct = targetBuildingCount / autoBuildBase * 100
    *
    * Invariants / constraints:
-   *   - We only touch worker-basis buildings (autoBuildBasis === 'workers') for allocation.
-   *   - Game interprets autoBuildPercent with base=workerCap, yielding target building counts.
-   *   - We convert desired worker allocation -> building count via ceil(workers / effNeed).
+   *   - We only touch worker-basis structures (autoBuildBasis === 'workers') for allocation.
+   *   - We only write to structures that are unlocked AND not hidden in the Structures UI.
+   *   - Game interprets autoBuildPercent with base = structure.getAutoBuildBase(pop, workerCap, collection),
+   *     which may differ from raw workerCap due to base modifiers and min-ratio logic.
    *   - Colonists + Androids are treated as cap-maintained resources:
    *         * request positive net until near-cap (even if consumption==0)
    *         * if consumption>0, enforce a small positive margin
    *         * emergency severity includes cap-deficit term (works even when consumption==0)
-   *
-   * UI architecture:
-   *   - Minimal header (Start/Stop + Minimize)
-   *   - Status card: high-signal summary (Workers + Pop caps + Max/learning score)
-   *   - Allocation card: controls + table
-   *   - All explanatory text is delivered via tooltips (single tooltip component)
    */
 
   // ---------------- VM/Firefox sandbox bridge ----------------
@@ -172,8 +168,8 @@ const TT = (() => {
   var __PAGE__ = (__UW__ && __UW__.wrappedJSObject) ? __UW__.wrappedJSObject : __UW__;
 
   function getPageProp(name) {
-    try { if (__PAGE__ && typeof __PAGE__[name] !== 'undefined') return __PAGE__[name]; } catch (e) {}
-    try { if (__UW__ && typeof __UW__[name] !== 'undefined') return __UW__[name]; } catch (e2) {}
+    try { if (__PAGE__ && typeof __PAGE__[name] !== 'undefined') return __PAGE__[name]; } catch (e) { }
+    try { if (__UW__ && typeof __UW__[name] !== 'undefined') return __UW__[name]; } catch (e2) { }
     return undefined;
   }
 
@@ -202,13 +198,18 @@ const TT = (() => {
         return base * mult;
       } catch (e) { return 0; }
     }
-    function computeTargetCount(b, pop, workerCap, collection) {
+    function computeAutoBuildBase(b, pop, workerCap, collection) {
+      try {
+        if (b && typeof b.getAutoBuildBase === 'function') return safeNumber(b.getAutoBuildBase(pop, workerCap, collection));
+        var basis = String((b && b.autoBuildBasis) ? b.autoBuildBasis : 'population');
+        return (basis === 'workers') ? safeNumber(workerCap) : safeNumber(pop);
+      } catch (e) { return 0; }
+    }
+    function computeTargetCount(b, pop, workerCap, collection, autoBuildBase) {
       try {
         var basis = String((b && b.autoBuildBasis) ? b.autoBuildBasis : 'population');
         if (basis === 'max') return Infinity;
-        var base = 0;
-        if (b && typeof b.getAutoBuildBase === 'function') base = safeNumber(b.getAutoBuildBase(pop, workerCap, collection));
-        else base = (basis === 'workers') ? safeNumber(workerCap) : safeNumber(pop);
+        var base = (typeof autoBuildBase === 'number') ? autoBuildBase : computeAutoBuildBase(b, pop, workerCap, collection);
         var pct = safeNumber(b ? b.autoBuildPercent : 0);
         return Math.ceil((pct * safeNumber(base)) / 100);
       } catch (e) { return 0; }
@@ -260,19 +261,34 @@ const TT = (() => {
         };
       } catch (e) { return null; }
     }
+    function isVisibleStruct(b) {
+      try {
+        if (b && typeof b.isVisible === 'function') return !!b.isVisible();
+        return !!b.unlocked && !b.isHidden;
+      } catch (e) {
+        return !!b && !!b.unlocked && !b.isHidden;
+      }
+    }
 
     __DIRECT_API__ = {
       mode: 'direct',
       ready: function () {
         try {
           var resources = getPageProp('resources');
+          var structures = getPageProp('structures');
           var buildings = getPageProp('buildings');
-          return !!(buildings && resources && resources.colony && resources.colony.workers);
+          return !!(resources && resources.colony && resources.colony.workers && (structures || buildings));
         } catch (e) { return false; }
       },
       snapshot: function () {
         var resources = getPageProp('resources');
-        var collection = getPageProp('buildings') || {};
+        var structures = getPageProp('structures');
+        if (!structures) {
+          var buildings = getPageProp('buildings') || {};
+          var colonies = getPageProp('colonies') || {};
+          structures = Object.assign({}, buildings, colonies);
+        }
+        var collection = structures || {};
 
         var popV = safeNumber(getPath(resources, ['colony', 'colonists', 'value']));
         var popC = safeNumber(getPath(resources, ['colony', 'colonists', 'cap']));
@@ -280,7 +296,7 @@ const TT = (() => {
         var workerFree = safeNumber(getPath(resources, ['colony', 'workers', 'value']));
         var out = { pop: popV, popCap: popC, workerCap: workerCap, workerFree: workerFree, buildings: [], res: {} };
 
-        // Keep these keys observable even if no building currently produces them.
+        // Keep these keys observable even if no structure currently produces them.
         var producedSet = {};
         producedSet['colony:colonists'] = true;
         producedSet['colony:androids'] = true;
@@ -295,19 +311,25 @@ const TT = (() => {
           var prodKeys = collectProducedKeys(b);
           for (var i = 0; i < prodKeys.length; i++) producedSet[prodKeys[i]] = true;
 
+          var basis = String(b.autoBuildBasis || 'population');
+          var autoBuildBase = computeAutoBuildBase(b, popV, workerCap, collection);
+
           out.buildings.push({
             key: key,
             displayName: (b.displayName || b.name || key),
             category: (b.category || ''),
             unlocked: !!b.unlocked,
+            isHidden: !!b.isHidden,
+            visible: isVisibleStruct(b),
             effNeed: effNeed,
             autoBuildEnabled: !!b.autoBuildEnabled,
-            autoBuildBasis: String(b.autoBuildBasis || 'population'),
+            autoBuildBasis: basis,
+            autoBuildBase: autoBuildBase,
             autoBuildPercent: safeNumber(b.autoBuildPercent),
             autoActiveEnabled: !!b.autoActiveEnabled,
             count: safeNumber(b.count),
             active: safeNumber(b.active),
-            targetCount: computeTargetCount(b, popV, workerCap, collection),
+            targetCount: computeTargetCount(b, popV, workerCap, collection, autoBuildBase),
             produces: prodKeys,
             hasExternalInputs: hasExternalInputs(b)
           });
@@ -330,12 +352,30 @@ const TT = (() => {
       },
       apply: function (updates) {
         try {
-          var collection = getPageProp('buildings') || {};
+          var structures = getPageProp('structures');
+          var buildings = getPageProp('buildings') || {};
+          var colonies = getPageProp('colonies') || {};
+          var collection = structures || Object.assign({}, buildings, colonies);
+
+          function getStructByKey(key) {
+            if (buildings && buildings[key]) return buildings[key];
+            if (colonies && colonies[key]) return colonies[key];
+            if (collection && collection[key]) return collection[key];
+            return null;
+          }
+
           for (var key in updates) {
             var u = updates[key];
-            var b = collection[key];
+            var b = getStructByKey(key);
             if (!b || !u) continue;
-            b.autoBuildBasis = 'workers';
+
+            // Do not touch locked/hidden structures (prevents enabling things you can't see/unlock).
+            var vis = isVisibleStruct(b);
+            if (!vis) continue;
+
+            // Only manage worker-basis structures.
+            if (String(b.autoBuildBasis || '') !== 'workers') continue;
+
             b.autoBuildEnabled = true;
             b.autoActiveEnabled = true;
             if (u.hasOwnProperty('autoBuildPercent')) {
@@ -369,13 +409,15 @@ const TT = (() => {
       + "  function safeNumber(x){ return (typeof x==='number' && isFinite(x)) ? x : 0; }\n"
       + "  function getPath(root, path){ try{ var cur=root; for(var i=0;i<path.length;i++){ if(!cur) return undefined; cur=cur[path[i]]; } return cur; }catch(e){ return undefined; } }\n"
       + "  function effectiveWorkerNeed(b){ try{ var base=0; if(b && typeof b.getTotalWorkerNeed==='function') base=safeNumber(b.getTotalWorkerNeed()); else base=safeNumber(b?b.requiresWorker:0); var mult=1; if(b && typeof b.getEffectiveWorkerMultiplier==='function') mult=safeNumber(b.getEffectiveWorkerMultiplier()); if(!mult) mult=1; return base*mult; }catch(e){ return 0; } }\n"
-      + "  function computeTargetCount(b,pop,workerCap,collection){ try{ var basis=String((b&&b.autoBuildBasis)?b.autoBuildBasis:'population'); if(basis==='max') return Infinity; var base=0; if(b && typeof b.getAutoBuildBase==='function') base=safeNumber(b.getAutoBuildBase(pop,workerCap,collection)); else base=(basis==='workers')?safeNumber(workerCap):safeNumber(pop); var pct=safeNumber(b?b.autoBuildPercent:0); return Math.ceil((pct*safeNumber(base))/100); }catch(e){ return 0; } }\n"
+      + "  function computeAutoBuildBase(b,pop,workerCap,collection){ try{ if(b && typeof b.getAutoBuildBase==='function') return safeNumber(b.getAutoBuildBase(pop,workerCap,collection)); var basis=String((b&&b.autoBuildBasis)?b.autoBuildBasis:'population'); return (basis==='workers')?safeNumber(workerCap):safeNumber(pop); }catch(e){ return 0; } }\n"
+      + "  function computeTargetCount(b,pop,workerCap,collection,base){ try{ var basis=String((b&&b.autoBuildBasis)?b.autoBuildBasis:'population'); if(basis==='max') return Infinity; var ab=(typeof base==='number')?base:computeAutoBuildBase(b,pop,workerCap,collection); var pct=safeNumber(b?b.autoBuildPercent:0); return Math.ceil((pct*safeNumber(ab))/100); }catch(e){ return 0; } }\n"
       + "  function isNonZeroConsumptionEntry(v){ if(v==null) return false; if(typeof v==='number') return v!==0; if(typeof v==='object'){ if(typeof v.amount==='number') return v.amount!==0; for(var k in v){ if(typeof v[k]==='number' && v[k]!==0) return true; } } return false; }\n"
       + "  function collectProducedKeys(b){ var out=[]; var prod=b&&b.production?b.production:{}; for(var cat in prod){ if(cat!=='colony' && cat!=='special') continue; var obj=prod[cat]; if(!obj||typeof obj!=='object') continue; for(var res in obj){ out.push(cat+':'+res); } } return out; }\n"
       + "  function hasExternalInputs(b){ var cons=b&&b.consumption?b.consumption:{}; for(var cat in cons){ if(cat==='colony'||cat==='special') continue; var obj=cons[cat]; if(!obj||typeof obj!=='object') continue; for(var res in obj){ if(isNonZeroConsumptionEntry(obj[res])) return true; } } return false; }\n"
       + "  function getResState(cat,res){ try{ var r=resources&&resources[cat]?resources[cat][res]:null; if(!r) return null; var prod=safeNumber(r.productionRate); var cons=safeNumber(r.consumptionRate); return { value:safeNumber(r.value), cap:safeNumber(r.cap), prod:prod, cons:cons, net:prod-cons, overflow:safeNumber(r.overflowRate), unlocked:!!r.unlocked }; }catch(e){ return null; } }\n"
+      + "  function isVisibleStruct(b){ try{ if(b && typeof b.isVisible==='function') return !!b.isVisible(); return !!b.unlocked && !b.isHidden; }catch(e){ return !!b && !!b.unlocked && !b.isHidden; } }\n"
       + "  window.__TT_WORKER_ALLOC__={\n"
-      + "    ready:function(){ try{ return (typeof buildings!=='undefined')&&(typeof resources!=='undefined')&&resources&&resources.colony&&resources.colony.workers; }catch(e){ return false; } },\n"
+      + "    ready:function(){ try{ var hasRes=(typeof resources!=='undefined')&&resources&&resources.colony&&resources.colony.workers; var hasStruct=(typeof structures!=='undefined'&&structures)||(typeof buildings!=='undefined'&&buildings); return !!(hasRes && hasStruct); }catch(e){ return false; } },\n"
       + "    snapshot:function(){\n"
       + "      var popV=safeNumber(getPath(resources,['colony','colonists','value']));\n"
       + "      var popC=safeNumber(getPath(resources,['colony','colonists','cap']));\n"
@@ -383,17 +425,25 @@ const TT = (() => {
       + "      var workerFree=safeNumber(getPath(resources,['colony','workers','value']));\n"
       + "      var out={ pop:popV, popCap:popC, workerCap:workerCap, workerFree:workerFree, buildings:[], res:{} };\n"
       + "      var producedSet={}; producedSet['colony:colonists']=true; producedSet['colony:androids']=true; producedSet['special:spaceships']=true;\n"
-      + "      var collection=(typeof buildings!=='undefined')?buildings:{};\n"
+      + "      var collection=(typeof structures!=='undefined'&&structures)?structures:((typeof buildings!=='undefined')?buildings:{});\n"
+      + "      if(!(typeof structures!=='undefined'&&structures) && (typeof colonies!=='undefined') && colonies){ try{ collection=Object.assign({},collection,colonies); }catch(e){} }\n"
       + "      for(var key in collection){ var b=collection[key]; if(!b) continue; var eff=effectiveWorkerNeed(b); if(!(eff>0)) continue;\n"
       + "        var prodKeys=collectProducedKeys(b); for(var i=0;i<prodKeys.length;i++){ producedSet[prodKeys[i]]=true; }\n"
-      + "        out.buildings.push({ key:key, displayName:(b.displayName||b.name||key), category:(b.category||''), unlocked:!!b.unlocked, effNeed:eff,\n"
-      + "          autoBuildEnabled:!!b.autoBuildEnabled, autoBuildBasis:String(b.autoBuildBasis||'population'), autoBuildPercent:safeNumber(b.autoBuildPercent), autoActiveEnabled:!!b.autoActiveEnabled,\n"
-      + "          count:safeNumber(b.count), active:safeNumber(b.active), targetCount:computeTargetCount(b,popV,workerCap,collection), produces:prodKeys, hasExternalInputs:hasExternalInputs(b) }); }\n"
+      + "        var basis=String(b.autoBuildBasis||'population');\n"
+      + "        var autoBuildBase=computeAutoBuildBase(b,popV,workerCap,collection);\n"
+      + "        out.buildings.push({ key:key, displayName:(b.displayName||b.name||key), category:(b.category||''), unlocked:!!b.unlocked, isHidden:!!b.isHidden, visible:isVisibleStruct(b), effNeed:eff,\n"
+      + "          autoBuildEnabled:!!b.autoBuildEnabled, autoBuildBasis:basis, autoBuildBase:autoBuildBase, autoBuildPercent:safeNumber(b.autoBuildPercent), autoActiveEnabled:!!b.autoActiveEnabled,\n"
+      + "          count:safeNumber(b.count), active:safeNumber(b.active), targetCount:computeTargetCount(b,popV,workerCap,collection,autoBuildBase), produces:prodKeys, hasExternalInputs:hasExternalInputs(b) }); }\n"
       + "      for(var rk in producedSet){ if(!producedSet[rk]) continue; var parts=rk.split(':'); var st=getResState(parts[0],parts[1]); if(st) out.res[rk]=st; }\n"
       + "      out.buildings.sort(function(a,b){ var c=String(a.category||'').localeCompare(String(b.category||'')); if(c) return c; return String(a.displayName||'').localeCompare(String(b.displayName||'')); });\n"
       + "      return out; },\n"
-      + "    apply:function(updates){ try{ var collection=(typeof buildings!=='undefined')?buildings:{}; for(var key in updates){ var u=updates[key]; var b=collection[key]; if(!b||!u) continue;\n"
-      + "        b.autoBuildBasis='workers'; b.autoBuildEnabled=true; b.autoActiveEnabled=true; if(u.hasOwnProperty('autoBuildPercent')){ var v=Number(u.autoBuildPercent); if(isFinite(v)) b.autoBuildPercent=v; } }\n"
+      + "    apply:function(updates){ try{\n"
+      + "      var collection=(typeof structures!=='undefined'&&structures)?structures:((typeof buildings!=='undefined')?buildings:{});\n"
+      + "      if(!(typeof structures!=='undefined'&&structures) && (typeof colonies!=='undefined') && colonies){ try{ collection=Object.assign({},collection,colonies); }catch(e){} }\n"
+      + "      for(var key in updates){ var u=updates[key]; var b=collection[key]; if(!b||!u) continue;\n"
+      + "        var vis=isVisibleStruct(b); if(!vis) continue;\n"
+      + "        if(String(b.autoBuildBasis||'')!=='workers') continue;\n"
+      + "        b.autoBuildEnabled=true; b.autoActiveEnabled=true; if(u.hasOwnProperty('autoBuildPercent')){ var v=Number(u.autoBuildPercent); if(isFinite(v)) b.autoBuildPercent=v; } }\n"
       + "      return {ok:true}; }catch(e){ return {ok:false,error:String(e)}; } }\n"
       + "  };\n"
       + "})();\n";
@@ -419,11 +469,11 @@ const TT = (() => {
     try {
       if (hasGM) return GM_setValue(key, val);
       localStorage.setItem(STORE_KEY + key, JSON.stringify(val));
-    } catch (e) {}
+    } catch (e) { }
   }
 
   // ---------------- small utils ----------------
-  var SUFFIX_FMT = [[1e24,'Y'],[1e21,'Z'],[1e18,'E'],[1e15,'P'],[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']];
+  var SUFFIX_FMT = [[1e24, 'Y'], [1e21, 'Z'], [1e18, 'E'], [1e15, 'P'], [1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
   function fmtNum(x) {
     if (!Number.isFinite(x)) return String(x);
     var ax = Math.abs(x);
@@ -469,7 +519,7 @@ const TT = (() => {
     running: false,
     minimized: false,
 
-    showOnlyUnlocked: true,
+    showOnlyUnlocked: true, // interpreted as "show only visible" in v1.0.3+
 
     // Min toggles + floor strengths (% of remainder, deficit-scaled)
     keepClonesMin: true,
@@ -691,7 +741,7 @@ const TT = (() => {
         root.style.top = p.top + 'px';
         root.style.right = 'auto';
       }
-    } catch (e) {}
+    } catch (e) { }
     clampRootToViewport(root);
   }
 
@@ -699,11 +749,11 @@ const TT = (() => {
     try {
       var r = root.getBoundingClientRect();
       setVal('pos', { left: Math.round(r.left), top: Math.round(r.top) });
-    } catch (e) {}
+    } catch (e) { }
   }
 
   function resetPos(root) {
-    try { setVal('pos', null); } catch (e) {}
+    try { setVal('pos', null); } catch (e) { }
     root.style.left = '';
     root.style.right = '16px';
     root.style.top = '88px';
@@ -736,7 +786,7 @@ const TT = (() => {
       root.style.right = 'auto';
 
       if (handle.setPointerCapture) {
-        try { handle.setPointerCapture(pid); } catch (err) {}
+        try { handle.setPointerCapture(pid); } catch (err) { }
       }
       e.preventDefault();
     });
@@ -820,7 +870,7 @@ const TT = (() => {
 
     setTip(ui.runBtn,
       '<div class="tt">Start / Stop</div>' +
-      '<div class="ln"><div class="lk">Effect</div><div class="lv">When <b>Start</b> is on, this script writes <code>autoBuildPercent</code> into worker-basis buildings every tick.</div></div>' +
+      '<div class="ln"><div class="lk">Effect</div><div class="lv">When <b>Start</b> is on, this script writes <code>autoBuildPercent</code> into worker-basis structures every tick.</div></div>' +
       '<div class="ln"><div class="lk">Safety</div><div class="lv">Stops immediately if bridge apply() fails.</div></div>'
     );
 
@@ -834,12 +884,16 @@ const TT = (() => {
   // ---------------- building helpers ----------------
   function isWorkersBasis(b) { return String(b && b.autoBuildBasis ? b.autoBuildBasis : '') === 'workers'; }
   function hasWorkers(b) { return toNum(b && b.effNeed, 0) > 0; }
+  function isVisibleSnap(b) { return !!(b && (b.visible === true)); }
 
   function getFixedBuildings(snapshot) {
     var out = [];
     for (var i = 0; i < snapshot.buildings.length; i++) {
       var b = snapshot.buildings[i];
-      if (hasWorkers(b) && !isWorkersBasis(b)) out.push(b);
+      if (!hasWorkers(b) || isWorkersBasis(b)) continue;
+      // Only reserve for things that are actually in play (unlocked or already built/active).
+      if (!(b.unlocked || toNum(b.count, 0) > 0 || toNum(b.active, 0) > 0)) continue;
+      out.push(b);
     }
     return out;
   }
@@ -849,7 +903,10 @@ const TT = (() => {
       var b = snapshot.buildings[i];
       if (!hasWorkers(b)) continue;
       if (!isWorkersBasis(b)) continue;
-      if (state.showOnlyUnlocked && !b.unlocked) continue;
+      // Hard safety: never allocate to locked/hidden structures.
+      if (!isVisibleSnap(b)) continue;
+      // Optional display filter: preserved for backwards settings; now also means visible.
+      if (state.showOnlyUnlocked && !isVisibleSnap(b)) continue;
       out.push(b);
     }
     return out;
@@ -920,7 +977,7 @@ const TT = (() => {
         if (isExcludedForMax(rk)) continue;
         return rk;
       }
-    } catch (e) {}
+    } catch (e) { }
     return null;
   }
 
@@ -948,7 +1005,7 @@ const TT = (() => {
       var maxrk = pickMaxResKeyFromBuilding(b);
 
       rowsHtml += ''
-        + '<tr data-key="' + escapeHtml(b.key) + '" data-maxrk="' + escapeHtml(maxrk || '') + '">'
+        + '<tr data-key="' + escapeHtml(b.key) + '" data-maxrk="' + escapeHtml(maxrk || '') + '">' 
         + '  <td class="ttwa-center"><input class="ttwa-use" type="checkbox"></td>'
         + '  <td class="ttwa-center"><input class="ttwa-max" type="checkbox"></td>'
         + '  <td>'
@@ -1014,11 +1071,11 @@ const TT = (() => {
       + '        <th>Workers</th>'
       + '      </tr>'
       + '    </thead>'
-      + '    <tbody>' + (rowsHtml || '<tr><td colspan="5" class="ttwa-muted">No worker-basis buildings detected yet.</td></tr>') + '</tbody>'
+      + '    <tbody>' + (rowsHtml || '<tr><td colspan="5" class="ttwa-muted">No worker-basis structures detected yet.</td></tr>') + '</tbody>'
       + '  </table>'
       + '</div>';
 
-    // Wire controls (unchanged from your version)
+    // Wire controls
     var minClonesBtn = ui.allocCard.querySelector('#ttwa-minClones');
     var minAndroidsBtn = ui.allocCard.querySelector('#ttwa-minAndroids');
     var minShipsBtn = ui.allocCard.querySelector('#ttwa-minShips');
@@ -1920,8 +1977,6 @@ const TT = (() => {
     }
 
     // --- FLOOR CAP: prevent stacked floors (min + emergency + boost) exceeding remainder ---
-    // Without this, floorWorkersUsed can exceed `remainder`, remainForWeights becomes 0,
-    // and overshoot trimming can't reduce floors (causing negative free workers + runaway counts).
     var totalFloorReq = 0;
     for (var fk0 in floorWorkersByKey) {
       if (!floorWorkersByKey.hasOwnProperty(fk0)) continue;
@@ -1936,7 +1991,11 @@ const TT = (() => {
     }
 
     var effByKey = {};
-    for (var b2 = 0; b2 < snapshot.buildings.length; b2++) effByKey[snapshot.buildings[b2].key] = toNum(snapshot.buildings[b2].effNeed, 0);
+    var baseByKey = {};
+    for (var b2 = 0; b2 < snapshot.buildings.length; b2++) {
+      effByKey[snapshot.buildings[b2].key] = toNum(snapshot.buildings[b2].effNeed, 0);
+      baseByKey[snapshot.buildings[b2].key] = toNum(snapshot.buildings[b2].autoBuildBase, 0);
+    }
 
     // Convert floor workers -> floor building counts
     var floorCountByKey = {};
@@ -2048,7 +2107,9 @@ const TT = (() => {
       var workers = cnt4 * eff4;
       workersByKey[b4.key] = workers;
       workerShareByKey[b4.key] = (workerCap > 0) ? (workers / workerCap) : 0;
-      percentByKey[b4.key] = (workerCap > 0) ? (cnt4 * 100 / workerCap) : 0;
+
+      var base = Math.max(0, toNum(baseByKey[b4.key], 0));
+      percentByKey[b4.key] = (base > 0) ? (cnt4 * 100 / base) : 0;
     }
 
     // Breakdowns for status card
@@ -2073,7 +2134,8 @@ const TT = (() => {
       targetCountByKey: targetCountByKey,
       percentByKey: percentByKey,
       workersByKey: workersByKey,
-      workerShareByKey: workerShareByKey
+      workerShareByKey: workerShareByKey,
+      baseByKey: baseByKey
     };
   }
 
@@ -2106,19 +2168,16 @@ const TT = (() => {
       saveSettings();
     }
 
-    // Optional nudge for engines that only recompute on helper call.
-    try {
-      var refreshAll = getPageProp('refreshAllAutoBuildTargets');
-      if (typeof refreshAll === 'function') refreshAll();
-    } catch (e) {}
+    // v1.0.3: DO NOT call refreshAllAutoBuildTargets() here.
+    // It can cause the Structures UI to re-render, closing open menus/rollers.
   }
 
   function renderWaiting(reason) {
-    var msg = reason || 'Waiting for game globals (resources/buildings)…';
+    var msg = reason || 'Waiting for game globals (resources/structures)…';
     ui.statusCard.innerHTML = ''
       + '<div class="ttwa-row" style="justify-content:space-between">'
       + '  <div class="ttwa-kv"><div class="k">Status</div><div class="v"><span class="ttwa-badge">Not ready</span></div></div>'
-      + '  <div class="ttwa-mini ttwa-muted">Open the Colony/Buildings tabs once if the page delays global init.</div>'
+      + '  <div class="ttwa-mini ttwa-muted">Open the Colony/Structures tabs once if the page delays global init.</div>'
       + '</div>'
       + '<div class="ttwa-mini ttwa-muted" style="margin-top:8px">' + escapeHtml(msg) + '</div>';
   }
@@ -2211,8 +2270,10 @@ const TT = (() => {
       var workers = toNum(plan.workersByKey[key], 0);
       var share = toNum(plan.workerShareByKey[key], 0);
       var boost = toNum(boostPctByKey[key], 0);
+      var base = toNum(plan.baseByKey[key], 0);
+      var pctApply = toNum(plan.percentByKey[key], 0);
 
-      // Workers bar = worker share, not autoBuildPercent.
+      // Workers bar = worker share.
       var pctFill = clamp(share * 100, 0, 100);
       barFill.style.width = pctFill.toFixed(2) + '%';
       barText.textContent = fmtNum(workers);
@@ -2227,6 +2288,8 @@ const TT = (() => {
         '<div class="ln"><div class="lk">Enabled</div><div class="lv">' + (en ? 'yes' : 'no') + '</div></div>' +
         '<div class="ln"><div class="lk">Weight</div><div class="lv">' + fmtPct(toNum(rs.weight, 0)) + '</div></div>' +
         '<div class="ln"><div class="lk">Workers/building</div><div class="lv">' + fmtNum(eff) + '</div></div>' +
+        '<div class="ln"><div class="lk">AutoBuild base</div><div class="lv">' + fmtNum(base) + '</div></div>' +
+        '<div class="ln"><div class="lk">AutoBuild %</div><div class="lv">' + fmtPct(pctApply) + '</div></div>' +
         '<div class="ln"><div class="lk">Floor buildings</div><div class="lv">' + fmtNum(floorCnt) + (boost > 0 ? (' · boost ' + fmtPct(boost) + '%') : '') + '</div></div>' +
         '<div class="ln"><div class="lk">Target buildings</div><div class="lv">' + fmtNum(tgtCnt) + '</div></div>' +
         '<div class="ln"><div class="lk">Workers</div><div class="lv">' + fmtNum(workers) + ' (' + pctFill.toFixed(3) + '% cap)</div></div>' +
