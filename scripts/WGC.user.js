@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.1.0
+// @version      1.1.1
 // @description  Deterministic optimiser/manager for Warp Gate Command (teams, stats, stances, difficulty, facilities, WGT equipment, keep-going tickbox).
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -1121,12 +1121,18 @@
       try { localStorage.setItem(LS_POS_KEY, JSON.stringify({ left, top })); } catch (_) {}
     }
     function clampToViewport(left, top, rect) {
+      // Allow dragging partially off-screen so it can get out of the way.
+      // Keep at least MIN_VISIBLE px visible on each axis.
       const w = rect?.width || CFG.panelWidth;
       const h = rect?.height || 200;
-      const pad = 8;
-      const maxL = Math.max(pad, window.innerWidth - w - pad);
-      const maxT = Math.max(pad, window.innerHeight - h - pad);
-      return { left: clamp(left, pad, maxL), top: clamp(top, pad, maxT) };
+      const MIN_VISIBLE = 28;
+
+      const minL = -w + MIN_VISIBLE;
+      const maxL = window.innerWidth - MIN_VISIBLE;
+      const minT = -h + MIN_VISIBLE;
+      const maxT = window.innerHeight - MIN_VISIBLE;
+
+      return { left: clamp(left, minL, maxL), top: clamp(top, minT, maxT) };
     }
 
     const btnCss = (bg, bd) => `all:unset;cursor:pointer;padding:6px 9px;border-radius:10px;background:${bg};border:1px solid ${bd};`;
@@ -1265,9 +1271,12 @@
         refreshPanel();
       });
 
-      // Drag
+      // Drag (safe: only starts after a small movement threshold; stops on mouseup/cancel anywhere)
       const drag = panel.querySelector('#tt-wgc-dragbar');
-      let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+      let dragPending = false;
+      let dragging = false;
+      let startX = 0, startY = 0, startLeft = 0, startTop = 0;
 
       function ensureLeftTop() {
         const rect = panel.getBoundingClientRect();
@@ -1277,39 +1286,78 @@
         panel.style.bottom = 'auto';
       }
 
-      drag.addEventListener('pointerdown', (e) => {
-        const t = e.target;
-        if (t && (t.tagName === 'INPUT' || t.tagName === 'BUTTON' || t.closest('button') || t.closest('label'))) return;
+      function isInteractiveTarget(t) {
+        if (!t) return false;
+        const tag = (t.tagName || '').toUpperCase();
+        if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+        if (t.closest && (t.closest('button') || t.closest('label') || t.closest('input') || t.closest('select') || t.closest('textarea'))) return true;
+        return false;
+      }
 
-        dragging = true;
-        panel.setPointerCapture(e.pointerId);
-        ensureLeftTop();
+      function onMove(e) {
+        if (!dragPending) return;
+
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+
+        // Don't treat a click as a drag until the pointer actually moves a bit.
+        if (!dragging) {
+          if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+          dragging = true;
+          ensureLeftTop();
+        }
+
+        const rect = panel.getBoundingClientRect();
+        const next = clampToViewport(startLeft + dx, startTop + dy, rect);
+        panel.style.left = `${next.left}px`;
+        panel.style.top = `${next.top}px`;
+        e.preventDefault();
+      }
+
+      function endDrag() {
+        if (!dragPending) return;
+        dragPending = false;
+
+        document.removeEventListener('pointermove', onMove, true);
+        document.removeEventListener('pointerup', onUp, true);
+        document.removeEventListener('pointercancel', onCancel, true);
+
+        if (dragging) {
+          dragging = false;
+          const rect = panel.getBoundingClientRect();
+          savePos(rect.left, rect.top);
+        } else {
+          dragging = false;
+        }
+      }
+
+      function onUp(_) { endDrag(); }
+      function onCancel(_) { endDrag(); }
+
+      drag.addEventListener('pointerdown', (e) => {
+        // Only left click / primary touch
+        if (e.button != null && e.button !== 0) return;
+
+        // If user is interacting with a control, don't start dragging.
+        if (isInteractiveTarget(e.target)) return;
+
+        dragPending = true;
+        dragging = false;
 
         const rect = panel.getBoundingClientRect();
         startX = e.clientX;
         startY = e.clientY;
         startLeft = rect.left;
         startTop = rect.top;
-        e.preventDefault();
+
+        // Capture move/up globally so we never "get stuck" dragging.
+        document.addEventListener('pointermove', onMove, true);
+        document.addEventListener('pointerup', onUp, true);
+        document.addEventListener('pointercancel', onCancel, true);
       });
 
-      drag.addEventListener('pointermove', (e) => {
-        if (!dragging) return;
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-        const rect = panel.getBoundingClientRect();
-        const next = clampToViewport(startLeft + dx, startTop + dy, rect);
-        panel.style.left = `${next.left}px`;
-        panel.style.top = `${next.top}px`;
-      });
-
-      drag.addEventListener('pointerup', (e) => {
-        if (!dragging) return;
-        dragging = false;
-        try { panel.releasePointerCapture(e.pointerId); } catch (_) {}
-        const rect = panel.getBoundingClientRect();
-        savePos(rect.left, rect.top);
-      });
+      // Extra safety: if the tab loses focus while dragging, stop.
+      window.addEventListener('blur', () => { endDrag(); }, true);
 
       refreshPanel();
     }
