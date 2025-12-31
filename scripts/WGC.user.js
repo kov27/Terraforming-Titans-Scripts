@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.0.4
-// @description  Deterministic optimiser/manager for WGC (teams, stats, stances, difficulty, facilities, WGT equipment).
+// @version      1.1.0
+// @description  Deterministic optimiser/manager for Warp Gate Command (teams, stats, stances, difficulty, facilities, WGT equipment, keep-going tickbox).
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
@@ -12,73 +12,91 @@
 // ==/UserScript==
 
 /*
-  Notes:
-  - Runs ONLY inside the actual game iframe (html.itch.zone / hwcdn), per your "1" (no top-frame overlay).
-  - Terraforming Titans defines `warpGateCommand` as a top-level `let` (global lexical), NOT window.warpGateCommand.
-  - So we inject the real optimiser into the PAGE scope via a <script> tag.
-  - Once loaded, it exposes: window.ttWgcOpt
+  What this script does (high level)
+  - For each complete WGC team:
+    - Computes the deterministic best (hazardous biomass stance, artifact stance, difficulty) that maximises expected Alien Artifacts/hour
+      with a recall-risk penalty (CFG.riskAversion).
+    - Applies the plan ONLY while the team is idle (op.active === false).
+    - Ensures the "keep going" tickbox in the Start button is ON (this is op.autoStart) for sustained redeploys.
+    - If a better plan is found while the team is active, it will NOT change difficulty mid-op.
+      Instead it can (by default) temporarily untick autoStart so the current op finishes, then re-tunes and restarts.
+
+  Spending behaviour
+  - Alien Artifacts: buys R&D upgrade wgtEquipment (unless disabled) because it deterministically increases artifact drop chance in WGC.
+  - Facilities: when cooldown is ready, upgrades the single facility that increases total expected artifacts/hour across all teams the most.
+  - Stats: respec + allocate points using class+facility-weighted ratios, then sets auto-allocation ratios for future levels.
+
+  HP question (why minDeployHpRatio exists)
+  - If your idle healing is faster than in-op healing, deploying injured teams is usually worse than resting, even on easier difficulty.
+  - The optimiser models this via restTime and recall risk, so you can tune CFG.minDeployHpRatio for your preference.
+
+  Console API
+  - window.ttWgcOpt (in page context) exposes helpers: getWGC(), optimiseNow(), clearCache(), CFG, etc.
 */
 
-(function () {
+(() => {
   'use strict';
 
-  if (window.__ttWgcOptimiserInjected__) return;
-  window.__ttWgcOptimiserInjected__ = true;
+  // Avoid double-inject
+  if (window.__ttWgcOptimiserInjectedV11__) return;
+  window.__ttWgcOptimiserInjectedV11__ = true;
 
   function injectedMain() {
     'use strict';
-
     if (globalThis.ttWgcOpt && globalThis.ttWgcOpt.__installed) return;
 
     /********************************************************************
-     * SETTINGS (edit these)
+     * SETTINGS
      ********************************************************************/
     const CFG = {
       enabled: true,
 
-      // Auto-manage runs:
+      // Core loop cadence
+      optimiseEveryMs: 60_000,    // 1 minute
+      uiRefreshMs: 1_000,
+
+      // Starting logic
       autoStartIdleTeams: true,
-      minDeployHpRatio: 0.65, // 0..1
+      minDeployHpRatio: 0.65,     // don't start a team below this HP ratio
 
-      // Stat management:
+      // "Keep going once I press Start" tickbox (WGC UI: .wgc-auto-start-checkbox)
+      // Backing state is op.autoStart.
+      forceKeepGoingTick: true,
+
+      // If an active team would benefit from retuning (new difficulty/stances):
+      // - 'finish'  => temporarily untick keep-going (autoStart=false) and let this op finish, then retune+restart.
+      // - 'recall'  => recall immediately (fast retune, but interrupts run).
+      // - 'never'   => never interfere; only retune when the user stops the team.
+      retuneModeWhenActive: 'finish', // 'finish' | 'recall' | 'never'
+
+      // Stats / spending
       manageStats: true,
-
-      // Upgrades management:
-      autoUpgradeFacilityWhenReady: true,
-      facilityCandidates: ['library', 'shootingRange', 'obstacleCourse', 'infirmary'], // omit 'barracks' by default
-
-      // Spend Alien Artifacts on Warp Gate Teams Equipment (wgtEquipment)
       autoBuyWgtEquipment: true,
       alienArtifactReserve: 0,
 
-      // Difficulty search bounds
-      difficultyMax: 5000,
+      autoUpgradeFacilityWhenReady: true,
+      facilityCandidates: ['library', 'shootingRange', 'obstacleCourse', 'infirmary'],
 
-      // Risk shaping: higher => safer
+      // Optimiser bounds/shape
+      difficultyMax: 5000,
       riskAversion: 5.0,
 
       // UI
-      panelWidth: 460,
-      refreshMs: 1000,
-
-      // Diagnostics
+      showPanel: true,
       showDiagnostics: true,
-      debugLog: false,
+      panelWidth: 480,
     };
 
-    const LOG = (...a) => { if (CFG.debugLog) console.log('[TT WGC]', ...a); };
-    console.info('[TT WGC] injected optimiser loaded', location.href, 'iframe?', window.top !== window);
+    const LOG = (...a) => { if (CFG.showDiagnostics) console.log('[TT WGC]', ...a); };
 
     /********************************************************************
-     * SAFE ACCESSORS (lexical globals)
+     * Lexical access (game uses lexical globals, not always window props)
      ********************************************************************/
     function getLex(name) {
       try {
         // eslint-disable-next-line no-new-func
         return Function(`return (typeof ${name} !== "undefined") ? ${name} : undefined;`)();
-      } catch (_) {
-        return undefined;
-      }
+      } catch (_) { return undefined; }
     }
 
     function getWGC() {
@@ -87,11 +105,11 @@
     }
 
     function getResources() {
-      return (typeof globalThis.resources !== 'undefined' && globalThis.resources) ? globalThis.resources : getLex('resources');
+      return getLex('resources') || globalThis.resources;
     }
 
     function getStories() {
-      return getLex('WGC_OPERATION_STORIES') || (globalThis.WGC_OPERATION_STORIES || null);
+      return getLex('WGC_OPERATION_STORIES') || globalThis.WGC_OPERATION_STORIES || null;
     }
 
     function tryUpdateWgcUI() {
@@ -102,7 +120,7 @@
     }
 
     /********************************************************************
-     * WGC CONSTANTS (mirrors game logic)
+     * WGC constants (mirrors wgc.js)
      ********************************************************************/
     const BASE_EVENTS = [
       { name: 'Individual Team Power Challenge', type: 'individual', skill: 'power', weight: 1, aliases: ['Team Power Challenge'] },
@@ -122,7 +140,7 @@
       for (const evt of BASE_EVENTS) {
         const { aliases, ...template } = evt;
         map[evt.name] = { ...template };
-        if (Array.isArray(aliases)) for (const alias of aliases) if (!(alias in map)) map[alias] = { ...template };
+        if (Array.isArray(aliases)) for (const a of aliases) if (!(a in map)) map[a] = { ...template };
       }
       return map;
     })();
@@ -141,7 +159,7 @@
     })();
 
     /********************************************************************
-     * Math helpers
+     * Helpers
      ********************************************************************/
     const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
@@ -227,7 +245,7 @@
     }
 
     /********************************************************************
-     * Team skill totals
+     * Team skill totals (mirrors resolveEvent)
      ********************************************************************/
     function skillMultipliers(facilities) {
       const shootingRange = facilities.shootingRange || 0;
@@ -277,7 +295,34 @@
     }
 
     /********************************************************************
-     * Event evaluation (deterministic expected value)
+     * "Keep going" tickbox (Start-button checkbox)
+     * UI: input.wgc-auto-start-checkbox[data-team="..."]
+     * State: op.autoStart
+     ********************************************************************/
+    function setKeepGoing(teamIndex, desired) {
+      const wgc = getWGC();
+      if (!wgc) return false;
+      const op = wgc.operations?.[teamIndex];
+      if (!op) return false;
+
+      op.autoStart = !!desired;
+
+      // Best-effort UI tick
+      try {
+        const sel = `input.wgc-auto-start-checkbox[data-team="${teamIndex}"]`;
+        const el = document.querySelector(sel);
+        if (el && el.checked !== !!desired) {
+          el.checked = !!desired;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      } catch (_) {}
+
+      return true;
+    }
+
+    /********************************************************************
+     * Event evaluation (expected value, deterministic)
      ********************************************************************/
     function evalEventOnce({
       team,
@@ -301,7 +346,6 @@
       const hasReroll = rerollBudget > 0;
 
       const stanceMod = (forceStanceDifficultyModifier != null) ? forceStanceDifficultyModifier : stanceDifficultyModifier(event, hazardStance);
-
       const difficultyForCheck = baseDifficulty * nextDiffMod;
       const scaledDifficulty = difficultyForCheck * stanceMod;
 
@@ -315,7 +359,6 @@
       if (event.type === 'team') {
         skillTotal = teamSkillTotal(team, event.skill, mults);
         dc = Math.max(0, (40 + difficultyForCheck * 4) * stanceMod);
-
         damageEach = 2 * scaledDifficulty;
         if (event.skill === 'wit') damageEach *= 0.5;
         damageEach = Math.max(0, damageEach);
@@ -323,7 +366,6 @@
         skillTotal = combatSkillTotal(team, mults);
         const cm = combatDifficultyMultiplier || 1;
         dc = Math.max(0, (40 * cm + 4 * difficultyForCheck) * stanceMod);
-
         damageEach = Math.max(0, 5 * scaledDifficulty);
       } else if (event.type === 'science') {
         const leader = team[0];
@@ -390,7 +432,7 @@
       }
 
       const chance = eventArtifactChance(event, equipPurchases, artifactStance);
-      const rewardBase = 1 + baseDifficulty * 0.1;
+      const rewardBase = 1 + baseDifficulty * 0.1; // uses base difficulty (wgc.js behaviour)
       const eventMult = event.artifactMultiplier || (event.specialty === 'Natural Scientist' ? 2 : 1);
       const reward = rewardBase * eventMult * nextArtMod;
 
@@ -451,7 +493,7 @@
         }
       }
 
-      let trans = null;
+      let trans;
       if (event.type === 'team' && event.skill === 'athletics') {
         trans = [
           { p: pInitSuccess, nextDiffMod: 0.75, nextArtMod: 1 },
@@ -478,33 +520,21 @@
     }
 
     /********************************************************************
-     * Story evaluation + inserted combat handling
+     * Story evaluation (DP over transitions + inserted combat quirks)
      ********************************************************************/
     function buildStoryEvents(story, hazardStance) {
       const raw = story && Array.isArray(story.events) ? story.events.slice(0, 10) : [];
       const out = [];
       for (const se of raw) {
         const template = baseEventTemplatesByName[se.name] || null;
-        if (template) {
-          const ev = { ...template };
-          ev._stanceMod = stanceDifficultyModifier(ev, hazardStance);
-          out.push(ev);
-        } else {
-          const ev = {
-            name: se.name,
-            type: se.type,
-            skill: se.skill,
-            specialty: se.specialty,
-            escalate: !!se.escalate,
-          };
-          ev._stanceMod = stanceDifficultyModifier(ev, hazardStance);
-          out.push(ev);
-        }
+        const ev = template ? { ...template } : { name: se.name, type: se.type, skill: se.skill, specialty: se.specialty, escalate: !!se.escalate };
+        ev._stanceMod = stanceDifficultyModifier(ev, hazardStance);
+        out.push(ev);
       }
       return out;
     }
 
-    const storyCache = new Map();
+    const storyCache = new Map(); // hazardStance -> eventLists
     function getStoryEventLists(hazardStance) {
       if (storyCache.has(hazardStance)) return storyCache.get(hazardStance);
       const stories = getStories();
@@ -515,17 +545,18 @@
     }
 
     function evaluateStory({ storyEvents, team, facilities, equipPurchases, hazardStance, artifactStance, baseDifficulty }) {
+      // State key: baseIndex|phase|nextDiffMod|nextArtMod
       let nodes = new Map();
-      function key(bi, phase, d, a) { return `${bi}|${phase}|${d}|${a}`; }
-      function addNode(map, bi, phase, d, a, p, timeW, lastW) {
+      const key = (bi, ph, d, a) => `${bi}|${ph}|${d}|${a}`;
+      const add = (map, bi, ph, d, a, p, timeW, lastW) => {
         if (p <= 0) return;
-        const k = key(bi, phase, d, a);
+        const k = key(bi, ph, d, a);
         const cur = map.get(k);
         if (!cur) map.set(k, { p, timeW, lastW });
         else { cur.p += p; cur.timeW += timeW; cur.lastW += lastW; }
-      }
+      };
 
-      addNode(nodes, 0, 0, 1, 1, 1, 60, 0);
+      add(nodes, 0, 0, 1, 1, 1, 60, 0);
 
       let artW = 0;
       const members = team.filter(Boolean);
@@ -537,16 +568,15 @@
       for (let iter = 0; iter < 1000; iter++) {
         if (nodes.size === 0) break;
         const nextNodes = new Map();
-        let progressed = false;
 
         for (const [k, node] of nodes.entries()) {
-          const [biS, phaseS, dS, aS] = k.split('|');
+          const [biS, phS, dS, aS] = k.split('|');
           const bi = parseInt(biS, 10);
-          const phase = parseInt(phaseS, 10);
+          const ph = parseInt(phS, 10);
           const nextDiffMod = Number(dS);
           const nextArtMod = Number(aS);
 
-          if (bi >= 10 && phase === 0) {
+          if (bi >= 10 && ph === 0) {
             endP += node.p;
             lastTimeW += node.lastW;
             continue;
@@ -554,7 +584,7 @@
 
           const curTime = node.timeW / node.p;
 
-          if (phase === 0) {
+          if (ph === 0) {
             const event = storyEvents[bi];
             if (!event) {
               endP += node.p;
@@ -563,26 +593,20 @@
             }
 
             const evRes = evalEventOnce({
-              team, facilities, equipPurchases,
-              hazardStance, artifactStance,
-              baseDifficulty,
-              nextDiffMod, nextArtMod,
-              event,
-              forceStanceDifficultyModifier: event._stanceMod,
-              combatDifficultyMultiplier: 1,
-              isImmediateCombat: false,
+              team, facilities, equipPurchases, hazardStance, artifactStance,
+              baseDifficulty, nextDiffMod, nextArtMod,
+              event, forceStanceDifficultyModifier: event._stanceMod,
+              combatDifficultyMultiplier: 1, isImmediateCombat: false,
             });
 
             artW += node.p * evRes.expectedArtifacts;
-            for (let i = 0; i < members.length; i++) {
-              dmgMeanW[i] += node.p * evRes.dmgMean[i];
-              dmgVarW[i] += node.p * evRes.dmgVar[i];
-            }
+            for (let i = 0; i < members.length; i++) { dmgMeanW[i] += node.p * evRes.dmgMean[i]; dmgVarW[i] += node.p * evRes.dmgVar[i]; }
 
             const inc = evRes.baseDelay + evRes.expectedExtraDelay;
             const baseNewTime = curTime + inc;
 
             const isSocialScience = (event.type === 'science' && event.specialty === 'Social Scientist');
+            const isNaturalEscalate = (event.type === 'science' && event.specialty === 'Natural Scientist' && event.escalate);
 
             for (const tr of evRes.trans) {
               if (tr.p <= 0) continue;
@@ -591,25 +615,25 @@
               const newLastW = pBranch * curTime;
 
               if (isSocialScience) {
+                // In wgc.js, Social Science failure inserts a queued combat at 1.25 difficulty multiplier,
+                // and (quirk) stanceDifficultyModifier is not applied to that inserted combat.
                 const pSucc = evRes.pInitSuccessNonIndividual != null ? evRes.pInitSuccessNonIndividual : 0;
-                const pFailInsert = 1 - pSucc;
+                const pFail = 1 - pSucc;
 
-                const pToCombat = pBranch * pFailInsert;
-                const pToNext = pBranch * (1 - pFailInsert);
+                const pToCombat = pBranch * pFail;
+                const pToNext = pBranch * (1 - pFail);
 
-                if (pToCombat > 0) addNode(nextNodes, bi, 1, 1, 1, pToCombat, (pToCombat / pBranch) * newTimeW, (pToCombat / pBranch) * newLastW);
-                if (pToNext > 0) addNode(nextNodes, bi + 1, 0, 1, 1, pToNext, (pToNext / pBranch) * newTimeW, (pToNext / pBranch) * newLastW);
-              } else if (event.type === 'science' && event.specialty === 'Natural Scientist' && event.escalate) {
+                if (pToCombat > 0) add(nextNodes, bi, 1, 1, 1, pToCombat, (pToCombat / pBranch) * newTimeW, (pToCombat / pBranch) * newLastW);
+                if (pToNext > 0) add(nextNodes, bi + 1, 0, 1, 1, pToNext, (pToNext / pBranch) * newTimeW, (pToNext / pBranch) * newLastW);
+              } else if (isNaturalEscalate) {
+                // Natural Science failure triggers immediate combat (no base delay for that combat)
                 const pSucc = evRes.pInitSuccessNonIndividual != null ? evRes.pInitSuccessNonIndividual : 0;
                 const pFail = 1 - pSucc;
 
                 const combatEv = { name: 'Combat challenge', type: 'combat' };
                 const combatRes = evalEventOnce({
-                  team, facilities, equipPurchases,
-                  hazardStance, artifactStance,
-                  baseDifficulty,
-                  nextDiffMod: 1,
-                  nextArtMod: 1,
+                  team, facilities, equipPurchases, hazardStance, artifactStance,
+                  baseDifficulty, nextDiffMod: 1, nextArtMod: 1,
                   event: combatEv,
                   forceStanceDifficultyModifier: stanceDifficultyModifier(combatEv, hazardStance),
                   combatDifficultyMultiplier: 1,
@@ -617,27 +641,20 @@
                 });
 
                 artW += pBranch * pFail * combatRes.expectedArtifacts;
-                for (let i = 0; i < members.length; i++) {
-                  dmgMeanW[i] += pBranch * pFail * combatRes.dmgMean[i];
-                  dmgVarW[i] += pBranch * pFail * combatRes.dmgVar[i];
-                }
+                for (let i = 0; i < members.length; i++) { dmgMeanW[i] += pBranch * pFail * combatRes.dmgMean[i]; dmgVarW[i] += pBranch * pFail * combatRes.dmgVar[i]; }
 
                 const extraTimeFromCombat = pFail * combatRes.expectedExtraDelay;
-                addNode(nextNodes, bi + 1, 0, 1, 1, pBranch, pBranch * (baseNewTime + extraTimeFromCombat), newLastW);
+                add(nextNodes, bi + 1, 0, 1, 1, pBranch, pBranch * (baseNewTime + extraTimeFromCombat), newLastW);
               } else {
-                addNode(nextNodes, bi + 1, 0, tr.nextDiffMod, tr.nextArtMod, pBranch, newTimeW, newLastW);
+                add(nextNodes, bi + 1, 0, tr.nextDiffMod, tr.nextArtMod, pBranch, newTimeW, newLastW);
               }
             }
-
-            progressed = true;
           } else {
+            // Inserted combat after Social Science failure (queued => base delay applies)
             const combatEv = { name: 'Combat challenge', type: 'combat' };
             const evRes = evalEventOnce({
-              team, facilities, equipPurchases,
-              hazardStance, artifactStance,
-              baseDifficulty,
-              nextDiffMod: 1,
-              nextArtMod: 1,
+              team, facilities, equipPurchases, hazardStance, artifactStance,
+              baseDifficulty, nextDiffMod: 1, nextArtMod: 1,
               event: combatEv,
               forceStanceDifficultyModifier: 1,
               combatDifficultyMultiplier: 1.25,
@@ -645,21 +662,16 @@
             });
 
             artW += node.p * evRes.expectedArtifacts;
-            for (let i = 0; i < members.length; i++) {
-              dmgMeanW[i] += node.p * evRes.dmgMean[i];
-              dmgVarW[i] += node.p * evRes.dmgVar[i];
-            }
+            for (let i = 0; i < members.length; i++) { dmgMeanW[i] += node.p * evRes.dmgMean[i]; dmgVarW[i] += node.p * evRes.dmgVar[i]; }
 
             const inc = evRes.baseDelay + evRes.expectedExtraDelay;
             const newTime = curTime + inc;
 
-            addNode(nextNodes, bi + 1, 0, 1, 1, node.p, node.p * newTime, node.p * curTime);
-            progressed = true;
+            add(nextNodes, bi + 1, 0, 1, 1, node.p, node.p * newTime, node.p * curTime);
           }
         }
 
         nodes = nextNodes;
-        if (!progressed) break;
       }
 
       const denom = endP || 1;
@@ -684,21 +696,10 @@
       const dmgVar = new Array(members.length).fill(0);
 
       for (const storyEvents of storyEventLists) {
-        const r = evaluateStory({
-          storyEvents,
-          team,
-          facilities,
-          equipPurchases,
-          hazardStance,
-          artifactStance,
-          baseDifficulty: difficulty,
-        });
+        const r = evaluateStory({ storyEvents, team, facilities, equipPurchases, hazardStance, artifactStance, baseDifficulty: difficulty });
         art += r.expectedArtifacts;
         lastTime += r.expectedLastTime;
-        for (let i = 0; i < members.length; i++) {
-          dmgMean[i] += r.meanDamage[i];
-          dmgVar[i] += r.varDamage[i];
-        }
+        for (let i = 0; i < members.length; i++) { dmgMean[i] += r.meanDamage[i]; dmgVar[i] += r.varDamage[i]; }
       }
 
       const n = storyEventLists.length;
@@ -706,6 +707,7 @@
       const expLastTime = lastTime / n;
       const duration = Math.max(600, expLastTime);
 
+      // Recall probability approx (independent normal approx)
       let recallProb = 0;
       if (members.length) {
         let survive = 1;
@@ -721,9 +723,10 @@
         recallProb = clamp(1 - survive, 0, 1);
       }
 
+      // Healing/downtime model (approx — tune by changing minDeployHpRatio/riskAversion)
       const healMult = 1 + (facilities.infirmary || 0) * 0.01;
-      const activeHeal = (duration / 60) * 1 * healMult;
-      const idleHealPerSec = (50 / 60) * healMult;
+      const activeHeal = (duration / 60) * 1 * healMult;   // ~1 HP/min during operation (model)
+      const idleHealPerSec = (50 / 60) * healMult;         // ~50 HP/min while resting (model)
 
       let percent = 0;
       const inf = facilities.infirmary || 0;
@@ -752,6 +755,9 @@
       return { score, artifactsPerHour, recallProb, expArtifactsPerOp, duration, restTime };
     }
 
+    /********************************************************************
+     * Difficulty + stance optimisation (deterministic search)
+     ********************************************************************/
     function optimiseForTeam(team, facilities, equipPurchases, currentDifficulty) {
       const stories = getStories();
       if (!Array.isArray(stories) || !stories.length) return null;
@@ -803,7 +809,7 @@
     }
 
     /********************************************************************
-     * Stat allocation
+     * Stat allocation (deterministic)
      ********************************************************************/
     function allocationFromWeights(points, wP, wA, wW) {
       const sum = wP + wA + wW;
@@ -840,7 +846,6 @@
         if (pts <= 0) continue;
 
         let wP = 1, wA = 1, wW = 1;
-
         if (m.classType === 'Soldier') { wP = 7 * mults.pMult; wA = 2 * mults.aMult; wW = 1 * mults.wMult; }
         else if (m.classType === 'Natural Scientist' || m.classType === 'Social Scientist') { wP = 1 * mults.pMult; wA = 2 * mults.aMult; wW = 8 * mults.wMult; }
         else if (m.classType === 'Team Leader') { wP = 3 * mults.pMult; wA = 3 * mults.aMult; wW = 4 * mults.wMult; }
@@ -860,28 +865,7 @@
     }
 
     /********************************************************************
-     * Apply plan to game
-     ********************************************************************/
-    function applyPlan(teamIndex, plan) {
-      const wgc = getWGC();
-      if (!wgc || !plan) return false;
-
-      if (typeof wgc.setStance === 'function') wgc.setStance(teamIndex, plan.hazardStance);
-      if (typeof wgc.setArtifactStance === 'function') wgc.setArtifactStance(teamIndex, plan.artifactStance);
-
-      const op = wgc.operations && wgc.operations[teamIndex];
-      if (op) { op.difficulty = plan.difficulty; op.autoStart = false; }
-
-      tryUpdateWgcUI();
-      return true;
-    }
-
-    function teamReady(team) {
-      return team.every(m => m && m.maxHealth > 0 && (m.health / m.maxHealth) >= CFG.minDeployHpRatio);
-    }
-
-    /********************************************************************
-     * Facilities + R&D spending
+     * Spending: R&D + facilities
      ********************************************************************/
     function tryAutoBuyWgtEquipment() {
       const wgc = getWGC();
@@ -935,8 +919,8 @@
       };
 
       const baseScore = scoreWithFacilities(baseFacilities);
-
       let best = { key: null, score: baseScore };
+
       for (const k of candidates) {
         const fac = { ...baseFacilities, [k]: baseFacilities[k] + 1 };
         const sc = scoreWithFacilities(fac);
@@ -947,18 +931,17 @@
     }
 
     /********************************************************************
-     * Optimise/apply
+     * Plan cache + signatures (so we don't recompute unless state changes)
      ********************************************************************/
-    const planCache = new Map();
+    const planCache = new Map(); // teamIndex -> { sig, plan }
 
     function teamSignature(team, facilities, equip) {
       const members = team.map(m => [m.classType, m.level, m.power, m.athletics, m.wit].join(':')).join('|');
-      const fac = ['infirmary', 'barracks', 'shootingRange', 'obstacleCourse', 'library']
-        .map(k => `${k}=${facilities[k] || 0}`).join(',');
+      const fac = ['infirmary','barracks','shootingRange','obstacleCourse','library'].map(k => `${k}=${facilities[k]||0}`).join(',');
       return `${members}||${fac}||equip=${equip}`;
     }
 
-    function optimiseAndApplyTeam(teamIndex) {
+    function computePlan(teamIndex) {
       const wgc = getWGC();
       if (!wgc) return null;
 
@@ -967,99 +950,270 @@
 
       const facilities = { ...(wgc.facilities || {}) };
       const equip = wgc.rdUpgrades?.wgtEquipment?.purchases || 0;
-
-      if (CFG.manageStats) applyOptimisedStats(team, facilities);
-
       const curDiff = wgc.operations?.[teamIndex]?.difficulty || 0;
-      const sig = teamSignature(team, facilities, equip);
 
+      const sig = teamSignature(team, facilities, equip);
       const cached = planCache.get(teamIndex);
-      if (cached && cached.sig === sig) {
-        applyPlan(teamIndex, cached.plan);
-        return cached.plan;
-      }
+      if (cached && cached.sig === sig) return cached.plan;
 
       const best = optimiseForTeam(team, facilities, equip, curDiff);
       if (!best) return null;
 
       const plan = {
-        hazardStance: best.hazardStance,
+        hazardousBiomassStance: best.hazardStance,
         artifactStance: best.artifactStance,
         difficulty: best.difficulty,
         metrics: best.r,
       };
 
       planCache.set(teamIndex, { sig, plan });
-      applyPlan(teamIndex, plan);
       return plan;
     }
 
-    function optimiseAndApplyAll() {
+    /********************************************************************
+     * Apply plan safely (never mid-op)
+     ********************************************************************/
+    const pendingRetune = new Map(); // teamIndex -> plan we want to apply when idle
+
+    function planDiffersFromCurrent(teamIndex, plan) {
       const wgc = getWGC();
-      if (!wgc) return;
+      if (!wgc || !plan) return false;
+      const op = wgc.operations?.[teamIndex];
+      if (!op) return false;
 
-      tryAutoBuyWgtEquipment();
-      tryAutoUpgradeFacility();
+      const stanceObj = wgc.stances?.[teamIndex] || { hazardousBiomass: 'Neutral', artifact: 'Neutral' };
+      const curHaz = stanceObj.hazardousBiomass || 'Neutral';
+      const curArt = stanceObj.artifact || 'Neutral';
+      const curDiff = Number(op.difficulty || 0);
 
-      for (let ti = 0; ti < 4; ti++) {
-        if (typeof wgc.isTeamUnlocked === 'function' && !wgc.isTeamUnlocked(ti)) continue;
-        const team = wgc.teams?.[ti];
-        if (!Array.isArray(team) || team.some(m => !m)) continue;
-        optimiseAndApplyTeam(ti);
-      }
-
-      tryUpdateWgcUI();
+      if (curHaz !== plan.hazardousBiomassStance) return true;
+      if (curArt !== plan.artifactStance) return true;
+      if (Math.abs(curDiff - plan.difficulty) >= 1) return true;
+      return false;
     }
 
-    function autoTick() {
+    function applyPlanIfIdle(teamIndex, plan) {
+      const wgc = getWGC();
+      if (!wgc || !plan) return false;
+      const op = wgc.operations?.[teamIndex];
+      if (!op || op.active) return false;
+
+      // set stances (wgc.js API)
+      if (typeof wgc.setStance === 'function') wgc.setStance(teamIndex, plan.hazardousBiomassStance);
+      if (typeof wgc.setArtifactStance === 'function') wgc.setArtifactStance(teamIndex, plan.artifactStance);
+
+      // set difficulty
+      op.difficulty = plan.difficulty;
+
+      // ensure keep-going tickbox
+      if (CFG.forceKeepGoingTick) setKeepGoing(teamIndex, true);
+
+      tryUpdateWgcUI();
+      return true;
+    }
+
+    function teamReady(team) {
+      return team.every(m => m && m.maxHealth > 0 && (m.health / m.maxHealth) >= CFG.minDeployHpRatio);
+    }
+
+    /********************************************************************
+     * Main loop
+     ********************************************************************/
+    function optimiseTickOnce() {
       if (!CFG.enabled) return;
+
       const wgc = getWGC();
       if (!wgc || !wgc.enabled) return;
 
+      // Global spending first (affects optimisation)
       if (CFG.autoBuyWgtEquipment) tryAutoBuyWgtEquipment();
       if (CFG.autoUpgradeFacilityWhenReady) tryAutoUpgradeFacility();
 
-      if (!CFG.autoStartIdleTeams) return;
-
       for (let ti = 0; ti < 4; ti++) {
         if (typeof wgc.isTeamUnlocked === 'function' && !wgc.isTeamUnlocked(ti)) continue;
+
         const team = wgc.teams?.[ti];
         if (!Array.isArray(team) || team.some(m => !m)) continue;
 
         const op = wgc.operations?.[ti];
-        if (!op || op.active) continue;
-        if (!teamReady(team)) continue;
+        if (!op) continue;
 
-        const plan = optimiseAndApplyTeam(ti);
+        // Keep-going tickbox behaviour:
+        // - If idle, force it on (unless user disables CFG.forceKeepGoingTick)
+        // - If active, only change it if we are intentionally stopping after finish (retuneMode 'finish')
+        if (!op.active && CFG.forceKeepGoingTick) setKeepGoing(ti, true);
+
+        // Optional stats management: only when idle (so we don't mutate mid-op)
+        if (!op.active && CFG.manageStats) {
+          const facilities = { ...(wgc.facilities || {}) };
+          applyOptimisedStats(team, facilities);
+        }
+
+        // If there is a pending retune and team is idle now, apply and restart
+        if (!op.active && pendingRetune.has(ti)) {
+          const plan = pendingRetune.get(ti);
+          pendingRetune.delete(ti);
+          applyPlanIfIdle(ti, plan);
+
+          if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
+            wgc.startOperation(ti, plan.difficulty);
+            // ensure keep-going ON after pressing start
+            if (CFG.forceKeepGoingTick) setKeepGoing(ti, true);
+            tryUpdateWgcUI();
+          }
+          continue;
+        }
+
+        // Compute plan (cached unless team/facilities/equip changed)
+        const plan = computePlan(ti);
         if (!plan) continue;
 
-        if (typeof wgc.startOperation === 'function') {
+        // ACTIVE team: do NOT change difficulty/stances mid-op.
+        if (op.active) {
+          // If plan differs, decide what to do
+          if (planDiffersFromCurrent(ti, plan)) {
+            if (CFG.retuneModeWhenActive === 'finish') {
+              // Stop after this op finishes by unticking keep-going (autoStart=false)
+              setKeepGoing(ti, false);
+              pendingRetune.set(ti, plan);
+            } else if (CFG.retuneModeWhenActive === 'recall') {
+              if (typeof wgc.recallTeam === 'function') {
+                wgc.recallTeam(ti);
+                // now idle: apply plan and restart
+                applyPlanIfIdle(ti, plan);
+                if (CFG.forceKeepGoingTick) setKeepGoing(ti, true);
+                if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
+                  wgc.startOperation(ti, plan.difficulty);
+                  if (CFG.forceKeepGoingTick) setKeepGoing(ti, true);
+                }
+                tryUpdateWgcUI();
+              }
+            } else {
+              // 'never' => do nothing
+            }
+          }
+          continue;
+        }
+
+        // IDLE team: apply plan
+        applyPlanIfIdle(ti, plan);
+
+        // Auto-start if allowed + HP ok
+        if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
           wgc.startOperation(ti, plan.difficulty);
+          if (CFG.forceKeepGoingTick) setKeepGoing(ti, true);
           tryUpdateWgcUI();
         }
       }
     }
 
     /********************************************************************
-     * UI overlay
+     * UI (optional, draggable)
      ********************************************************************/
+    const LS_POS_KEY = 'ttWgcOpt.panelPos.v11';
     let panel = null;
+    let lastRunAt = 0;
 
-    function cssButton(bg, border) {
-      return `all:unset;cursor:pointer;padding:8px 10px;border-radius:10px;background:${bg};border:1px solid ${border};`;
+    function loadPos() {
+      try { const raw = localStorage.getItem(LS_POS_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; }
+    }
+    function savePos(left, top) {
+      try { localStorage.setItem(LS_POS_KEY, JSON.stringify({ left, top })); } catch (_) {}
+    }
+    function clampToViewport(left, top, rect) {
+      const w = rect?.width || CFG.panelWidth;
+      const h = rect?.height || 200;
+      const pad = 8;
+      const maxL = Math.max(pad, window.innerWidth - w - pad);
+      const maxT = Math.max(pad, window.innerHeight - h - pad);
+      return { left: clamp(left, pad, maxL), top: clamp(top, pad, maxT) };
+    }
+
+    const btnCss = (bg, bd) => `all:unset;cursor:pointer;padding:6px 9px;border-radius:10px;background:${bg};border:1px solid ${bd};`;
+
+    function fmt(x, d = 1) { return Number.isFinite(x) ? x.toFixed(d) : '—'; }
+
+    function refreshPanel() {
+      if (!panel) return;
+      const wgc = getWGC();
+      const res = getResources();
+      const art = res?.special?.alienArtifact?.value;
+      const equip = wgc?.rdUpgrades?.wgtEquipment?.purchases || 0;
+      const cd = wgc?.facilityCooldown || 0;
+      const stories = getStories();
+
+      const status = panel.querySelector('#tt-wgc-status');
+      const teamsBox = panel.querySelector('#tt-wgc-teams');
+      const diag = panel.querySelector('#tt-wgc-diag');
+
+      if (!wgc) {
+        status.innerHTML = `<div>Waiting for <b>warpGateCommand</b>…</div>`;
+        teamsBox.innerHTML = '';
+      } else if (!wgc.enabled) {
+        status.innerHTML = `<div>WGC exists but is <b>disabled</b>. Open the WGC tab.</div>`;
+        teamsBox.innerHTML = '';
+      } else {
+        status.innerHTML = `
+          <div>Alien Artifacts: <b>${Number.isFinite(art) ? fmt(art, 0) : '—'}</b> | wgtEquipment: <b>${equip}</b> | Facility CD: <b>${fmt(cd, 0)}s</b></div>
+          <div style="opacity:0.85;">Auto start idle: <b>${CFG.autoStartIdleTeams ? 'ON' : 'OFF'}</b> | Keep going tick: <b>${CFG.forceKeepGoingTick ? 'ON' : 'OFF'}</b> | Retune while active: <b>${CFG.retuneModeWhenActive}</b></div>
+        `;
+
+        teamsBox.innerHTML = '';
+        for (let ti = 0; ti < 4; ti++) {
+          if (typeof wgc.isTeamUnlocked === 'function' && !wgc.isTeamUnlocked(ti)) continue;
+          const team = wgc.teams?.[ti];
+          if (!Array.isArray(team)) continue;
+          const op = wgc.operations?.[ti];
+          const stanceObj = wgc.stances?.[ti] || { hazardousBiomass: 'Neutral', artifact: 'Neutral' };
+
+          const cached = planCache.get(ti)?.plan || null;
+
+          const fullTeam = team.every(m => m);
+          const ready = fullTeam && teamReady(team.filter(Boolean));
+          const active = !!op?.active;
+
+          const row = document.createElement('div');
+          row.style.cssText = `padding:8px;border-radius:10px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.10);`;
+
+          row.innerHTML = `
+            <div style="display:flex;gap:8px;align-items:center;">
+              <div style="font-weight:800;flex:1;">${wgc.teamNames?.[ti] || `Team ${ti + 1}`}</div>
+              <div style="opacity:0.9;">${active ? '🟩 active' : (ready ? '🟦 ready' : '⬛ resting')}</div>
+            </div>
+            <div style="margin-top:6px;opacity:0.9;">
+              Current: <b>${stanceObj.hazardousBiomass}</b> / <b>${stanceObj.artifact}</b> / diff <b>${fmt(op?.difficulty || 0, 0)}</b> / keep-going <b>${op?.autoStart ? 'ON' : 'OFF'}</b>
+              ${pendingRetune.has(ti) ? `<span style="margin-left:6px;opacity:0.9;">⏳ pending retune</span>` : ``}
+            </div>
+            <div style="margin-top:4px;opacity:0.9;">
+              Best: ${cached ? `<b>${cached.hazardousBiomassStance}</b> / <b>${cached.artifactStance}</b> / diff <b>${cached.difficulty}</b> | ~<b>${fmt(cached.metrics?.artifactsPerHour, 1)}</b>/hr | recall ~<b>${fmt((cached.metrics?.recallProb || 0) * 100, 1)}%</b>` : '—'}
+            </div>
+          `;
+          teamsBox.appendChild(row);
+        }
+      }
+
+      if (CFG.showDiagnostics) {
+        diag.style.display = 'block';
+        diag.innerHTML = `
+          <div style="font-weight:800;margin-bottom:4px;">Diagnostics</div>
+          <div>Stories: <b>${Array.isArray(stories) ? stories.length : '—'}</b></div>
+          <div>Last run: <b>${lastRunAt ? new Date(lastRunAt).toLocaleTimeString() : '—'}</b> | Cache: <b>${planCache.size}</b></div>
+          <div style="opacity:0.85;">Clear cache only clears optimiser memory (not your save).</div>
+        `;
+      } else {
+        diag.style.display = 'none';
+      }
     }
 
     function makePanel() {
-      if (panel) return;
+      if (!CFG.showPanel || panel) return;
 
       const el = document.createElement('div');
       el.id = 'tt-wgc-opt-panel';
       el.style.cssText = `
         position: fixed;
-        right: 12px;
-        bottom: 12px;
-        width: ${CFG.panelWidth}px;
         z-index: 2147483647;
+        width: ${CFG.panelWidth}px;
         background: rgba(18, 22, 30, 0.92);
         color: #e8eefc;
         border: 1px solid rgba(255,255,255,0.14);
@@ -1068,28 +1222,32 @@
         font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
         font-size: 12px;
         padding: 10px;
+        user-select: none;
       `;
 
+      const pos = loadPos();
+      if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+        el.style.left = `${pos.left}px`;
+        el.style.top = `${pos.top}px`;
+        el.style.right = 'auto';
+        el.style.bottom = 'auto';
+      } else {
+        el.style.right = '12px';
+        el.style.bottom = '12px';
+      }
+
       el.innerHTML = `
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+        <div id="tt-wgc-dragbar" style="display:flex;gap:8px;align-items:center;margin-bottom:8px;cursor:move;">
           <div style="font-weight:800;flex:1;">WGC Optimiser & Manager</div>
-          <label style="display:flex;gap:6px;align-items:center;opacity:0.95;">
-            <input id="tt-wgc-enabled" type="checkbox" ${CFG.enabled ? 'checked' : ''}/>
+          <label style="display:flex;gap:6px;align-items:center;opacity:0.95;cursor:pointer;">
+            <input id="tt-wgc-enabled" type="checkbox" ${CFG.enabled ? 'checked' : ''} style="cursor:pointer;"/>
             Enabled
           </label>
+          <button id="tt-wgc-clearcache" title="Clears ONLY optimiser plan cache; does NOT affect the game's save." style="${btnCss('rgba(255,255,255,0.06)','rgba(255,255,255,0.10)')}">Clear cache</button>
         </div>
 
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button id="tt-wgc-optimise" style="${cssButton('rgba(255,255,255,0.10)','rgba(255,255,255,0.12)')}">
-            Optimise & Apply (All)
-          </button>
-          <button id="tt-wgc-clearcache" style="${cssButton('rgba(255,255,255,0.06)','rgba(255,255,255,0.10)')}">
-            Clear cache
-          </button>
-        </div>
-
-        <div id="tt-wgc-status" style="margin-top:10px;opacity:0.92;line-height:1.35;"></div>
-        <div id="tt-wgc-diag" style="margin-top:10px;opacity:0.78;line-height:1.35;display:none;"></div>
+        <div id="tt-wgc-status" style="margin-top:2px;opacity:0.92;line-height:1.35;"></div>
+        <div id="tt-wgc-diag" style="margin-top:10px;opacity:0.78;line-height:1.35;"></div>
         <div id="tt-wgc-teams" style="margin-top:10px;display:flex;flex-direction:column;gap:8px;"></div>
       `;
 
@@ -1101,119 +1259,59 @@
         refreshPanel();
       });
 
-      panel.querySelector('#tt-wgc-optimise').addEventListener('click', () => {
-        optimiseAndApplyAll();
+      panel.querySelector('#tt-wgc-clearcache').addEventListener('click', () => {
+        planCache.clear();
+        pendingRetune.clear();
         refreshPanel();
       });
 
-      panel.querySelector('#tt-wgc-clearcache').addEventListener('click', () => {
-        planCache.clear();
-        refreshPanel();
+      // Drag
+      const drag = panel.querySelector('#tt-wgc-dragbar');
+      let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+      function ensureLeftTop() {
+        const rect = panel.getBoundingClientRect();
+        panel.style.left = `${rect.left}px`;
+        panel.style.top = `${rect.top}px`;
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+      }
+
+      drag.addEventListener('pointerdown', (e) => {
+        const t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'BUTTON' || t.closest('button') || t.closest('label'))) return;
+
+        dragging = true;
+        panel.setPointerCapture(e.pointerId);
+        ensureLeftTop();
+
+        const rect = panel.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        startLeft = rect.left;
+        startTop = rect.top;
+        e.preventDefault();
+      });
+
+      drag.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        const rect = panel.getBoundingClientRect();
+        const next = clampToViewport(startLeft + dx, startTop + dy, rect);
+        panel.style.left = `${next.left}px`;
+        panel.style.top = `${next.top}px`;
+      });
+
+      drag.addEventListener('pointerup', (e) => {
+        if (!dragging) return;
+        dragging = false;
+        try { panel.releasePointerCapture(e.pointerId); } catch (_) {}
+        const rect = panel.getBoundingClientRect();
+        savePos(rect.left, rect.top);
       });
 
       refreshPanel();
-    }
-
-    function fmt(x, d = 1) {
-      if (!Number.isFinite(x)) return '—';
-      return x.toFixed(d);
-    }
-
-    function refreshPanel() {
-      if (!panel) return;
-
-      const wgc = getWGC();
-      const status = panel.querySelector('#tt-wgc-status');
-      const diag = panel.querySelector('#tt-wgc-diag');
-      const teamsBox = panel.querySelector('#tt-wgc-teams');
-
-      const stories = getStories();
-      const resources = getResources();
-      const alienArt = resources?.special?.alienArtifact?.value;
-
-      if (CFG.showDiagnostics) {
-        diag.style.display = 'block';
-        diag.innerHTML = `
-          <div><b>Diagnostics</b></div>
-          <div>warpGateCommand (lexical): <b>${wgc ? 'FOUND' : 'not found'}</b></div>
-          <div>Stories: <b>${Array.isArray(stories) ? stories.length : 'not found'}</b></div>
-          <div>Alien Artifacts: <b>${Number.isFinite(alienArt) ? fmt(alienArt, 0) : '—'}</b></div>
-          <div>URL: <span style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;">${location.href}</span></div>
-        `;
-      } else {
-        diag.style.display = 'none';
-      }
-
-      if (!wgc) {
-        status.innerHTML = `
-          <div style="opacity:0.95;">Waiting for <b>warpGateCommand</b>…</div>
-          <div style="opacity:0.78;">Open/unlock the WGC tab in-game. This panel will update when WGC becomes available.</div>
-        `;
-        teamsBox.innerHTML = '';
-        return;
-      }
-
-      if (!wgc.enabled) {
-        status.innerHTML = `<div>WGC exists but is <b>disabled</b>. Open the WGC tab in-game.</div>`;
-        teamsBox.innerHTML = '';
-        return;
-      }
-
-      const equip = wgc.rdUpgrades?.wgtEquipment?.purchases || 0;
-      const cd = wgc.facilityCooldown || 0;
-
-      status.innerHTML = `
-        <div>Alien Artifacts: <b>${Number.isFinite(alienArt) ? fmt(alienArt, 0) : '—'}</b> | wgtEquipment: <b>${equip}</b> | Facility CD: <b>${fmt(cd, 0)}s</b></div>
-        <div style="opacity:0.85;">AutoStart idle teams: <b>${CFG.autoStartIdleTeams ? 'ON' : 'OFF'}</b> | Min deploy HP: <b>${fmt(CFG.minDeployHpRatio * 100, 0)}%</b></div>
-      `;
-
-      teamsBox.innerHTML = '';
-      for (let ti = 0; ti < 4; ti++) {
-        if (typeof wgc.isTeamUnlocked === 'function' && !wgc.isTeamUnlocked(ti)) continue;
-        const team = wgc.teams?.[ti];
-        if (!Array.isArray(team)) continue;
-
-        const op = wgc.operations?.[ti];
-        const name = wgc.teamNames?.[ti] || `Team ${ti + 1}`;
-
-        const cached = planCache.get(ti)?.plan || null;
-
-        const line = document.createElement('div');
-        line.style.cssText = `
-          padding: 8px;
-          border-radius: 10px;
-          background: rgba(255,255,255,0.06);
-          border: 1px solid rgba(255,255,255,0.10);
-        `;
-
-        const fullTeam = team.every(m => m);
-        const ready = fullTeam && teamReady(team.filter(Boolean));
-        const active = !!op?.active;
-
-        line.innerHTML = `
-          <div style="display:flex;gap:8px;align-items:center;">
-            <div style="font-weight:800;flex:1;">${name}</div>
-            <div style="opacity:0.9;">${active ? '🟩 active' : (ready ? '🟦 ready' : '⬛ resting')}</div>
-            <button data-ti="${ti}" class="tt-wgc-opt-one" style="${cssButton('rgba(255,255,255,0.10)','rgba(255,255,255,0.12)')}">
-              Optimise
-            </button>
-          </div>
-          <div style="margin-top:6px;opacity:0.92;">
-            ${cached ? `Plan: <b>${cached.hazardStance}</b> / <b>${cached.artifactStance}</b> / diff <b>${cached.difficulty}</b> | ~<b>${fmt(cached.metrics?.artifactsPerHour, 1)}</b>/hr | recall ~<b>${fmt((cached.metrics?.recallProb || 0) * 100, 1)}%</b>`
-                     : 'Plan: — (click Optimise)'}
-          </div>
-        `;
-
-        teamsBox.appendChild(line);
-      }
-
-      teamsBox.querySelectorAll('.tt-wgc-opt-one').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          const ti = parseInt(e.currentTarget.getAttribute('data-ti'), 10);
-          optimiseAndApplyTeam(ti);
-          refreshPanel();
-        });
-      });
     }
 
     /********************************************************************
@@ -1226,34 +1324,46 @@
         getWGC,
         getResources,
         getStories,
-        optimiseAndApplyAll,
-        optimiseAndApplyTeam,
         planCache,
+        pendingRetune,
+        clearCache: () => { planCache.clear(); pendingRetune.clear(); },
+        optimiseNow: () => optimiseTickOnce(),
+        setKeepGoing,
       };
 
       makePanel();
 
       setInterval(() => {
+        try { refreshPanel(); } catch (_) {}
+      }, CFG.uiRefreshMs);
+
+      const run = () => {
         try {
-          autoTick();
+          optimiseTickOnce();
+          lastRunAt = Date.now();
           refreshPanel();
         } catch (e) {
-          LOG('tick error', e);
+          LOG('optimise error', e);
         }
-      }, CFG.refreshMs);
+      };
+
+      // Run shortly after load, then every minute
+      setTimeout(run, 1500);
+      setInterval(run, CFG.optimiseEveryMs);
     }
 
-    const waitBody = setInterval(() => {
+    const wait = setInterval(() => {
       if (document.body) {
-        clearInterval(waitBody);
+        clearInterval(wait);
         boot();
       }
     }, 50);
   }
 
+  // Inject into PAGE scope (needed to access lexical globals like warpGateCommand)
   const s = document.createElement('script');
-  s.id = 'tt-wgc-optimiser-injected';
-  s.textContent = '(' + injectedMain.toString() + ')();';
+  s.id = 'tt-wgc-optimiser-injected-v11';
+  s.textContent = `(${injectedMain.toString()})();`;
   (document.documentElement || document.head || document.body).appendChild(s);
   s.remove();
 })();
