@@ -1,1313 +1,2278 @@
 // ==UserScript==
-// @name         Terraforming Titans - Worker Allocation (Resources + Market)
-// @namespace    https://kov27.github.io/
-// @version      3.2.0
-// @description  Resource-centric worker allocator with On/Off/Balance + Market Buy/Sell, docked left popout UI.
-// @author       kov27 + ChatGPT
-// @match        *://*.itch.io/*
-// @match        *://itch.io/*
-// @match        *://*.html5.gamemonetize.co/*
-// @match        *://html5.gamemonetize.co/*
-// @match        *://*.terraformingtitans.com/*
-// @match        *://terraformingtitans.com/*
-// @grant        none
+// @name         Terraforming Titans Worker Allocator (Live + Scaled Safeguards + Max Learn) [Firefox Fixed + UI Dock]
+// @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
+// @version      1.0.2
+// @description  Worker allocator overlay + safeguards + MAX weight learning. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis buildings to realize a target allocation plan.
+// @author       kov27
+// @match        https://html-classic.itch.zone/html/*/index.html
+// @match        https://html.itch.zone/html/*/index.html
+// @match        https://*.ssl.hwcdn.net/html/*/index.html
+// @match        https://*.hwcdn.net/html/*/index.html
+// @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/kov27/Terraforming-Titans-Scripts/main/scripts/worker-allocation.user.js
+// @updateURL    https://raw.githubusercontent.com/kov27/Terraforming-Titans-Scripts/main/scripts/worker-allocation.user.js
+// @grant        unsafeWindow
+// @grant        GM_getValue
+// @grant        GM_setValue
 // ==/UserScript==
 
-(() => {
+(function () {
   'use strict';
+// ===================== TT Shared Runtime (cross-script contract) =====================
+// Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
+// Persists masterEnabled via localStorage key: tt.masterEnabled
+const TT = (() => {
+  const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  const LS = (() => {
+    try { return W.localStorage; } catch { return null; }
+  })();
 
-  /********************************************************************
-   * Safety/Compatibility Notes
-   * - Only manipulates buildings that are (a) in globalThis.buildings and
-   *   (b) visible/unhidden in the game's own Buildings UI (build button exists
-   *       and the row isn't ".hidden"). This prevents interacting with locked
-   *       buildings (e.g., Recycling Facility) on a world where you can't see it.
-   * - UI is rendered once; periodic updates do NOT rebuild controls, preventing
-   *   dropdowns closing / spinners breaking.
-   ********************************************************************/
+  const scriptName =
+    (typeof GM_info !== 'undefined' && GM_info?.script?.name) ? GM_info.script.name :
+    'TT-Script';
 
-  const VERSION = '3.2.0';
-  const STATE_KEY = 'ttwa_state_v3_2_0';
+  const shared = W.__TT_SHARED__ || (W.__TT_SHARED__ = {
+    masterEnabled: true,
+    pauseUntil: 0,
+    locks: {},        // { [name]: { owner, expiresAt } }
+    lastAction: '',   // string
+    lastError: '',    // string
+  });
 
-  // Only track gameplay-relevant colony resources (exclude energy/antimatter/dusts etc.)
-  const RESOURCES = [
-    { key: 'metal',          label: 'Metal',          cat: 'colony' },
-    { key: 'glass',          label: 'Glass',          cat: 'colony' },
-    { key: 'water',          label: 'Water',          cat: 'colony' },
-    { key: 'food',           label: 'Food',           cat: 'colony' },
-    { key: 'components',     label: 'Components',     cat: 'colony' },
-    { key: 'electronics',    label: 'Electronics',    cat: 'colony' },
-    { key: 'superconductors',label: 'Superconductors',cat: 'colony' },
-    { key: 'androids',       label: 'Androids',       cat: 'colony' },
-    { key: 'colonists',      label: 'Colonists',      cat: 'colony' }, // cloning facility
-    { key: 'spaceships',     label: 'Spaceships',     cat: 'colony' },
-  ];
-
-  // Default target stockpile fill (as ratio of cap)
-  const DEFAULT_TARGET_FILL = {
-    metal: 0.55,
-    glass: 0.55,
-    water: 0.55,
-    food: 0.65,          // food treated more conservatively (like v1)
-    components: 0.55,
-    electronics: 0.55,
-    superconductors: 0.45,
-    androids: 0.45,
-    colonists: 0.45,
-    spaceships: 0.35,
-  };
-
-  // UI sizing
-  const RAIL_W = 34;
-  const EXPAND_W = 560;
-
-  // Worker allocation cadence
-  const TICK_MS = 1100;
-
-  // Market tuning
-  const MARKET_BUY_HORIZON_SEC = 12;     // cover deficit over short horizon
-  const MARKET_SELL_HORIZON_SEC = 30;    // drain overfill over longer horizon
-  const MARKET_MIN_TRADE = 1e-6;         // ignore tiny noise
-  const FUNDS_MIN_BUFFER = 0;            // keep funding >= 0 (no buffer)
-
-  // Helpers
-  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-  const fmt = (n, digits = 2) => {
-    if (!Number.isFinite(n)) return '—';
-    const abs = Math.abs(n);
-    if (abs >= 1e9) return (n / 1e9).toFixed(digits) + 'B';
-    if (abs >= 1e6) return (n / 1e6).toFixed(digits) + 'M';
-    if (abs >= 1e3) return (n / 1e3).toFixed(digits) + 'K';
-    if (abs >= 1) return n.toFixed(digits);
-    return n.toFixed(Math.max(digits, 4));
-  };
-
-  // Persistent State
-  function defaultState() {
-    const resources = {};
-    for (const r of RESOURCES) {
-      resources[r.key] = {
-        mode: 'off',           // 'off' | 'on' | 'balance'
-        producer: 'auto',      // building id or 'auto'
-        weight: 1.0,           // base weight
-        marketBuy: false,
-        marketSell: false,
-        targetFill: DEFAULT_TARGET_FILL[r.key] ?? 0.55,
-      };
-    }
-    return {
-      version: VERSION,
-      pinnedOpen: true,
-      resources,
-    };
+  // Load persisted masterEnabled once (best-effort)
+  if (LS && LS.getItem('tt.masterEnabled') != null) {
+    shared.masterEnabled = LS.getItem('tt.masterEnabled') === '1';
   }
 
-  function loadState() {
-    try {
-      const raw = localStorage.getItem(STATE_KEY);
-      if (!raw) return defaultState();
-      const parsed = JSON.parse(raw);
-      const base = defaultState();
-
-      // Merge safely
-      const out = { ...base, ...parsed };
-      out.resources = { ...base.resources, ...(parsed.resources || {}) };
-      for (const k of Object.keys(out.resources)) {
-        out.resources[k] = { ...base.resources[k], ...out.resources[k] };
-        // sanitize
-        if (!['off', 'on', 'balance'].includes(out.resources[k].mode)) out.resources[k].mode = 'off';
-        if (typeof out.resources[k].producer !== 'string') out.resources[k].producer = 'auto';
-        out.resources[k].weight = Number.isFinite(+out.resources[k].weight) ? +out.resources[k].weight : 1.0;
-        out.resources[k].targetFill = clamp(Number(out.resources[k].targetFill ?? base.resources[k].targetFill), 0.05, 0.95);
-        out.resources[k].marketBuy = !!out.resources[k].marketBuy;
-        out.resources[k].marketSell = !!out.resources[k].marketSell;
-      }
-      out.pinnedOpen = !!out.pinnedOpen;
-      out.version = VERSION;
-      return out;
-    } catch {
-      return defaultState();
-    }
+  function setMasterEnabled(enabled) {
+    shared.masterEnabled = !!enabled;
+    if (LS) LS.setItem('tt.masterEnabled', shared.masterEnabled ? '1' : '0');
+    note(`MASTER ${shared.masterEnabled ? 'ON' : 'OFF'}`);
   }
 
-  let STATE = loadState();
-  let saveTimer = null;
-  function saveStateSoon() {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => {
-      saveTimer = null;
-      try {
-        localStorage.setItem(STATE_KEY, JSON.stringify(STATE));
-      } catch {}
-    }, 250);
+  function isPaused() {
+    return Date.now() < (shared.pauseUntil || 0);
   }
 
-  /********************************************************************
-   * Game Introspection (safe, UI-driven visibility)
-   ********************************************************************/
-
-  function gameReady() {
-    return !!(globalThis.resources && globalThis.buildings && globalThis.projectManager);
+  function pause(ms, reason = '') {
+    const until = Date.now() + Math.max(0, ms | 0);
+    shared.pauseUntil = Math.max(shared.pauseUntil || 0, until);
+    note(`PAUSE ${ms}ms${reason ? `: ${reason}` : ''}`);
   }
 
-  function getResourceObj(cat, key) {
-    const c = globalThis.resources?.[cat];
-    return c?.[key] || null;
+  function note(msg) {
+    const line = `[${new Date().toISOString()}] ${scriptName}: ${msg}`;
+    shared.lastAction = line;
+    // Keep console noise low; comment out if you want it quieter.
+    console.debug(line);
   }
 
-  function getFundingObj() {
-    return globalThis.resources?.colony?.funding || null;
+  function error(msg, err) {
+    const line = `[${new Date().toISOString()}] ${scriptName}: ERROR ${msg}${err ? ` | ${String(err)}` : ''}`;
+    shared.lastError = line;
+    console.warn(line);
   }
 
-  // Visible in the game's Buildings tab UI if build button exists and is not hidden.
-  function isBuildingVisibleInUI(building) {
-    if (!building || !building.name) return false;
-    const btn = document.getElementById(`build-${building.name}`);
-    if (!btn) return false;
-    const row = btn.closest('.combined-building-row');
-    if (row && row.classList.contains('hidden')) return false;
-    // Some UIs may hide via style/display
-    if (row) {
-      const cs = window.getComputedStyle(row);
-      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
-    }
+  // Best-effort lock with TTL. Prevents two scripts changing the same subsystem simultaneously.
+  function tryLock(name, ttlMs = 4000) {
+    const now = Date.now();
+    const lock = shared.locks[name];
+    if (lock && lock.expiresAt > now && lock.owner !== scriptName) return false;
+
+    shared.locks[name] = { owner: scriptName, expiresAt: now + Math.max(250, ttlMs | 0) };
     return true;
   }
 
-  function getBuildingWorkerNeed(building) {
-    if (!building) return 0;
-    if (typeof building.getTotalWorkerNeed === 'function') return Number(building.getTotalWorkerNeed()) || 0;
-    return Number(building.requiresWorker) || 0;
+  function unlock(name) {
+    const lock = shared.locks[name];
+    if (lock && lock.owner === scriptName) delete shared.locks[name];
   }
 
-  function extractProducedKeysFromProduction(prod) {
-    const keys = new Set();
-    const wanted = new Set(RESOURCES.map(r => r.key));
-    const visit = (v) => {
-      if (!v || typeof v !== 'object') return;
-      for (const [k, vv] of Object.entries(v)) {
-        if (wanted.has(k)) keys.add(k);
-        visit(vv);
-      }
-    };
-    visit(prod);
-    return [...keys];
+  function shouldRun() {
+    return !!shared.masterEnabled && !isPaused();
   }
 
-  function snapshot() {
-    const snap = {
-      now: Date.now(),
-      workerCap: Number(globalThis.resources?.colony?.workers?.cap) || 0,
-      workersValue: Number(globalThis.resources?.colony?.workers?.value) || 0,
-      funding: {
-        value: Number(getFundingObj()?.value) || 0,
-        cap: Number(getFundingObj()?.cap) || 0,
-      },
-      resources: {},          // key -> { value, cap, totalNet, marketNet, baselineNet, fill }
-      buildings: {},          // id -> { id, displayName, need, count, produces[] }
-      producersByRes: {},     // resKey -> [{id, name, need}]
-      market: null,           // { project, buyPriceFn, sellPriceFn }
-    };
+  // Convenience wrapper: runs fn only if enabled+not paused+lock acquired.
+  function runExclusive(lockName, ttlMs, fn) {
+    if (!shouldRun()) return false;
+    if (!tryLock(lockName, ttlMs)) return false;
 
-    // resources
-    for (const r of RESOURCES) {
-      const obj = getResourceObj(r.cat, r.key);
-      if (!obj) continue;
-      const value = Number(obj.value) || 0;
-      const cap = Number(obj.cap ?? obj.max ?? 0) || 0;
-      const totalNet = (Number(obj.productionRate) || 0) - (Number(obj.consumptionRate) || 0);
-      const marketNet = getMarketNetFromRates(obj);
-      const autobuildAvg = getAutobuildAvgCost(r.cat, r.key);
-      const baselineNet = totalNet - marketNet - autobuildAvg;
-
-      snap.resources[r.key] = {
-        value,
-        cap,
-        fill: cap > 0 ? value / cap : 0,
-        totalNet,
-        marketNet,
-        autobuildAvg,
-        baselineNet,
-        unlocked: obj.unlocked !== undefined ? !!obj.unlocked : true,
-      };
-    }
-
-    // buildings visible in UI
-    const bdict = globalThis.buildings || {};
-    for (const [id, b] of Object.entries(bdict)) {
-      if (!b || !b.name) continue;
-      if (!isBuildingVisibleInUI(b)) continue;
-
-      const produces = extractProducedKeysFromProduction(b.production);
-      if (!produces.length) continue;
-
-      const need = getBuildingWorkerNeed(b);
-      snap.buildings[id] = {
-        id,
-        displayName: b.displayName || b.name || id,
-        need,
-        count: Number(b.count) || 0,
-        produces,
-      };
-    }
-
-    // producers per resource
-    for (const r of RESOURCES) {
-      const list = [];
-      for (const [id, meta] of Object.entries(snap.buildings)) {
-        if (meta.produces.includes(r.key)) {
-          list.push({ id, name: meta.displayName, need: meta.need });
-        }
-      }
-      list.sort((a, b) => (a.need - b.need) || a.name.localeCompare(b.name));
-      snap.producersByRes[r.key] = list;
-    }
-
-    // market project
-    snap.market = getMarketHandle();
-
-    return snap;
-  }
-
-  function getMarketNetFromRates(resObj) {
-    if (!resObj) return 0;
-    // market uses type 'project' and source 'Galactic Market'
-    const pr = resObj.productionRateByType?.project || {};
-    const cr = resObj.consumptionRateByType?.project || {};
-    const sumRates = (map, sign) => {
-      let s = 0;
-      for (const [src, v] of Object.entries(map)) {
-        if (src === 'Galactic Market') s += sign * (Number(v) || 0);
-      }
-      return s;
-    };
-    return sumRates(pr, +1) + sumRates(cr, -1);
-  }
-
-  function getAutobuildAvgCost(category, resourceKey) {
-    const tracker = globalThis.autobuildCostTracker;
-    if (!tracker || typeof tracker.getAverageCost !== 'function') return 0;
-    const v = tracker.getAverageCost(category, resourceKey);
-    return Number(v) || 0;
-  }
-
-  function getMarketHandle() {
     try {
-      const pm = globalThis.projectManager;
-      const proj = pm?.projects?.galactic_market || null;
-      if (!proj) return null;
-      const buyPrice = (cat, resKey) => {
-        if (typeof proj.getBuyPrice === 'function') return Number(proj.getBuyPrice(cat, resKey)) || 0;
-        return 0;
-      };
-      const sellPrice = (cat, resKey, qty) => {
-        if (typeof proj.getSellPrice === 'function') return Number(proj.getSellPrice(cat, resKey, qty)) || 0;
-        return 0;
-      };
-      return { project: proj, buyPrice, sellPrice };
-    } catch {
-      return null;
+      fn();
+      return true;
+    } catch (e) {
+      error(`runExclusive(${lockName})`, e);
+      // Auto-pause briefly on repeated failures to avoid runaway loops
+      pause(2000, `exception in ${lockName}`);
+      return false;
+    } finally {
+      unlock(lockName);
     }
   }
 
-  /********************************************************************
-   * Worker Allocation Planning
-   ********************************************************************/
+  // Optional: quick console helpers
+  W.__TT = {
+    shared,
+    setMasterEnabled,
+    pause,
+  };
 
-  function dynamicWeight(resKey, snapRes, baseWeight, targetFill) {
-    const fill = snapRes.cap > 0 ? snapRes.fill : 0;
-    const net = snapRes.baselineNet;
+  return {
+    shared,
+    scriptName,
+    setMasterEnabled,
+    isPaused,
+    pause,
+    note,
+    error,
+    tryLock,
+    unlock,
+    shouldRun,
+    runExclusive,
+  };
+})();
+// ===================== /TT Shared Runtime =====================
 
-    // Core v1-like feel: stockpile influences urgency strongly.
-    let stockFactor = 1;
-    if (snapRes.cap > 0) {
-      const deficit = clamp((targetFill - fill) / Math.max(0.05, targetFill), -1, 1);
-      // deficit positive => under target => increase weight
-      stockFactor = 1 + deficit * 1.6; // up to 2.6x, down to -0.6x (clamped later)
-    }
+  /**
+   * MAINTENANCE NOTES (for ChatGPT / future automated edits)
+   *
+   * Dataflow:
+   *   (1) Bridge -> snapshot() reads live game state (resources + buildings)
+   *   (2) ensureRows(snapshot) syncs UI rows + persisted rowState (enabled/weight)
+   *   (3) adjustSafeguards(snapshot) updates boostPctByKey (persistent %worker reserve) based on buffer logic
+   *   (4) maxLearnTick(snapshot) optionally mutates weights via stochastic hill-climb to maximize selected output
+   *   (5) computePlan(snapshot) builds a targetCountByKey for worker-basis buildings, honoring:
+   *         - fixed-demand (non-workers basis) buildings (reserved first)
+   *         - minimum floors (Min toggles) with deficit-scaled strength
+   *         - emergency floors (buffer + cap-deficit severity) distributed to producers
+   *         - persistent boosts (boostPctByKey)
+   *         - weights distributing remaining workers
+   *         - final overshoot trimming + slack fill
+   *   (6) applyPlan(plan) writes autoBuildPercent for each worker-basis building:
+   *         pct = targetBuildingCount / workerCap * 100
+   *
+   * Invariants / constraints:
+   *   - We only touch worker-basis buildings (autoBuildBasis === 'workers') for allocation.
+   *   - Game interprets autoBuildPercent with base=workerCap, yielding target building counts.
+   *   - We convert desired worker allocation -> building count via ceil(workers / effNeed).
+   *   - Colonists + Androids are treated as cap-maintained resources:
+   *         * request positive net until near-cap (even if consumption==0)
+   *         * if consumption>0, enforce a small positive margin
+   *         * emergency severity includes cap-deficit term (works even when consumption==0)
+   *
+   * UI architecture:
+   *   - Minimal header (Start/Stop + Minimize)
+   *   - Status card: high-signal summary (Workers + Pop caps + Max/learning score)
+   *   - Allocation card: controls + table
+   *   - All explanatory text is delivered via tooltips (single tooltip component)
+   */
 
-    // Net trend influence (smaller than stockpile)
-    let netFactor = 1;
-    if (Number.isFinite(net)) {
-      if (net < 0) netFactor = 1.25;
-      else if (net > 0) netFactor = 0.90;
-    }
+  // ---------------- VM/Firefox sandbox bridge ----------------
+  var __UW__ = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+  var __PAGE__ = (__UW__ && __UW__.wrappedJSObject) ? __UW__.wrappedJSObject : __UW__;
 
-    // Food special handling (more conservative like v1)
-    let foodFactor = 1;
-    if (resKey === 'food') {
-      const hunger = snapRes.cap > 0 ? clamp((0.75 - fill) / 0.75, 0, 1) : 0.5;
-      foodFactor = 1 + hunger * 1.4; // up to 2.4x when low
-      if (net < 0) foodFactor *= 1.1;
-    }
-
-    let w = baseWeight * stockFactor * netFactor * foodFactor;
-    if (!Number.isFinite(w)) w = baseWeight;
-    return clamp(w, 0.05, 50);
+  function getPageProp(name) {
+    try { if (__PAGE__ && typeof __PAGE__[name] !== 'undefined') return __PAGE__[name]; } catch (e) {}
+    try { if (__UW__ && typeof __UW__[name] !== 'undefined') return __UW__[name]; } catch (e2) {}
+    return undefined;
   }
 
-  function chooseAutoProducer(resKey, producers, snap) {
-    // Prefer the one with highest built count; tie-break by worker need (lower), then name.
-    let best = null;
-    let bestCount = -1;
-    let bestNeed = Infinity;
-    for (const p of producers) {
-      const cnt = snap.buildings?.[p.id]?.count ?? 0;
-      const need = snap.buildings?.[p.id]?.need ?? 0;
-      if (cnt > bestCount) {
-        best = p.id; bestCount = cnt; bestNeed = need;
-      } else if (cnt === bestCount) {
-        if (need < bestNeed) {
-          best = p.id; bestNeed = need;
-        } else if (need === bestNeed && best && p.id.localeCompare(best) < 0) {
-          best = p.id;
-        }
+  // Direct API fallback (when script injection is blocked).
+  var __DIRECT_API__ = null;
+
+  function getDirectApi() {
+    if (__DIRECT_API__) return __DIRECT_API__;
+
+    function safeNumber(x) { return (typeof x === 'number' && isFinite(x)) ? x : 0; }
+    function getPath(root, path) {
+      try {
+        var cur = root;
+        for (var i = 0; i < path.length; i++) { if (!cur) return undefined; cur = cur[path[i]]; }
+        return cur;
+      } catch (e) { return undefined; }
+    }
+    function effectiveWorkerNeed(b) {
+      try {
+        var base = 0;
+        if (b && typeof b.getTotalWorkerNeed === 'function') base = safeNumber(b.getTotalWorkerNeed());
+        else base = safeNumber(b ? b.requiresWorker : 0);
+        var mult = 1;
+        if (b && typeof b.getEffectiveWorkerMultiplier === 'function') mult = safeNumber(b.getEffectiveWorkerMultiplier());
+        if (!mult) mult = 1;
+        return base * mult;
+      } catch (e) { return 0; }
+    }
+    function computeTargetCount(b, pop, workerCap, collection) {
+      try {
+        var basis = String((b && b.autoBuildBasis) ? b.autoBuildBasis : 'population');
+        if (basis === 'max') return Infinity;
+        var base = 0;
+        if (b && typeof b.getAutoBuildBase === 'function') base = safeNumber(b.getAutoBuildBase(pop, workerCap, collection));
+        else base = (basis === 'workers') ? safeNumber(workerCap) : safeNumber(pop);
+        var pct = safeNumber(b ? b.autoBuildPercent : 0);
+        return Math.ceil((pct * safeNumber(base)) / 100);
+      } catch (e) { return 0; }
+    }
+    function isNonZeroConsumptionEntry(v) {
+      if (v == null) return false;
+      if (typeof v === 'number') return v !== 0;
+      if (typeof v === 'object') {
+        if (typeof v.amount === 'number') return v.amount !== 0;
+        for (var k in v) { if (typeof v[k] === 'number' && v[k] !== 0) return true; }
       }
+      return false;
     }
-    return best || (producers[0]?.id ?? null);
-  }
+    function collectProducedKeys(b) {
+      var out = [];
+      var prod = b && b.production ? b.production : {};
+      for (var cat in prod) {
+        if (cat !== 'colony' && cat !== 'special') continue;
+        var obj = prod[cat];
+        if (!obj || typeof obj !== 'object') continue;
+        for (var res in obj) out.push(cat + ':' + res);
+      }
+      return out;
+    }
+    function hasExternalInputs(b) {
+      var cons = b && b.consumption ? b.consumption : {};
+      for (var cat in cons) {
+        if (cat === 'colony' || cat === 'special') continue;
+        var obj = cons[cat];
+        if (!obj || typeof obj !== 'object') continue;
+        for (var res in obj) { if (isNonZeroConsumptionEntry(obj[res])) return true; }
+      }
+      return false;
+    }
+    function getResState(resources, cat, res) {
+      try {
+        var r = resources && resources[cat] ? resources[cat][res] : null;
+        if (!r) return null;
+        var prod = safeNumber(r.productionRate);
+        var cons = safeNumber(r.consumptionRate);
+        return {
+          value: safeNumber(r.value),
+          cap: safeNumber(r.cap),
+          prod: prod,
+          cons: cons,
+          net: prod - cons,
+          overflow: safeNumber(r.overflowRate),
+          unlocked: !!r.unlocked
+        };
+      } catch (e) { return null; }
+    }
 
-  function computeWorkerPlan(snap) {
-    const Wcap = snap.workerCap;
-    const plan = {
-      workerCap: Wcap,
-      lines: [],      // { buildingId, desiredCount, mode, need, reasonResKeys:[] }
-      counts: {},     // buildingId -> count integer
-      market: { buy: [], sell: [], note: '' },
-      notes: [],
+    __DIRECT_API__ = {
+      mode: 'direct',
+      ready: function () {
+        try {
+          var resources = getPageProp('resources');
+          var buildings = getPageProp('buildings');
+          return !!(buildings && resources && resources.colony && resources.colony.workers);
+        } catch (e) { return false; }
+      },
+      snapshot: function () {
+        var resources = getPageProp('resources');
+        var collection = getPageProp('buildings') || {};
+
+        var popV = safeNumber(getPath(resources, ['colony', 'colonists', 'value']));
+        var popC = safeNumber(getPath(resources, ['colony', 'colonists', 'cap']));
+        var workerCap = safeNumber(getPath(resources, ['colony', 'workers', 'cap']));
+        var workerFree = safeNumber(getPath(resources, ['colony', 'workers', 'value']));
+        var out = { pop: popV, popCap: popC, workerCap: workerCap, workerFree: workerFree, buildings: [], res: {} };
+
+        // Keep these keys observable even if no building currently produces them.
+        var producedSet = {};
+        producedSet['colony:colonists'] = true;
+        producedSet['colony:androids'] = true;
+        producedSet['special:spaceships'] = true;
+
+        for (var key in collection) {
+          var b = collection[key];
+          if (!b) continue;
+          var effNeed = effectiveWorkerNeed(b);
+          if (!(effNeed > 0)) continue;
+
+          var prodKeys = collectProducedKeys(b);
+          for (var i = 0; i < prodKeys.length; i++) producedSet[prodKeys[i]] = true;
+
+          out.buildings.push({
+            key: key,
+            displayName: (b.displayName || b.name || key),
+            category: (b.category || ''),
+            unlocked: !!b.unlocked,
+            effNeed: effNeed,
+            autoBuildEnabled: !!b.autoBuildEnabled,
+            autoBuildBasis: String(b.autoBuildBasis || 'population'),
+            autoBuildPercent: safeNumber(b.autoBuildPercent),
+            autoActiveEnabled: !!b.autoActiveEnabled,
+            count: safeNumber(b.count),
+            active: safeNumber(b.active),
+            targetCount: computeTargetCount(b, popV, workerCap, collection),
+            produces: prodKeys,
+            hasExternalInputs: hasExternalInputs(b)
+          });
+        }
+
+        for (var rk in producedSet) {
+          if (!producedSet[rk]) continue;
+          var parts = rk.split(':');
+          var st = getResState(resources, parts[0], parts[1]);
+          if (st) out.res[rk] = st;
+        }
+
+        out.buildings.sort(function (a, b) {
+          var c = String(a.category || '').localeCompare(String(b.category || ''));
+          if (c) return c;
+          return String(a.displayName || '').localeCompare(String(b.displayName || ''));
+        });
+
+        return out;
+      },
+      apply: function (updates) {
+        try {
+          var collection = getPageProp('buildings') || {};
+          for (var key in updates) {
+            var u = updates[key];
+            var b = collection[key];
+            if (!b || !u) continue;
+            b.autoBuildBasis = 'workers';
+            b.autoBuildEnabled = true;
+            b.autoActiveEnabled = true;
+            if (u.hasOwnProperty('autoBuildPercent')) {
+              var v = Number(u.autoBuildPercent);
+              if (isFinite(v)) b.autoBuildPercent = v;
+            }
+          }
+          return { ok: true };
+        } catch (e) { return { ok: false, error: String(e) }; }
+      }
     };
 
-    if (!Wcap || Wcap <= 0) {
-      plan.notes.push('No worker cap detected.');
-      return plan;
-    }
+    return __DIRECT_API__;
+  }
 
-    // Build list of controlled resources and chosen producers
-    const lines = [];
-    const buildingToRes = new Map(); // buildingId -> [resKey,...] for combined weight
-    for (const r of RESOURCES) {
-      const st = STATE.resources[r.key];
-      if (!st) continue;
-      if (st.mode === 'off') continue;
+  function getApi() {
+    var injected = getPageProp('__TT_WORKER_ALLOC__');
+    if (injected) return injected;
+    var d = getDirectApi();
+    if (d && typeof d.ready === 'function' && d.ready()) return d;
+    return null;
+  }
 
-      const producers = snap.producersByRes[r.key] || [];
-      if (!producers.length) continue;
+  // Page-context bridge (best compatibility path).
+  function injectBridge() {
+    if (getApi()) return;
 
-      let producerId = st.producer;
-      if (producerId === 'auto' || !snap.buildings?.[producerId]) {
-        producerId = chooseAutoProducer(r.key, producers, snap);
+    var code = ""
+      + "(function(){\n"
+      + "  if (window.__TT_WORKER_ALLOC__) return;\n"
+      + "  function safeNumber(x){ return (typeof x==='number' && isFinite(x)) ? x : 0; }\n"
+      + "  function getPath(root, path){ try{ var cur=root; for(var i=0;i<path.length;i++){ if(!cur) return undefined; cur=cur[path[i]]; } return cur; }catch(e){ return undefined; } }\n"
+      + "  function effectiveWorkerNeed(b){ try{ var base=0; if(b && typeof b.getTotalWorkerNeed==='function') base=safeNumber(b.getTotalWorkerNeed()); else base=safeNumber(b?b.requiresWorker:0); var mult=1; if(b && typeof b.getEffectiveWorkerMultiplier==='function') mult=safeNumber(b.getEffectiveWorkerMultiplier()); if(!mult) mult=1; return base*mult; }catch(e){ return 0; } }\n"
+      + "  function computeTargetCount(b,pop,workerCap,collection){ try{ var basis=String((b&&b.autoBuildBasis)?b.autoBuildBasis:'population'); if(basis==='max') return Infinity; var base=0; if(b && typeof b.getAutoBuildBase==='function') base=safeNumber(b.getAutoBuildBase(pop,workerCap,collection)); else base=(basis==='workers')?safeNumber(workerCap):safeNumber(pop); var pct=safeNumber(b?b.autoBuildPercent:0); return Math.ceil((pct*safeNumber(base))/100); }catch(e){ return 0; } }\n"
+      + "  function isNonZeroConsumptionEntry(v){ if(v==null) return false; if(typeof v==='number') return v!==0; if(typeof v==='object'){ if(typeof v.amount==='number') return v.amount!==0; for(var k in v){ if(typeof v[k]==='number' && v[k]!==0) return true; } } return false; }\n"
+      + "  function collectProducedKeys(b){ var out=[]; var prod=b&&b.production?b.production:{}; for(var cat in prod){ if(cat!=='colony' && cat!=='special') continue; var obj=prod[cat]; if(!obj||typeof obj!=='object') continue; for(var res in obj){ out.push(cat+':'+res); } } return out; }\n"
+      + "  function hasExternalInputs(b){ var cons=b&&b.consumption?b.consumption:{}; for(var cat in cons){ if(cat==='colony'||cat==='special') continue; var obj=cons[cat]; if(!obj||typeof obj!=='object') continue; for(var res in obj){ if(isNonZeroConsumptionEntry(obj[res])) return true; } } return false; }\n"
+      + "  function getResState(cat,res){ try{ var r=resources&&resources[cat]?resources[cat][res]:null; if(!r) return null; var prod=safeNumber(r.productionRate); var cons=safeNumber(r.consumptionRate); return { value:safeNumber(r.value), cap:safeNumber(r.cap), prod:prod, cons:cons, net:prod-cons, overflow:safeNumber(r.overflowRate), unlocked:!!r.unlocked }; }catch(e){ return null; } }\n"
+      + "  window.__TT_WORKER_ALLOC__={\n"
+      + "    ready:function(){ try{ return (typeof buildings!=='undefined')&&(typeof resources!=='undefined')&&resources&&resources.colony&&resources.colony.workers; }catch(e){ return false; } },\n"
+      + "    snapshot:function(){\n"
+      + "      var popV=safeNumber(getPath(resources,['colony','colonists','value']));\n"
+      + "      var popC=safeNumber(getPath(resources,['colony','colonists','cap']));\n"
+      + "      var workerCap=safeNumber(getPath(resources,['colony','workers','cap']));\n"
+      + "      var workerFree=safeNumber(getPath(resources,['colony','workers','value']));\n"
+      + "      var out={ pop:popV, popCap:popC, workerCap:workerCap, workerFree:workerFree, buildings:[], res:{} };\n"
+      + "      var producedSet={}; producedSet['colony:colonists']=true; producedSet['colony:androids']=true; producedSet['special:spaceships']=true;\n"
+      + "      var collection=(typeof buildings!=='undefined')?buildings:{};\n"
+      + "      for(var key in collection){ var b=collection[key]; if(!b) continue; var eff=effectiveWorkerNeed(b); if(!(eff>0)) continue;\n"
+      + "        var prodKeys=collectProducedKeys(b); for(var i=0;i<prodKeys.length;i++){ producedSet[prodKeys[i]]=true; }\n"
+      + "        out.buildings.push({ key:key, displayName:(b.displayName||b.name||key), category:(b.category||''), unlocked:!!b.unlocked, effNeed:eff,\n"
+      + "          autoBuildEnabled:!!b.autoBuildEnabled, autoBuildBasis:String(b.autoBuildBasis||'population'), autoBuildPercent:safeNumber(b.autoBuildPercent), autoActiveEnabled:!!b.autoActiveEnabled,\n"
+      + "          count:safeNumber(b.count), active:safeNumber(b.active), targetCount:computeTargetCount(b,popV,workerCap,collection), produces:prodKeys, hasExternalInputs:hasExternalInputs(b) }); }\n"
+      + "      for(var rk in producedSet){ if(!producedSet[rk]) continue; var parts=rk.split(':'); var st=getResState(parts[0],parts[1]); if(st) out.res[rk]=st; }\n"
+      + "      out.buildings.sort(function(a,b){ var c=String(a.category||'').localeCompare(String(b.category||'')); if(c) return c; return String(a.displayName||'').localeCompare(String(b.displayName||'')); });\n"
+      + "      return out; },\n"
+      + "    apply:function(updates){ try{ var collection=(typeof buildings!=='undefined')?buildings:{}; for(var key in updates){ var u=updates[key]; var b=collection[key]; if(!b||!u) continue;\n"
+      + "        b.autoBuildBasis='workers'; b.autoBuildEnabled=true; b.autoActiveEnabled=true; if(u.hasOwnProperty('autoBuildPercent')){ var v=Number(u.autoBuildPercent); if(isFinite(v)) b.autoBuildPercent=v; } }\n"
+      + "      return {ok:true}; }catch(e){ return {ok:false,error:String(e)}; } }\n"
+      + "  };\n"
+      + "})();\n";
+
+    var s = document.createElement('script');
+    s.textContent = code;
+    document.documentElement.appendChild(s);
+    s.parentNode.removeChild(s);
+  }
+
+  // ---------------- storage (GM fallback to localStorage) ----------------
+  var STORE_KEY = 'ttwa465__';
+  var hasGM = (typeof GM_getValue === 'function') && (typeof GM_setValue === 'function');
+
+  function getVal(key, def) {
+    try {
+      if (hasGM) return GM_getValue(key, def);
+      var raw = localStorage.getItem(STORE_KEY + key);
+      return (raw == null) ? def : JSON.parse(raw);
+    } catch (e) { return def; }
+  }
+  function setVal(key, val) {
+    try {
+      if (hasGM) return GM_setValue(key, val);
+      localStorage.setItem(STORE_KEY + key, JSON.stringify(val));
+    } catch (e) {}
+  }
+
+  // ---------------- small utils ----------------
+  var SUFFIX_FMT = [[1e24,'Y'],[1e21,'Z'],[1e18,'E'],[1e15,'P'],[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']];
+  function fmtNum(x) {
+    if (!Number.isFinite(x)) return String(x);
+    var ax = Math.abs(x);
+    for (var i = 0; i < SUFFIX_FMT.length; i++) {
+      var v = SUFFIX_FMT[i][0], s = SUFFIX_FMT[i][1];
+      if (ax >= v) {
+        var d = (ax >= v * 100) ? 0 : (ax >= v * 10) ? 1 : 2;
+        return (x / v).toFixed(d) + s;
       }
-      if (!producerId || !snap.buildings?.[producerId]) continue;
+    }
+    if (ax >= 100) return x.toFixed(0);
+    if (ax >= 10) return x.toFixed(1);
+    if (ax >= 1) return x.toFixed(2);
+    if (ax === 0) return '0';
+    return x.toExponential(3);
+  }
+  function fmtPct(x) {
+    if (!Number.isFinite(x)) return '';
+    var ax = Math.abs(x);
+    if (ax === 0) return '0';
+    if (ax >= 10) return x.toFixed(3);
+    if (ax >= 1) return x.toFixed(4);
+    if (ax >= 0.01) return x.toFixed(6);
+    return x.toExponential(6);
+  }
+  function clamp(x, a, b) {
+    var n = Number(x);
+    if (!Number.isFinite(n)) return a;
+    return Math.max(a, Math.min(b, n));
+  }
+  function toNum(x, d) {
+    var n = Number(x);
+    return Number.isFinite(n) ? n : (d || 0);
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+    });
+  }
 
-      const bmeta = snap.buildings[producerId];
-      // record mapping
-      if (!buildingToRes.has(producerId)) buildingToRes.set(producerId, []);
-      buildingToRes.get(producerId).push(r.key);
+  // ---------------- settings/state ----------------
+  var DEFAULTS = {
+    running: false,
+    minimized: false,
 
-      // Create a line only if building uses workers (>0)
-      if ((bmeta.need || 0) > 0) {
-        lines.push({ resKey: r.key, buildingId: producerId, mode: st.mode });
+    showOnlyUnlocked: true,
+
+    // Min toggles + floor strengths (% of remainder, deficit-scaled)
+    keepClonesMin: true,
+    keepAndroidsMin: true,
+    keepShipsMin: false,
+    keepBiodomesMin: false,
+
+    minPctClones: 2,
+    minPctAndroids: 2,
+    minPctShips: 1,
+    minPctBiodomes: 1,
+
+    // safeguard / buffer model
+    preferNetZero: true,
+    bufferSeconds: 30,
+    softHorizonSeconds: 600,
+    refillSeconds: 60,
+    strengthenBand: 2.0,
+
+    // pop cap maintenance
+    capFillSeconds: 45,       // target time constant for filling cap deficits (even if cons==0)
+    popCapBandFrac: 0.002,    // deficit fraction that maps to "full" severity (0.2% under cap -> sev=1)
+    popCapHystOn: 0.99999,
+    popCapHystOff: 0.99950,
+    popConsMarginFrac: 0.002, // if consumption>0, request a small positive margin
+
+    // Max/Learn
+    maxBuildingKey: null,
+    maxResKey: null,
+    learnAgg: 35,           // 0..100
+    learnSmooth: 60,        // 0..100 (higher = more volatility penalty)
+    learnIntervalSec: 8,    // 3..60
+    learnSettleSec: 8       // 3..60
+  };
+
+  var state = (function () {
+    var s = getVal('settings', DEFAULTS);
+    var out = {};
+    for (var k in DEFAULTS) out[k] = DEFAULTS[k];
+    for (var k2 in s) out[k2] = s[k2];
+    return out;
+  })();
+
+  var rowState = getVal('rows', {});                 // key -> { enabled:boolean, weight:number }
+  var boostPctByKey = getVal('boostPctByKey', {});   // key -> boost % of remainder workers reserved
+
+  function saveSettings() { setVal('settings', state); }
+  function saveRows() { setVal('rows', rowState); }
+  function saveBoosts() { setVal('boostPctByKey', boostPctByKey); }
+
+  // ---------------- UI ----------------
+  function addStyle(css) {
+    var s = document.createElement('style');
+    s.textContent = css;
+    document.head.appendChild(s);
+  }
+
+  // Visually distinct from game dark mode: slightly tinted background + higher-contrast border + stronger shadow.
+  addStyle(
+    "#ttwa-root{position:fixed;top:88px;right:16px;z-index:999999;font:12px/1.25 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;color:#eaeaf0}" +
+    "#ttwa-root *{box-sizing:border-box}" +
+    "#ttwa-panel{width:var(--ttwa-w,940px);max-width:calc(100vw - 24px);background:linear-gradient(180deg, rgba(38,32,55,.96) 0%, rgba(20,18,28,.96) 80%);border:1px solid rgba(140,200,255,.36);border-radius:14px;box-shadow:0 22px 70px rgba(0,0,0,.62), 0 0 0 1px rgba(255,255,255,.06) inset;overflow:hidden;backdrop-filter:blur(7px);user-select:none;display:flex;flex-direction:column;resize:horizontal}" +
+    "#ttwa-header{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.10);cursor:move;background:rgba(0,0,0,.14)}" +
+    "#ttwa-title{font-weight:850;font-size:13px;letter-spacing:.25px}" +
+    "#ttwa-spacer{flex:1}" +
+    ".ttwa-btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:#eaeaf0;border-radius:10px;padding:6px 10px;cursor:pointer}" +
+    ".ttwa-btn:hover{background:rgba(255,255,255,.14)}" +
+    ".ttwa-btn:active{transform:translateY(1px)}" +
+    ".ttwa-btn.primary{background:rgba(140,200,255,.18);border-color:rgba(140,200,255,.42)}" +
+    ".ttwa-btn.primary:hover{background:rgba(140,200,255,.26)}" +
+    ".ttwa-btn.small{padding:5px 9px;border-radius:10px}" +
+    ".ttwa-toggle{border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.20);color:#eaeaf0;border-radius:10px;padding:6px 10px;cursor:pointer}" +
+    ".ttwa-toggle.on{background:rgba(140,200,255,.22);border-color:rgba(140,200,255,.48)}" +
+    ".ttwa-toggle:hover{background:rgba(255,255,255,.10)}" +
+    ".ttwa-toggle.on:hover{background:rgba(140,200,255,.30)}" +
+    ".ttwa-mini{opacity:.78;font-size:11px}" +
+    ".ttwa-muted{opacity:.72}" +
+    ".ttwa-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}" +
+    ".ttwa-input{padding:6px 8px;border-radius:10px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.24);color:#eaeaf0;outline:none}" +
+    ".ttwa-input:focus{border-color:rgba(140,200,255,.55)}" +
+    ".ttwa-badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.16);font-size:11px;white-space:nowrap}" +
+    "#ttwa-body{padding:10px 12px;display:flex;flex-direction:column;gap:10px;overflow:hidden}" +
+    ".ttwa-card{border:1px solid rgba(255,255,255,.10);border-radius:14px;padding:10px;background:rgba(0,0,0,.18)}" +
+    ".ttwa-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}" +
+    ".ttwa-kv{display:flex;flex-direction:column;gap:4px}" +
+    ".ttwa-kv .k{opacity:.75;font-size:11px}" +
+    ".ttwa-kv .v{display:flex;gap:8px;align-items:center;flex-wrap:wrap}" +
+    ".ttwa-tablewrap{overflow:auto;border-radius:12px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.10)}" +
+    "table.ttwa-table{width:100%;border-collapse:collapse;table-layout:fixed}" +
+    ".ttwa-table th,.ttwa-table td{padding:7px 7px;border-bottom:1px solid rgba(255,255,255,.08);vertical-align:middle}" +
+    ".ttwa-table th{font-weight:850;background:rgba(0,0,0,.18);position:sticky;top:0;z-index:2}" +
+    ".ttwa-right{text-align:right}" +
+    ".ttwa-center{text-align:center}" +
+    ".ttwa-bname{font-weight:850;white-space:normal;overflow-wrap:anywhere}" +
+    ".ttwa-weight{width:86px;text-align:right}" +
+    ".ttwa-info{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:999px;border:1px solid rgba(255,255,255,.20);background:rgba(0,0,0,.18);color:#eaeaf0;font-weight:900;font-size:11px;cursor:help;margin-left:8px;flex:0 0 auto}" +
+    ".ttwa-info:hover{background:rgba(140,200,255,.22);border-color:rgba(140,200,255,.45)}" +
+    ".ttwa-bar{position:relative;height:18px;border-radius:10px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);overflow:hidden}" +
+    ".ttwa-barfill{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg, rgba(140,200,255,.20), rgba(140,200,255,.38))}" +
+    ".ttwa-bartext{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;height:100%;font:11px/1 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;color:#f1f1ff;white-space:nowrap;text-shadow:0 1px 0 rgba(0,0,0,.55)}" +
+    "#ttwa-tip{position:fixed;z-index:1000000;display:none;max-width:420px;background:rgba(14,14,18,.96);border:1px solid rgba(140,200,255,.38);border-radius:12px;box-shadow:0 14px 45px rgba(0,0,0,.62);padding:10px;pointer-events:none;color:#f3f3ff}" +
+    "#ttwa-tip .tt{font-weight:900;margin-bottom:6px}" +
+    "#ttwa-tip .ln{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;line-height:1.25}" +
+    "#ttwa-tip .lk{opacity:.78;white-space:nowrap}" +
+    "#ttwa-tip .lv{opacity:.95;text-align:right;white-space:normal;overflow-wrap:anywhere}"
+  );
+
+  function el(tag, attrs, children) {
+    var e = document.createElement(tag);
+    attrs = attrs || {};
+    children = children || [];
+    for (var k in attrs) {
+      if (!attrs.hasOwnProperty(k)) continue;
+      var v = attrs[k];
+      if (k === 'class') e.className = v;
+      else if (k === 'text') e.textContent = v;
+      else if (k === 'html') e.innerHTML = v;
+      else if (k.indexOf('on') === 0 && typeof v === 'function') e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
+    }
+    for (var i = 0; i < children.length; i++) e.appendChild(children[i]);
+    return e;
+  }
+
+  // Tooltip: single component, per-node HTML set via property __ttwaTipHtml.
+  var tip = null;
+  function showTip(html, x, y) {
+    if (!tip) return;
+    tip.innerHTML = html;
+    tip.style.display = 'block';
+
+    var pad = 12;
+    var vw = window.innerWidth || 0;
+    var vh = window.innerHeight || 0;
+
+    // Place near cursor but clamp within viewport.
+    var tx = x + 14;
+    var ty = y + 14;
+
+    // Need measure after display.
+    var r = tip.getBoundingClientRect();
+    if (tx + r.width + pad > vw) tx = Math.max(pad, vw - r.width - pad);
+    if (ty + r.height + pad > vh) ty = Math.max(pad, y - r.height - 14);
+    if (ty < pad) ty = pad;
+
+    tip.style.left = tx + 'px';
+    tip.style.top = ty + 'px';
+  }
+  function hideTip() {
+    if (!tip) return;
+    tip.style.display = 'none';
+  }
+  function wireTip(node) {
+    if (!node || node.__ttwaTipWired) return;
+    node.__ttwaTipWired = true;
+
+    node.addEventListener('mouseenter', function (e) {
+      if (!node.__ttwaTipHtml) return;
+      showTip(node.__ttwaTipHtml, e.clientX, e.clientY);
+    });
+    node.addEventListener('mousemove', function (e) {
+      if (!node.__ttwaTipHtml) return;
+      showTip(node.__ttwaTipHtml, e.clientX, e.clientY);
+    });
+    node.addEventListener('mouseleave', function () { hideTip(); });
+  }
+  function setTip(node, html) {
+    if (!node) return;
+    node.__ttwaTipHtml = html;
+    wireTip(node);
+  }
+
+  // ---------------- position guardrails + drag ----------------
+  function clampRootToViewport(root) {
+    if (!root) return;
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    if (!vw || !vh) return;
+
+    var r = root.getBoundingClientRect();
+    var w = r.width || 0;
+    var h = r.height || 0;
+    if (!w || !h) return;
+
+    var header = root.querySelector('#ttwa-header');
+    var headerH = 42;
+    if (header && header.getBoundingClientRect) {
+      var hr = header.getBoundingClientRect();
+      if (hr && hr.height) headerH = hr.height;
+    }
+
+    var minVisibleX = 56;
+    var minVisibleY = Math.max(28, Math.min(60, headerH));
+
+    var minLeft = -w + minVisibleX;
+    var maxLeft = vw - minVisibleX;
+    var minTop = -h + minVisibleY;
+    var maxTop = vh - minVisibleY;
+
+    function clamp2(v, a, b) { return Math.min(Math.max(v, a), b); }
+
+    var left = clamp2(r.left, minLeft, maxLeft);
+    var top = clamp2(r.top, minTop, maxTop);
+
+    if (Math.abs(left - r.left) < 0.5 && Math.abs(top - r.top) < 0.5) return;
+
+    root.style.left = left + 'px';
+    root.style.top = top + 'px';
+    root.style.right = 'auto';
+    root.style.bottom = 'auto';
+    savePosFrom(root);
+  }
+
+  function loadPosInto(root) {
+    try {
+      var p = getVal('pos', null);
+      if (p && typeof p.left === 'number' && typeof p.top === 'number') {
+        root.style.left = p.left + 'px';
+        root.style.top = p.top + 'px';
+        root.style.right = 'auto';
+      }
+    } catch (e) {}
+    clampRootToViewport(root);
+  }
+
+  function savePosFrom(root) {
+    try {
+      var r = root.getBoundingClientRect();
+      setVal('pos', { left: Math.round(r.left), top: Math.round(r.top) });
+    } catch (e) {}
+  }
+
+  function resetPos(root) {
+    try { setVal('pos', null); } catch (e) {}
+    root.style.left = '';
+    root.style.right = '16px';
+    root.style.top = '88px';
+    clampRootToViewport(root);
+  }
+
+  function enableDrag(root, handle) {
+    var dragging = false;
+    var pid = null;
+    var sx = 0, sy = 0, ox = 0, oy = 0;
+
+    function isInteractiveTarget(t) {
+      try { return !!(t && t.closest && t.closest('button, input, select, textarea, a, label')); }
+      catch (e) { return false; }
+    }
+
+    handle.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) return;
+      if (isInteractiveTarget(e.target)) return;
+
+      dragging = true;
+      pid = e.pointerId;
+
+      var r = root.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY;
+      ox = r.left; oy = r.top;
+
+      root.style.left = ox + 'px';
+      root.style.top = oy + 'px';
+      root.style.right = 'auto';
+
+      if (handle.setPointerCapture) {
+        try { handle.setPointerCapture(pid); } catch (err) {}
+      }
+      e.preventDefault();
+    });
+
+    window.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
+      if (pid != null && e.pointerId !== pid) return;
+
+      root.style.left = (ox + (e.clientX - sx)) + 'px';
+      root.style.top = (oy + (e.clientY - sy)) + 'px';
+      root.style.right = 'auto';
+      clampRootToViewport(root);
+    });
+
+    window.addEventListener('pointerup', function (e) {
+      if (!dragging) return;
+      if (pid != null && e.pointerId !== pid) return;
+      dragging = false;
+      pid = null;
+      clampRootToViewport(root);
+      savePosFrom(root);
+    });
+  }
+
+  // ---------------- UI build ----------------
+  var ui = {};
+  function buildUI() {
+    ui.root = el('div', { id: 'ttwa-root' });
+    ui.panel = el('div', { id: 'ttwa-panel' });
+
+    tip = el('div', { id: 'ttwa-tip' });
+    ui.root.appendChild(tip);
+
+    ui.runBtn = el('button', { class: 'ttwa-btn primary', text: state.running ? 'Stop' : 'Start' });
+    ui.minBtn = el('button', { class: 'ttwa-btn small', text: state.minimized ? '▢' : '—' });
+
+    ui.header = el('div', { id: 'ttwa-header' }, [
+      el('div', { id: 'ttwa-title', text: 'TT Worker Allocator' }),
+      el('div', { id: 'ttwa-spacer' }),
+      ui.runBtn,
+      ui.minBtn
+    ]);
+
+    ui.body = el('div', { id: 'ttwa-body' });
+    ui.statusCard = el('div', { class: 'ttwa-card' });
+    ui.allocCard = el('div', { class: 'ttwa-card' });
+
+    ui.body.appendChild(ui.statusCard);
+    ui.body.appendChild(ui.allocCard);
+
+    ui.panel.appendChild(ui.header);
+    ui.panel.appendChild(ui.body);
+    ui.root.appendChild(ui.panel);
+    document.body.appendChild(ui.root);
+
+    loadPosInto(ui.root);
+    enableDrag(ui.root, ui.header);
+
+    ui.header.addEventListener('dblclick', function (e) {
+      if (e && e.target && e.target.closest && e.target.closest('button, input, select, textarea, a, label')) return;
+      resetPos(ui.root);
+    });
+
+    window.addEventListener('resize', function () { clampRootToViewport(ui.root); });
+
+    ui.runBtn.addEventListener('click', function () {
+      state.running = !state.running;
+      ui.runBtn.textContent = state.running ? 'Stop' : 'Start';
+      saveSettings();
+    });
+
+    ui.minBtn.addEventListener('click', function () {
+      state.minimized = !state.minimized;
+      ui.minBtn.textContent = state.minimized ? '▢' : '—';
+      ui.body.style.display = state.minimized ? 'none' : 'flex';
+      saveSettings();
+      clampRootToViewport(ui.root);
+    });
+
+    ui.body.style.display = state.minimized ? 'none' : 'flex';
+
+    setTip(ui.runBtn,
+      '<div class="tt">Start / Stop</div>' +
+      '<div class="ln"><div class="lk">Effect</div><div class="lv">When <b>Start</b> is on, this script writes <code>autoBuildPercent</code> into worker-basis buildings every tick.</div></div>' +
+      '<div class="ln"><div class="lk">Safety</div><div class="lv">Stops immediately if bridge apply() fails.</div></div>'
+    );
+
+    setTip(ui.minBtn,
+      '<div class="tt">Minimize</div>' +
+      '<div class="ln"><div class="lk">Effect</div><div class="lv">Collapses the overlay to the header (no allocation changes).</div></div>' +
+      '<div class="ln"><div class="lk">Tip</div><div class="lv">Double-click the header to reset position.</div></div>'
+    );
+  }
+
+  // ---------------- building helpers ----------------
+  function isWorkersBasis(b) { return String(b && b.autoBuildBasis ? b.autoBuildBasis : '') === 'workers'; }
+  function hasWorkers(b) { return toNum(b && b.effNeed, 0) > 0; }
+
+  function getFixedBuildings(snapshot) {
+    var out = [];
+    for (var i = 0; i < snapshot.buildings.length; i++) {
+      var b = snapshot.buildings[i];
+      if (hasWorkers(b) && !isWorkersBasis(b)) out.push(b);
+    }
+    return out;
+  }
+  function getAllocBuildings(snapshot) {
+    var out = [];
+    for (var i = 0; i < snapshot.buildings.length; i++) {
+      var b = snapshot.buildings[i];
+      if (!hasWorkers(b)) continue;
+      if (!isWorkersBasis(b)) continue;
+      if (state.showOnlyUnlocked && !b.unlocked) continue;
+      out.push(b);
+    }
+    return out;
+  }
+  function findBuildingKeyByName(snapshot, re) {
+    for (var i = 0; i < snapshot.buildings.length; i++) {
+      var x = snapshot.buildings[i];
+      if (re.test(x.key) || re.test(x.displayName)) return x.key;
+    }
+    return null;
+  }
+
+  // ---------------- resource filters ----------------
+  function isExcludedForSafeguards(resKey) {
+    // Must not attempt to stabilize these; they are system-level / non-buffered.
+    var r = String(resKey || '').split(':')[1] || '';
+    return (r === 'energy' || r === 'workers' || r === 'funding');
+  }
+  function isExcludedForMax(resKey) {
+    // Avoid learning against caps/system resources.
+    var r = String(resKey || '').split(':')[1] || '';
+    return (r === 'energy' || r === 'workers' || r === 'funding' || r === 'colonists');
+  }
+  function isPopRes(resKey) {
+    return resKey === 'colony:colonists' || resKey === 'colony:androids';
+  }
+  function resKeyLabel(rk) {
+    var parts = String(rk || '').split(':');
+    return parts.length >= 2 ? parts[1] : String(rk || '');
+  }
+
+  // ---------------- row state sync ----------------
+  var lastKeysSig = '';
+  function hydrateRowDefaults(snapshot) {
+    var workerCap = toNum(snapshot.workerCap, 0);
+    var fixed = getFixedBuildings(snapshot);
+    var fixedWorkers = 0;
+    for (var i = 0; i < fixed.length; i++) {
+      var b = fixed[i];
+      var count = b.autoBuildEnabled ? (Number.isFinite(b.targetCount) ? b.targetCount : 0) : toNum(b.active, 0);
+      fixedWorkers += count * toNum(b.effNeed, 0);
+    }
+    var remainder = Math.max(0, workerCap - fixedWorkers);
+    var alloc = getAllocBuildings(snapshot);
+
+    var changed = false;
+    for (var j = 0; j < alloc.length; j++) {
+      var bb = alloc[j];
+      if (!rowState[bb.key]) rowState[bb.key] = {};
+      if (rowState[bb.key].enabled === undefined) { rowState[bb.key].enabled = true; changed = true; }
+      if (rowState[bb.key].weight === undefined) {
+        var curCount = bb.autoBuildEnabled ? (Number.isFinite(bb.targetCount) ? bb.targetCount : 0) : toNum(bb.active, 0);
+        var curWorkers = curCount * toNum(bb.effNeed, 0);
+        var share = remainder > 0 ? (curWorkers / remainder) * 100 : 0;
+        rowState[bb.key].weight = Number.isFinite(share) ? Math.max(0, Math.round(share * 10) / 10) : 0;
+        changed = true;
       }
     }
+    if (changed) saveRows();
+  }
 
-    // Deduplicate by building: sum weights across resources that map to same building
-    const unique = new Map(); // buildingId -> { buildingId, mode, resKeys[], weightSum }
-    for (const [bid, resKeys] of buildingToRes.entries()) {
-      const bmeta = snap.buildings[bid];
-      const need = bmeta?.need || 0;
-      if (need <= 0) continue; // no worker plan line for 0-worker buildings
-      // Mode: if any mapped resource is 'on', treat as 'on' (more permissive), else balance.
-      let mode = 'balance';
-      for (const rk of resKeys) {
-        const m = STATE.resources[rk]?.mode;
-        if (m === 'on') { mode = 'on'; break; }
+  function pickMaxResKeyFromBuilding(b) {
+    try {
+      var pr = (b && b.produces) ? b.produces : [];
+      for (var i = 0; i < pr.length; i++) {
+        var rk = pr[i];
+        if (!rk) continue;
+        if (isExcludedForMax(rk)) continue;
+        return rk;
       }
-      // Weight sum:
-      let wsum = 0;
-      for (const rk of resKeys) {
-        const snapRes = snap.resources[rk];
-        if (!snapRes) continue;
-        const st = STATE.resources[rk];
-        const w = dynamicWeight(rk, snapRes, st.weight, st.targetFill);
-        wsum += w;
-      }
-      unique.set(bid, { buildingId: bid, mode, resKeys, need, weight: wsum });
+    } catch (e) {}
+    return null;
+  }
+
+  function ensureRows(snapshot) {
+    var alloc = getAllocBuildings(snapshot);
+    var keys = [];
+    for (var i = 0; i < alloc.length; i++) keys.push(alloc[i].key);
+    var sig = keys.join('|');
+    if (sig === lastKeysSig) return;
+    lastKeysSig = sig;
+
+    hydrateRowDefaults(snapshot);
+
+    // if selected max building vanished, clear
+    if (state.maxBuildingKey) {
+      var ok = false;
+      for (var mi = 0; mi < alloc.length; mi++) if (alloc[mi].key === state.maxBuildingKey) { ok = true; break; }
+      if (!ok) { state.maxBuildingKey = null; state.maxResKey = null; saveSettings(); }
     }
 
-    const items = [...unique.values()].filter(x => x.weight > 0 && x.need > 0);
-    if (!items.length) {
-      plan.notes.push('No worker-using producers selected (or none unlocked/visible).');
-      return plan;
+    // Controls + table
+    var rowsHtml = '';
+    for (var r = 0; r < alloc.length; r++) {
+      var b = alloc[r];
+      var maxrk = pickMaxResKeyFromBuilding(b);
+
+      rowsHtml += ''
+        + '<tr data-key="' + escapeHtml(b.key) + '" data-maxrk="' + escapeHtml(maxrk || '') + '">'
+        + '  <td class="ttwa-center"><input class="ttwa-use" type="checkbox"></td>'
+        + '  <td class="ttwa-center"><input class="ttwa-max" type="checkbox"></td>'
+        + '  <td>'
+        + '    <div style="display:flex;align-items:center;gap:8px">'
+        + '      <div class="ttwa-bname" title="' + escapeHtml(b.displayName) + '">' + escapeHtml(b.displayName) + '</div>'
+        + '      <button class="ttwa-info" type="button">i</button>'
+        + '    </div>'
+        + '  </td>'
+        + '  <td class="ttwa-right"><input class="ttwa-input ttwa-weight" type="number" step="0.1" min="0"></td>'
+        + '  <td><div class="ttwa-bar"><div class="ttwa-barfill" style="width:0%"></div><div class="ttwa-bartext">0</div></div></td>'
+        + '</tr>';
     }
 
-    const sumW = items.reduce((a, x) => a + x.weight, 0);
-    if (sumW <= 0) {
-      plan.notes.push('All weights were zero.');
-      return plan;
+    ui.allocCard.innerHTML = ''
+      + '<div class="ttwa-row" style="justify-content:space-between;align-items:flex-end;gap:12px">'
+      + '  <div>'
+      + '    <div style="font-weight:900">Allocation</div>'
+      + '    <div class="ttwa-mini ttwa-muted">Weights distribute workers <b>after</b> fixed demand + floors. Safeguards add reserve floors. <b>Max</b> learns weights to maximize one selected output.</div>'
+      + '  </div>'
+      + '</div>'
+      + '<div class="ttwa-row" style="margin-top:10px;gap:10px;align-items:center">'
+      + '  <span class="ttwa-mini ttwa-muted">Minimum floors:</span>'
+      + '  <button id="ttwa-minClones" class="ttwa-toggle">Min Clones</button>'
+      + '  <input id="ttwa-minClonesPct" class="ttwa-input" type="number" min="0" max="10" step="0.1" style="width:64px"><span class="ttwa-mini ttwa-muted">%</span>'
+      + '  <button id="ttwa-minAndroids" class="ttwa-toggle">Min Androids</button>'
+      + '  <input id="ttwa-minAndroidsPct" class="ttwa-input" type="number" min="0" max="10" step="0.1" style="width:64px"><span class="ttwa-mini ttwa-muted">%</span>'
+      + '  <button id="ttwa-minShips" class="ttwa-toggle">Min Ships</button>'
+      + '  <input id="ttwa-minShipsPct" class="ttwa-input" type="number" min="0" max="10" step="0.1" style="width:64px"><span class="ttwa-mini ttwa-muted">%</span>'
+      + '  <button id="ttwa-minBiodomes" class="ttwa-toggle">Min Biodomes</button>'
+      + '  <input id="ttwa-minBiodomesPct" class="ttwa-input" type="number" min="0" max="10" step="0.1" style="width:64px"><span class="ttwa-mini ttwa-muted">%</span>'
+      + '</div>'
+      + '<div class="ttwa-row" style="margin-top:8px;gap:12px;align-items:center">'
+      + '  <span class="ttwa-mini ttwa-muted">Learn:</span>'
+      + '  <span class="ttwa-mini ttwa-muted">Agg</span>'
+      + '  <input id="ttwa-learnAgg" type="range" min="0" max="100" step="1" style="width:160px">'
+      + '  <span class="ttwa-badge" id="ttwa-learnAggVal"></span>'
+      + '  <span class="ttwa-mini ttwa-muted">Smooth</span>'
+      + '  <input id="ttwa-learnSmooth" type="range" min="0" max="100" step="1" style="width:160px">'
+      + '  <span class="ttwa-badge" id="ttwa-learnSmoothVal"></span>'
+      + '  <span class="ttwa-mini ttwa-muted">Step</span>'
+      + '  <input id="ttwa-learnInterval" class="ttwa-input" type="number" min="3" max="60" step="1" style="width:70px">'
+      + '  <span class="ttwa-mini ttwa-muted">s</span>'
+      + '  <span class="ttwa-mini ttwa-muted">Settle</span>'
+      + '  <input id="ttwa-learnSettle" class="ttwa-input" type="number" min="3" max="60" step="1" style="width:70px">'
+      + '  <span class="ttwa-mini ttwa-muted">s</span>'
+      + '  <button id="ttwa-resetlearn" class="ttwa-btn small">Reset Learner</button>'
+      + '</div>'
+      + '<div style="margin-top:10px" class="ttwa-tablewrap">'
+      + '  <table class="ttwa-table">'
+      + '    <colgroup>'
+      + '      <col style="width:46px">'
+      + '      <col style="width:46px">'
+      + '      <col>'
+      + '      <col style="width:104px">'
+      + '      <col style="width:250px">'
+      + '    </colgroup>'
+      + '    <thead>'
+      + '      <tr>'
+      + '        <th class="ttwa-center">Use</th>'
+      + '        <th class="ttwa-center">Max</th>'
+      + '        <th>Building</th>'
+      + '        <th class="ttwa-right">Weight</th>'
+      + '        <th>Workers</th>'
+      + '      </tr>'
+      + '    </thead>'
+      + '    <tbody>' + (rowsHtml || '<tr><td colspan="5" class="ttwa-muted">No worker-basis buildings detected yet.</td></tr>') + '</tbody>'
+      + '  </table>'
+      + '</div>';
+
+    // Wire controls (unchanged from your version)
+    var minClonesBtn = ui.allocCard.querySelector('#ttwa-minClones');
+    var minAndroidsBtn = ui.allocCard.querySelector('#ttwa-minAndroids');
+    var minShipsBtn = ui.allocCard.querySelector('#ttwa-minShips');
+    var minBiodomesBtn = ui.allocCard.querySelector('#ttwa-minBiodomes');
+
+    var minClonesPct = ui.allocCard.querySelector('#ttwa-minClonesPct');
+    var minAndroidsPct = ui.allocCard.querySelector('#ttwa-minAndroidsPct');
+    var minShipsPct = ui.allocCard.querySelector('#ttwa-minShipsPct');
+    var minBiodomesPct = ui.allocCard.querySelector('#ttwa-minBiodomesPct');
+
+    function syncMinUI() {
+      minClonesBtn.classList.toggle('on', !!state.keepClonesMin);
+      minAndroidsBtn.classList.toggle('on', !!state.keepAndroidsMin);
+      minShipsBtn.classList.toggle('on', !!state.keepShipsMin);
+      minBiodomesBtn.classList.toggle('on', !!state.keepBiodomesMin);
+
+      minClonesPct.value = String(clamp(toNum(state.minPctClones, 2), 0, 10));
+      minAndroidsPct.value = String(clamp(toNum(state.minPctAndroids, 2), 0, 10));
+      minShipsPct.value = String(clamp(toNum(state.minPctShips, 1), 0, 10));
+      minBiodomesPct.value = String(clamp(toNum(state.minPctBiodomes, 1), 0, 10));
     }
+    syncMinUI();
 
-    // Compute desired workers, convert to desired building counts
-    for (const it of items) {
-      const desiredWorkers = (Wcap * it.weight) / sumW;
-      let desiredCount = desiredWorkers / it.need;
+    function tipMin(label, which) {
+      return '<div class="tt">' + escapeHtml(label) + '</div>'
+        + '<div class="ln"><div class="lk">What</div><div class="lv">Reserves a <b>minimum</b> share of the remainder for the matching building.</div></div>'
+        + '<div class="ln"><div class="lk">Strength</div><div class="lv">The % is multiplied by a <b>deficit factor</b> (strong when under cap, fades near cap).</div></div>'
+        + '<div class="ln"><div class="lk">Why</div><div class="lv">Prevents the allocator from starving critical progression buildings while other safeguards compete.</div></div>'
+        + '<div class="ln"><div class="lk">Key</div><div class="lv"><code>' + escapeHtml(which) + '</code></div></div>';
+    }
+    setTip(minClonesBtn, tipMin('Min Clones', 'clone building'));
+    setTip(minAndroidsBtn, tipMin('Min Androids', 'android building'));
+    setTip(minShipsBtn, tipMin('Min Ships', 'shipyard'));
+    setTip(minBiodomesBtn, tipMin('Min Biodomes', 'biodome'));
 
-      // In balance mode, do not exceed built count.
-      const built = snap.buildings?.[it.buildingId]?.count ?? 0;
-      if (it.mode === 'balance') desiredCount = Math.min(desiredCount, built);
-
-      plan.lines.push({
-        buildingId: it.buildingId,
-        desiredCount,
-        mode: it.mode,
-        need: it.need,
-        reasonResKeys: it.resKeys.slice(),
+    function bindToggle(btn, key) {
+      btn.addEventListener('click', function () {
+        state[key] = !state[key];
+        syncMinUI();
+        saveSettings();
       });
     }
+    bindToggle(minClonesBtn, 'keepClonesMin');
+    bindToggle(minAndroidsBtn, 'keepAndroidsMin');
+    bindToggle(minShipsBtn, 'keepShipsMin');
+    bindToggle(minBiodomesBtn, 'keepBiodomesMin');
 
-    // Integer rounding + fill to use workers
-    const counts = {};
-    for (const line of plan.lines) {
-      counts[line.buildingId] = Math.max(0, Math.floor(line.desiredCount));
+    function bindPct(inp, key) {
+      inp.addEventListener('change', function () {
+        state[key] = clamp(toNum(inp.value, state[key]), 0, 10);
+        inp.value = String(state[key]);
+        saveSettings();
+      });
+    }
+    bindPct(minClonesPct, 'minPctClones');
+    bindPct(minAndroidsPct, 'minPctAndroids');
+    bindPct(minShipsPct, 'minPctShips');
+    bindPct(minBiodomesPct, 'minPctBiodomes');
+
+    setTip(minClonesPct, '<div class="tt">Min floor %</div><div class="ln"><div class="lk">Meaning</div><div class="lv">% of <b>remainder workers</b> reserved (before weights), scaled by cap deficit.</div></div>');
+    setTip(minAndroidsPct, '<div class="tt">Min floor %</div><div class="ln"><div class="lk">Meaning</div><div class="lv">% of <b>remainder workers</b> reserved (before weights), scaled by cap deficit.</div></div>');
+    setTip(minShipsPct, '<div class="tt">Min floor %</div><div class="ln"><div class="lk">Meaning</div><div class="lv">% of <b>remainder workers</b> reserved (before weights), scaled by cap deficit.</div></div>');
+    setTip(minBiodomesPct, '<div class="tt">Min floor %</div><div class="ln"><div class="lk">Meaning</div><div class="lv">% of <b>remainder workers</b> reserved (before weights), scaled by cap deficit.</div></div>');
+
+    var resetBtn = ui.allocCard.querySelector('#ttwa-resetlearn');
+    resetBtn.addEventListener('click', function () { resetMaxLearner(true); });
+    setTip(resetBtn,
+      '<div class="tt">Reset Learner</div>' +
+      '<div class="ln"><div class="lk">Effect</div><div class="lv">Clears the learner state (observations + current trial). Does <b>not</b> change your saved weights.</div></div>'
+    );
+
+    // Learn controls
+    var learnAgg = ui.allocCard.querySelector('#ttwa-learnAgg');
+    var learnAggVal = ui.allocCard.querySelector('#ttwa-learnAggVal');
+    var learnSmooth = ui.allocCard.querySelector('#ttwa-learnSmooth');
+    var learnSmoothVal = ui.allocCard.querySelector('#ttwa-learnSmoothVal');
+    var learnInterval = ui.allocCard.querySelector('#ttwa-learnInterval');
+    var learnSettle = ui.allocCard.querySelector('#ttwa-learnSettle');
+
+    learnAgg.value = String(clamp(toNum(state.learnAgg, 35), 0, 100));
+    learnSmooth.value = String(clamp(toNum(state.learnSmooth, 60), 0, 100));
+    learnInterval.value = String(clamp(toNum(state.learnIntervalSec, 8), 3, 60));
+    learnSettle.value = String(clamp(toNum(state.learnSettleSec, 8), 3, 60));
+
+    function refreshLearnLabels() {
+      learnAggVal.textContent = String(Math.round(clamp(toNum(learnAgg.value, 35), 0, 100)));
+      learnSmoothVal.textContent = String(Math.round(clamp(toNum(learnSmooth.value, 60), 0, 100)));
+    }
+    refreshLearnLabels();
+
+    learnAgg.addEventListener('input', function () {
+      state.learnAgg = clamp(toNum(learnAgg.value, 35), 0, 100);
+      refreshLearnLabels();
+      saveSettings();
+    });
+    learnSmooth.addEventListener('input', function () {
+      state.learnSmooth = clamp(toNum(learnSmooth.value, 60), 0, 100);
+      refreshLearnLabels();
+      saveSettings();
+    });
+    learnInterval.addEventListener('change', function () {
+      state.learnIntervalSec = clamp(toNum(learnInterval.value, 8), 3, 60);
+      learnInterval.value = String(state.learnIntervalSec);
+      saveSettings();
+    });
+    learnSettle.addEventListener('change', function () {
+      state.learnSettleSec = clamp(toNum(learnSettle.value, 8), 3, 60);
+      learnSettle.value = String(state.learnSettleSec);
+      saveSettings();
+    });
+
+    // Wire row controls
+    var trs = ui.allocCard.querySelectorAll('tr[data-key]');
+    for (var t = 0; t < trs.length; t++) {
+      (function () {
+        var tr = trs[t];
+        var key = tr.getAttribute('data-key');
+        var cb = tr.querySelector('.ttwa-use');
+        var cbMax = tr.querySelector('.ttwa-max');
+        var inp = tr.querySelector('.ttwa-weight');
+
+        if (!rowState[key]) rowState[key] = {};
+        var rs = rowState[key] || {};
+        cb.checked = (rs.enabled !== false);
+        inp.value = String(Number.isFinite(rs.weight) ? rs.weight : 0);
+
+        var maxrk = tr.getAttribute('data-maxrk') || '';
+        cbMax.checked = (state.maxBuildingKey === key);
+        cbMax.disabled = !maxrk || isExcludedForMax(maxrk);
+
+        cb.addEventListener('change', function () {
+          if (!rowState[key]) rowState[key] = {};
+          rowState[key].enabled = cb.checked;
+          saveRows();
+          if (!cb.checked && state.maxBuildingKey === key) {
+            state.maxBuildingKey = null;
+            state.maxResKey = null;
+            saveSettings();
+            resetMaxLearner(true);
+          }
+        });
+
+        cbMax.addEventListener('change', function () {
+          if (cbMax.checked) {
+            state.maxBuildingKey = key;
+            state.maxResKey = (maxrk && !isExcludedForMax(maxrk)) ? maxrk : null;
+            saveSettings();
+            resetMaxLearner(true);
+
+            var others = ui.allocCard.querySelectorAll('.ttwa-max');
+            for (var i = 0; i < others.length; i++) {
+              var otr = others[i].closest('tr[data-key]');
+              if (!otr) continue;
+              var okk = otr.getAttribute('data-key');
+              if (okk !== key) others[i].checked = false;
+            }
+          } else {
+            if (state.maxBuildingKey === key) {
+              state.maxBuildingKey = null;
+              state.maxResKey = null;
+              saveSettings();
+              resetMaxLearner(true);
+            }
+          }
+        });
+
+        inp.addEventListener('input', function () {
+          if (!rowState[key]) rowState[key] = {};
+          rowState[key].weight = toNum(inp.value, 0);
+          saveRows();
+        });
+      })();
     }
 
-    const caps = {}; // max counts for balance lines
-    for (const line of plan.lines) {
-      if (line.mode === 'balance') {
-        const built = snap.buildings?.[line.buildingId]?.count ?? 0;
-        caps[line.buildingId] = Math.max(0, Math.floor(built));
-        counts[line.buildingId] = Math.min(counts[line.buildingId], caps[line.buildingId]);
-      } else {
-        caps[line.buildingId] = Infinity;
+    saveSettings();
+  }
+
+  // ---------------- safeguard model ----------------
+  var rt = {
+    resEma: {},         // key -> EMA(net) for smoothing error signals
+    emergEma: {},       // key -> EMA(severity) for emergency floors
+    lastEmergencyAt: 0,
+    lastSafeguardAt: 0,
+    lastApplyAt: 0,
+    lastAppliedPct: {},
+
+    capState: { android: false, colonists: false },
+
+    maxLearn: {
+      resKey: null,
+      obs: [],
+      mean: 0,
+      mad: 0,
+      lastScore: NaN,
+      lastStepAt: 0,
+      trial: null,
+      paused: ''
+    }
+  };
+
+  function emaUpdate(key, x, alpha) {
+    if (alpha == null) alpha = 0.22;
+    var prev = rt.resEma[key];
+    if (!Number.isFinite(prev)) { rt.resEma[key] = x; return x; }
+    var v = prev + alpha * (x - prev);
+    rt.resEma[key] = v;
+    return v;
+  }
+
+  function updateCapHysteresis(snapshot) {
+    var a = snapshot && snapshot.res ? snapshot.res['colony:androids'] : null;
+    var c = snapshot && snapshot.res ? snapshot.res['colony:colonists'] : null;
+    var on = clamp(toNum(state.popCapHystOn, 0.99999), 0.9, 0.9999999);
+    var off = clamp(toNum(state.popCapHystOff, 0.9995), 0.9, on);
+
+    if (a && a.cap > 0) {
+      var fillA = a.value / a.cap;
+      if (!rt.capState.android && fillA >= on) rt.capState.android = true;
+      else if (rt.capState.android && fillA <= off) rt.capState.android = false;
+    }
+    if (c && c.cap > 0) {
+      var fillC = c.value / c.cap;
+      if (!rt.capState.colonists && fillC >= on) rt.capState.colonists = true;
+      else if (rt.capState.colonists && fillC <= off) rt.capState.colonists = false;
+    }
+  }
+
+  function netIncludingOverflow(st) {
+    var net = toNum(st ? st.net : 0, 0);
+    var cap = toNum(st ? st.cap : 0, 0);
+    var val = toNum(st ? st.value : 0, 0);
+    if (cap > 0 && val >= cap * 0.999) net += toNum(st ? st.overflow : 0, 0);
+    return net;
+  }
+
+  function wantNetDeltaGeneric(cons0, val0) {
+    var cons = Math.max(0, cons0);
+    var val = Math.max(0, val0);
+
+    if (cons <= 0) return 0;
+
+    var bufferS = clamp(state.bufferSeconds, 5, 600);
+    var softS = clamp(state.softHorizonSeconds, 60, 3600);
+    var refillS = clamp(state.refillSeconds, 10, 600);
+    var bandMul = clamp(state.strengthenBand, 1.0, 10.0);
+
+    var targetVal = cons * bufferS;
+
+    if (val < targetVal) {
+      return (targetVal - val) / refillS;
+    }
+
+    if (state.preferNetZero) return 0;
+
+    var allowed = -(val - targetVal) / softS;
+
+    var bandVal = targetVal * bandMul;
+    if (val < bandVal) {
+      var denom = Math.max(1e-9, (bandVal - targetVal));
+      var k = (bandVal - val) / denom;
+      k = clamp(k, 0, 1);
+      allowed = allowed * (1 - k);
+    }
+    return allowed;
+  }
+
+  function wantNetDeltaPop(st) {
+    // Cap-fill demand: generate positive net until near cap even if consumption==0.
+    var cap = Math.max(0, toNum(st ? st.cap : 0, 0));
+    var val = Math.max(0, toNum(st ? st.value : 0, 0));
+    var cons = Math.max(0, toNum(st ? st.cons : 0, 0));
+
+    var want = 0;
+    if (cap > 0) {
+      var band = clamp(toNum(state.popCapBandFrac, 0.002), 1e-5, 0.25);
+      var targetVal = cap * (1 - band * 0.05); // aim extremely close to cap, but avoid numerical chatter
+      if (val < targetVal) {
+        var fillS = clamp(toNum(state.capFillSeconds, 45), 5, 600);
+        want = Math.max(want, (targetVal - val) / fillS);
       }
     }
 
-    const usedWorkers = (cs) => {
-      let u = 0;
-      for (const line of plan.lines) {
-        const c = cs[line.buildingId] || 0;
-        u += c * line.need;
+    // If consumption exists, require a small positive margin to stay pinned at cap.
+    if (cons > 0) {
+      var m = clamp(toNum(state.popConsMarginFrac, 0.002), 0, 0.05);
+      want = Math.max(want, cons * m);
+    }
+
+    // Do not allow negative "wanted" for pop resources; goal is pinned-to-cap, not buffer decay.
+    return Math.max(0, want);
+  }
+
+  function wantNetDelta(resKey, st) {
+    if (isPopRes(resKey)) return wantNetDeltaPop(st);
+    var cons = toNum(st ? st.cons : 0, 0);
+    var val = toNum(st ? st.value : 0, 0);
+    return wantNetDeltaGeneric(cons, val);
+  }
+
+  function resourceSecondsOfCons(st) {
+    var cons = toNum(st ? st.cons : 0, 0);
+    var val = toNum(st ? st.value : 0, 0);
+    if (!(cons > 0)) return Infinity;
+    return Math.max(0, val) / cons;
+  }
+
+  function timeToReachSeconds(st, targetSeconds) {
+    var cons = Math.max(0, toNum(st ? st.cons : 0, 0));
+    if (!(cons > 0)) return 0;
+    var val = Math.max(0, toNum(st ? st.value : 0, 0));
+    var targetVal = cons * Math.max(0, targetSeconds);
+    var need = targetVal - val;
+    if (!(need > 0)) return 0;
+    var net = netIncludingOverflow(st);
+    if (!(net > 0)) return Infinity;
+    return need / net;
+  }
+
+  function capDeficitSeverity(st) {
+    // Works even if consumption==0. Intended mainly for colonists/androids.
+    var cap = Math.max(0, toNum(st ? st.cap : 0, 0));
+    if (!(cap > 0)) return 0;
+    var val = Math.max(0, toNum(st ? st.value : 0, 0));
+    var def = Math.max(0, cap - val);
+    var band = clamp(toNum(state.popCapBandFrac, 0.002), 1e-5, 0.25);
+    var denom = cap * band;
+    if (!(denom > 0)) return 0;
+    return clamp(def / denom, 0, 1);
+  }
+
+  function emergencySeverity(resKey, st, bufferS) {
+    if (!st) return 0;
+
+    // Base buffer logic (consumption-driven)
+    var cons = Math.max(0, toNum(st.cons, 0));
+    var val = Math.max(0, toNum(st.value, 0));
+    var sev = 0;
+
+    if (cons > 0) {
+      var secs = val / cons;
+
+      var secsTerm = 0;
+      if (secs < bufferS) {
+        secsTerm = clamp((bufferS - secs) / bufferS, 0, 1);
+
+        var grace = clamp(state.refillSeconds, 5, 600);
+        var tToBuf = timeToReachSeconds(st, bufferS);
+        var fastCut = grace * 0.35;
+
+        if (tToBuf <= fastCut) {
+          secsTerm = 0;
+        } else if (tToBuf < grace && secsTerm > 0) {
+          var k = clamp((tToBuf - fastCut) / Math.max(1e-9, (grace - fastCut)), 0, 1);
+          secsTerm = secsTerm * k;
+        }
       }
-      return u;
-    };
 
-    function greedyFill(cs) {
-      let remaining = Wcap - usedWorkers(cs);
-      if (remaining <= 0) return remaining;
+      var net = netIncludingOverflow(st);
+      var netTerm = 0;
+      var netDead = cons * 0.003;
+      if (secs < bufferS * 2 && net < -netDead) {
+        var mag = ((-net) - netDead) / (cons + 1e-9);
+        netTerm = clamp(mag, 0, 1) * clamp((bufferS * 2 - secs) / (bufferS * 2), 0, 1);
+      }
 
-      // Precompute desired workers for scoring
-      const desiredWorkers = {};
-      for (const line of plan.lines) desiredWorkers[line.buildingId] = (line.desiredCount * line.need);
+      sev = Math.max(secsTerm, netTerm);
+    }
 
-      const minNeed = Math.min(...plan.lines.map(l => l.need));
-      let guard = 0;
-      while (remaining >= minNeed && guard++ < 20000) {
-        let bestId = null;
-        let bestScore = -Infinity;
+    // Pop resources get cap-deficit severity as an additional driver.
+    if (isPopRes(resKey)) sev = Math.max(sev, capDeficitSeverity(st));
 
-        for (const line of plan.lines) {
-          const id = line.buildingId;
-          if ((cs[id] || 0) >= (caps[id] ?? Infinity)) continue;
-          if (line.need > remaining) continue;
+    return (sev < 0.01) ? 0 : sev;
+  }
 
-          const allocW = (cs[id] || 0) * line.need;
-          const def = (desiredWorkers[id] ?? 0) - allocW;
-          // Prefer filling deficits first; normalize by worker cost
-          const score = (def / line.need);
-          if (score > bestScore) {
-            bestScore = score;
-            bestId = id;
+  function emergLevelUpdate(resKey, target, dtSec) {
+    var prev = rt.emergEma[resKey];
+    if (!Number.isFinite(prev)) prev = 0;
+
+    // faster rise than decay to reduce oscillation
+    var up = 6.0;
+    var down = 1.4;
+    var rate = (target > prev) ? up : down;
+
+    var k = 1 - Math.exp(-rate * clamp(dtSec, 0.01, 5));
+    var v = prev + (target - prev) * k;
+
+    if (v < 0.005) v = 0;
+    rt.emergEma[resKey] = v;
+    return v;
+  }
+
+  // One-hop coupling to reduce component/electronics seesaw.
+  var EMERG_DEPS = {
+    'colony:electronics': ['colony:components'],
+    'colony:superconductors': ['colony:electronics', 'colony:components'],
+    'colony:superalloys': ['colony:superconductors', 'colony:electronics', 'colony:components']
+  };
+
+  function adjustSafeguards(snapshot) {
+    var now = Date.now();
+    var dtSec = (now - rt.lastSafeguardAt) / 1000;
+    if (dtSec < 0.7) return;
+    rt.lastSafeguardAt = now;
+
+    updateCapHysteresis(snapshot);
+
+    var alloc = getAllocBuildings(snapshot);
+    for (var i = 0; i < alloc.length; i++) {
+      var b = alloc[i];
+      var produces = b && b.produces ? b.produces : [];
+      if (!produces || !produces.length) continue;
+
+      var keys = [];
+      for (var p = 0; p < produces.length; p++) {
+        var rk = produces[p];
+        if (!rk || isExcludedForSafeguards(rk)) continue;
+        keys.push(rk);
+      }
+      if (!keys.length) continue;
+
+      var worstErr = 0;
+      var safeToDecay = true;
+
+      for (var j = 0; j < keys.length; j++) {
+        var key = keys[j];
+        var st = snapshot && snapshot.res ? snapshot.res[key] : null;
+        if (!st) continue;
+
+        var net = toNum(st.net, 0);
+        var cap = toNum(st.cap, 0);
+        var val = toNum(st.value, 0);
+        if (cap > 0 && val >= cap * 0.999) net += toNum(st.overflow, 0);
+
+        var ema = emaUpdate(key, net, 0.22);
+        var want = wantNetDelta(key, st);
+        var err = want - ema;
+        if (err > worstErr) worstErr = err;
+
+        // Decay gating: only decay when "clearly safe" (err well below 0 + not near buffer band).
+        var cons = Math.max(1e-9, toNum(st.cons, 0));
+        var deadband = cons * 0.001;
+
+        if (err > 0) safeToDecay = false;
+        if (err > -deadband) safeToDecay = false;
+
+        var secs = resourceSecondsOfCons(st);
+        var bufferS = clamp(state.bufferSeconds, 5, 600);
+        var bandS = bufferS * clamp(state.strengthenBand, 1, 10);
+        if (secs < bandS) {
+          var graceS = clamp(state.refillSeconds, 10, 600);
+          var tBand = timeToReachSeconds(st, bandS);
+          if (tBand > graceS) safeToDecay = false;
+        }
+
+        // Pop resources: treat any deficit as not safe to decay.
+        if (isPopRes(key) && capDeficitSeverity(st) > 0) safeToDecay = false;
+      }
+
+      var cur = toNum(boostPctByKey[b.key], 0);
+      if (worstErr > 0) {
+        // Scale error to avoid pop resources (cons==0) causing gigantic rel => stepUp slams to 95%.
+        var scale = 1;
+        var popDriven = false;
+
+        for (var j2 = 0; j2 < keys.length; j2++) {
+          var k2 = keys[j2];
+          if (isPopRes(k2)) popDriven = true;
+
+          var st2 = snapshot && snapshot.res ? snapshot.res[k2] : null;
+          if (!st2) continue;
+
+          // Normal resources: scale by consumption.
+          var cns = Math.max(1e-9, toNum(st2.cons, 0));
+          if (cns > scale) scale = cns;
+
+          // Pop resources: scale by cap-fill demand / observed scale so rel is sane.
+          if (isPopRes(k2)) {
+            var w = Math.abs(wantNetDelta(k2, st2));            // cap-fill desired net
+            var e = Math.abs(toNum(rt.resEma[k2], 0));          // observed net EMA magnitude
+            if (w > scale) scale = w;
+            if (e > scale) scale = e;
           }
         }
 
-        if (!bestId) break;
-        cs[bestId] = (cs[bestId] || 0) + 1;
-        remaining -= plan.lines.find(l => l.buildingId === bestId).need;
+        var rel = worstErr / Math.max(1e-9, scale);
+        var mag = Math.log10(rel + 1);
+
+        // Pop-driven boosts should rise slower to avoid “pin to cap” demanding 95% instantly.
+        var stepUp = popDriven
+          ? clamp(0.008 * (1 + 3 * mag), 0.001, 0.05)
+          : clamp(0.010 * (1 + 6 * mag), 0.002, 0.18);
+
+        boostPctByKey[b.key] = clamp(cur + stepUp, 0, 95);
+      } else if (safeToDecay && cur > 0) {
+        var decayPerSec = 0.35;
+        var factor = Math.pow(1 - decayPerSec, Math.min(dtSec, 10));
+        boostPctByKey[b.key] = clamp(cur * factor, 0, 95);
       }
-      return remaining;
     }
 
-    // Initial greedy fill
-    let remaining = greedyFill(counts);
+    saveBoosts();
+  }
 
-    // One-step improvement: remove one building from a line to free workers and refill (helps use more workers)
-    // Only do if it improves leftover substantially.
-    if (remaining > 0) {
-      let best = { leftover: remaining, counts: null };
+  // ---------------- Max learning ----------------
+  function resetMaxLearner(hard) {
+    rt.maxLearn.obs = [];
+    rt.maxLearn.mean = 0;
+    rt.maxLearn.mad = 0;
+    rt.maxLearn.lastScore = NaN;
+    rt.maxLearn.trial = null;
+    rt.maxLearn.paused = '';
+    if (hard) rt.maxLearn.lastStepAt = 0;
+  }
 
-      for (const line of plan.lines) {
-        const id = line.buildingId;
-        if ((counts[id] || 0) <= 0) continue;
+  function collectDepsFor(rk) {
+    var out = [];
+    var seen = {};
+    function rec(k, depth) {
+      if (depth > 5) return;
+      var deps = EMERG_DEPS[k];
+      if (!deps || !deps.length) return;
+      for (var i = 0; i < deps.length; i++) {
+        var d = deps[i];
+        if (!d || seen[d]) continue;
+        seen[d] = true;
+        out.push(d);
+        rec(d, depth + 1);
+      }
+    }
+    rec(rk, 0);
+    return out;
+  }
 
-        const trial = { ...counts };
-        trial[id] = trial[id] - 1;
-        // Refill
-        const trialLeftover = greedyFill(trial);
-        if (trialLeftover < best.leftover) {
-          best = { leftover: trialLeftover, counts: trial };
-          if (best.leftover === 0) break;
+  function updateMaxScore(snapshot) {
+    var rk = state.maxResKey;
+    if (!rk) return;
+
+    var st = snapshot && snapshot.res ? snapshot.res[rk] : null;
+    if (!st) return;
+
+    var obs = netIncludingOverflow(st);
+
+    var arr = rt.maxLearn.obs;
+    arr.push(obs);
+    if (arr.length > 80) arr.shift();
+
+    var n = arr.length;
+    if (n < 6) return;
+
+    var W = Math.min(20, n);
+    var start = n - W;
+
+    var sum = 0;
+    for (var i = start; i < n; i++) sum += arr[i];
+    var mean = sum / W;
+
+    var madSum = 0;
+    for (var j = start + 1; j < n; j++) madSum += Math.abs(arr[j] - arr[j - 1]);
+    var mad = madSum / Math.max(1, (W - 1));
+
+    var penalty = clamp(toNum(state.learnSmooth, 60) / 50, 0, 2);
+
+    rt.maxLearn.mean = mean;
+    rt.maxLearn.mad = mad;
+    rt.maxLearn.lastScore = mean - penalty * mad;
+  }
+
+  function startMaxTrial(snapshot) {
+    var rk = state.maxResKey;
+    if (!rk) return false;
+    if (!state.running) { rt.maxLearn.paused = 'paused (allocator stopped)'; return false; }
+
+    var alloc = getAllocBuildings(snapshot);
+    if (!alloc || !alloc.length) return false;
+
+    var enabled = [];
+    var sumW = 0;
+    for (var i = 0; i < alloc.length; i++) {
+      var b = alloc[i];
+      var rs = rowState[b.key] || {};
+      if (rs.enabled === false) continue;
+      var w = Math.max(0, toNum(rs.weight, 0));
+      enabled.push({ key: b.key, w: w, produces: (b.produces || []) });
+      sumW += w;
+    }
+    if (!enabled.length) { rt.maxLearn.paused = 'paused (no enabled buildings)'; return false; }
+
+    var deps = collectDepsFor(rk);
+    var chain = {}; chain[rk] = true;
+    for (var d = 0; d < deps.length; d++) chain[deps[d]] = true;
+
+    var candidates = [];
+    var direct = [];
+    var candSet = {};
+    for (var e = 0; e < enabled.length; e++) {
+      var pr = enabled[e].produces;
+      var hit = false;
+      var hitDirect = false;
+      for (var p = 0; p < pr.length; p++) {
+        var rr = pr[p];
+        if (!rr) continue;
+        if (rr === rk) hitDirect = true;
+        if (chain[rr]) hit = true;
+      }
+      if (hit) { candidates.push(enabled[e].key); candSet[enabled[e].key] = true; }
+      if (hitDirect) direct.push(enabled[e].key);
+    }
+    if (!candidates.length) { rt.maxLearn.paused = 'paused (no candidate producers)'; return false; }
+
+    // If all weights are zero, seed candidate producers evenly to bootstrap learning.
+    if (!(sumW > 0)) {
+      var seed = 100 / candidates.length;
+      for (var s = 0; s < enabled.length; s++) rowState[enabled[s].key].weight = 0;
+      for (var c = 0; c < candidates.length; c++) {
+        if (!rowState[candidates[c]]) rowState[candidates[c]] = {};
+        rowState[candidates[c]].weight = Math.max(0, seed);
+      }
+      saveRows();
+      return true;
+    }
+
+    function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+    // Choose a decrement key from any positive-weight building, preferring outside the chain.
+    var posKeys = [];
+    for (var k0 = 0; k0 < enabled.length; k0++) {
+      var kk = enabled[k0].key;
+      var ww = Math.max(0, toNum((rowState[kk] || {}).weight, 0));
+      if (ww > 0) posKeys.push(kk);
+    }
+    if (!posKeys.length) { rt.maxLearn.paused = 'paused (no positive weights)'; return false; }
+
+    var posOutside = [];
+    for (var po = 0; po < posKeys.length; po++) if (!candSet[posKeys[po]]) posOutside.push(posKeys[po]);
+    var decKey = pick(posOutside.length ? posOutside : posKeys);
+
+    // Increment target: prefer direct producers, else any chain producer, else any enabled.
+    var incPool = [];
+    for (var di = 0; di < direct.length; di++) if (direct[di] !== decKey) incPool.push(direct[di]);
+    if (!incPool.length) for (var ci = 0; ci < candidates.length; ci++) if (candidates[ci] !== decKey) incPool.push(candidates[ci]);
+    if (!incPool.length) for (var ei = 0; ei < enabled.length; ei++) if (enabled[ei].key !== decKey) incPool.push(enabled[ei].key);
+    if (!incPool.length) { rt.maxLearn.paused = 'paused (no valid trade)'; return false; }
+
+    var incKey = pick(incPool);
+    if (incKey === decKey) return false;
+
+    var baseScore = toNum(rt.maxLearn.lastScore, NaN);
+    if (!Number.isFinite(baseScore)) { rt.maxLearn.paused = 'warming up (score not ready)'; return false; }
+
+    var wInc = Math.max(0, toNum((rowState[incKey] || {}).weight, 0));
+    var wDec = Math.max(0, toNum((rowState[decKey] || {}).weight, 0));
+
+    var agg = clamp(toNum(state.learnAgg, 35) / 100, 0, 1);
+    var delta = clamp(sumW * (0.01 + 0.05 * agg), 0.2, 20);
+    delta = Math.min(delta, wDec);
+    if (!(delta > 1e-6)) { rt.maxLearn.paused = 'paused (delta=0)'; return false; }
+
+    if (!rowState[incKey]) rowState[incKey] = {};
+    if (!rowState[decKey]) rowState[decKey] = {};
+
+    rowState[incKey].weight = wInc + delta;
+    rowState[decKey].weight = wDec - delta;
+    saveRows();
+
+    rt.maxLearn.trial = {
+      incKey: incKey,
+      decKey: decKey,
+      delta: delta,
+      baseScore: baseScore,
+      oldInc: wInc,
+      oldDec: wDec,
+      startedAt: Date.now(),
+      settleUntil: Date.now() + clamp(toNum(state.learnSettleSec, 8), 3, 60) * 1000
+    };
+    return true;
+  }
+
+  function finishMaxTrial() {
+    var tr = rt.maxLearn.trial;
+    if (!tr) return;
+
+    var curScore = toNum(rt.maxLearn.lastScore, NaN);
+    if (!Number.isFinite(curScore) || !Number.isFinite(tr.baseScore)) {
+      rowState[tr.incKey].weight = tr.oldInc;
+      rowState[tr.decKey].weight = tr.oldDec;
+      saveRows();
+      rt.maxLearn.trial = null;
+      return;
+    }
+
+    var eps = Math.max(Math.abs(tr.baseScore) * 0.0005, 1e-9);
+    if (curScore >= tr.baseScore + eps) {
+      rt.maxLearn.trial = null;
+      return;
+    }
+
+    rowState[tr.incKey].weight = tr.oldInc;
+    rowState[tr.decKey].weight = tr.oldDec;
+    saveRows();
+    rt.maxLearn.trial = null;
+  }
+
+  function maxLearnTick(snapshot) {
+    if (rt.maxLearn.resKey !== state.maxResKey) {
+      rt.maxLearn.resKey = state.maxResKey || null;
+      resetMaxLearner(false);
+    }
+    if (!state.maxResKey) return;
+
+    updateMaxScore(snapshot);
+
+    if (rt.maxLearn.trial) {
+      if (Date.now() >= rt.maxLearn.trial.settleUntil) finishMaxTrial();
+      return;
+    }
+
+    if ((rt.maxLearn.obs || []).length < 16) { rt.maxLearn.paused = 'warming up (observations)'; return; }
+
+    var now = Date.now();
+    var intervalMs = clamp(toNum(state.learnIntervalSec, 8), 3, 60) * 1000;
+    if (now - (rt.maxLearn.lastStepAt || 0) < intervalMs) return;
+
+    var started = startMaxTrial(snapshot);
+    if (started) rt.maxLearn.lastStepAt = now;
+  }
+
+  // ---------------- compute plan ----------------
+  function computePlan(snapshot) {
+    var workerCap = toNum(snapshot.workerCap, 0);
+    var pop = toNum(snapshot.pop, 0);
+    var popCap = toNum(snapshot.popCap, 0);
+
+    var fixed = getFixedBuildings(snapshot);
+    var alloc = getAllocBuildings(snapshot);
+
+    var fixedWorkers = 0;
+    for (var i = 0; i < fixed.length; i++) {
+      var fb = fixed[i];
+      var cnt = fb.autoBuildEnabled ? (Number.isFinite(fb.targetCount) ? fb.targetCount : 0) : toNum(fb.active, 0);
+      fixedWorkers += cnt * toNum(fb.effNeed, 0);
+    }
+    var remainder = Math.max(0, workerCap - fixedWorkers);
+
+    var cloneKey = findBuildingKeyByName(snapshot, /clon/i);
+    var androidKey = findBuildingKeyByName(snapshot, /android/i);
+    var shipKey = findBuildingKeyByName(snapshot, /shipyard|ship\b/i);
+    var biodomeKey = findBuildingKeyByName(snapshot, /biodome/i);
+
+    var stColonists = snapshot && snapshot.res ? snapshot.res['colony:colonists'] : null;
+    var stAndroids = snapshot && snapshot.res ? snapshot.res['colony:androids'] : null;
+
+    // "Hard-capped" only when hysteresis says capped AND there is no consumption pressure.
+    var colonistsCapped = !!rt.capState.colonists && stColonists && stColonists.cap > 0 && (stColonists.cons <= 0);
+    var androidsCapped = !!rt.capState.android && stAndroids && stAndroids.cap > 0 && (stAndroids.cons <= 0);
+
+    // Deficit factors (0..1): strong under cap, fades near cap.
+    function deficitFactorFor(st) {
+      if (!st) return 0;
+      if (!(toNum(st.cap, 0) > 0)) return 0;
+      var sev = capDeficitSeverity(st); // already banded 0..1
+      // Keep a tiny floor if consumption exists (avoids "fully off" in steady-state where tiny drops matter).
+      if (toNum(st.cons, 0) > 0) sev = Math.max(sev, 0.10);
+      return clamp(sev, 0, 1);
+    }
+    var defColonists = deficitFactorFor(stColonists);
+    var defAndroids = deficitFactorFor(stAndroids);
+
+    // Floors are expressed in workers (not buildings) before conversion; later we ceil by effNeed.
+    var floorWorkersByKey = {};
+    function addFloorWorkers(k, w) {
+      if (!k || !(w > 0)) return;
+      floorWorkersByKey[k] = (floorWorkersByKey[k] || 0) + w;
+    }
+
+    // Deficit-scaled "Min" floors
+    if (state.keepClonesMin && cloneKey && !colonistsCapped) {
+      addFloorWorkers(cloneKey, remainder * (clamp(state.minPctClones, 0, 10) / 100) * defColonists);
+    }
+    if (state.keepAndroidsMin && androidKey && !androidsCapped) {
+      addFloorWorkers(androidKey, remainder * (clamp(state.minPctAndroids, 0, 10) / 100) * defAndroids);
+    }
+    if (state.keepShipsMin && shipKey) {
+      // ships are not cap-stabilized here; min ships is always a fixed minimum when enabled
+      addFloorWorkers(shipKey, remainder * (clamp(state.minPctShips, 0, 10) / 100));
+    }
+    if (state.keepBiodomesMin && biodomeKey && !colonistsCapped) {
+      addFloorWorkers(biodomeKey, remainder * (clamp(state.minPctBiodomes, 0, 10) / 100) * defColonists);
+    }
+
+    // Emergency floor distribution based on resource severity, plus dependency coupling.
+    var producersByRes = {};
+    for (var pb = 0; pb < alloc.length; pb++) {
+      var pbld = alloc[pb];
+      var pr = pbld && pbld.produces ? pbld.produces : [];
+      for (var pi = 0; pi < pr.length; pi++) {
+        var rk = pr[pi];
+        if (!rk || isExcludedForSafeguards(rk)) continue;
+        if (!producersByRes[rk]) producersByRes[rk] = [];
+        producersByRes[rk].push(pbld.key);
+      }
+    }
+
+    var resMap = snapshot && snapshot.res ? snapshot.res : {};
+    var bufferS2 = clamp(state.bufferSeconds, 5, 600);
+
+    var nowE = Date.now();
+    var dtE = (nowE - (rt.lastEmergencyAt || nowE)) / 1000;
+    if (!Number.isFinite(dtE) || dtE <= 0) dtE = 0.5;
+    dtE = clamp(dtE, 0.1, 5);
+    rt.lastEmergencyAt = nowE;
+
+    var targetSev = {};
+    for (var rk2 in resMap) {
+      if (!resMap.hasOwnProperty(rk2)) continue;
+      if (isExcludedForSafeguards(rk2)) continue;
+      targetSev[rk2] = emergencySeverity(rk2, resMap[rk2], bufferS2);
+    }
+
+    // Dependency propagation: if output is severely starved and an input is tight, lift the input severity.
+    function depPropagationFactor(depSt, bufferS) {
+      if (!depSt) return 0;
+
+      var cap = toNum(depSt.cap, 0);
+      var val = Math.max(0, toNum(depSt.value, 0));
+
+      if (cap > 0 && val >= cap * 0.995) return 0;
+
+      var cons = Math.max(0, toNum(depSt.cons, 0));
+      if (!(cons > 0)) return 0;
+
+      var secs = val / cons;
+      if (secs < bufferS * 1.5) return 1;
+      if (secs < bufferS * 4) return clamp((bufferS * 4 - secs) / (bufferS * 2.5), 0, 1);
+
+      var net = netIncludingOverflow(depSt);
+      var dead = cons * 0.01;
+      if (net < -dead && secs < bufferS * 10) return 0.2;
+
+      return 0;
+    }
+
+    for (var outKey in targetSev) {
+      if (!targetSev.hasOwnProperty(outKey)) continue;
+      var sevOut = targetSev[outKey];
+      if (!(sevOut > 0)) continue;
+
+      var deps = EMERG_DEPS[outKey];
+      if (!deps || !deps.length) continue;
+
+      for (var di = 0; di < deps.length; di++) {
+        var dep = deps[di];
+        if (isExcludedForSafeguards(dep)) continue;
+
+        var depSt = resMap[dep];
+        var f = depPropagationFactor(depSt, bufferS2);
+        if (f > 0) targetSev[dep] = Math.max(toNum(targetSev[dep], 0), sevOut * 0.75 * f);
+      }
+    }
+
+    var emergList = [];
+    var maxSev = 0;
+    for (var rk3 in targetSev) {
+      if (!targetSev.hasOwnProperty(rk3)) continue;
+      var prodKeys = producersByRes[rk3];
+      if (!prodKeys || !prodKeys.length) continue;
+
+      var sevSm = emergLevelUpdate(rk3, targetSev[rk3], dtE);
+      if (!(sevSm > 0)) continue;
+
+      emergList.push({ rk: rk3, sev: sevSm, producers: prodKeys });
+      if (sevSm > maxSev) maxSev = sevSm;
+    }
+
+    if (remainder > 0 && emergList.length) {
+      emergList.sort(function (a, b) { return b.sev - a.sev; });
+      if (emergList.length > 8) emergList.length = 8;
+
+      var sumTop = 0;
+      for (var si = 0; si < emergList.length; si++) sumTop += emergList[si].sev;
+
+      if (sumTop > 0) {
+        var budgetPct = clamp(6 + 49 * maxSev, 0, 55);
+        var budgetWorkers = remainder * (budgetPct / 100);
+
+        for (var ei = 0; ei < emergList.length; ei++) {
+          var e = emergList[ei];
+          var wBudget = budgetWorkers * (e.sev / sumTop);
+          var per = wBudget / e.producers.length;
+          for (var pk = 0; pk < e.producers.length; pk++) addFloorWorkers(e.producers[pk], per);
         }
       }
-      if (best.counts) {
-        Object.assign(counts, best.counts);
-        remaining = best.leftover;
+    }
+
+    // Persistent boosts (controller output from adjustSafeguards)
+    for (var a = 0; a < alloc.length; a++) {
+      var bb = alloc[a];
+      var bp = toNum(boostPctByKey[bb.key], 0);
+      if (bp > 0) addFloorWorkers(bb.key, remainder * (bp / 100));
+    }
+
+    // --- FLOOR CAP: prevent stacked floors (min + emergency + boost) exceeding remainder ---
+    // Without this, floorWorkersUsed can exceed `remainder`, remainForWeights becomes 0,
+    // and overshoot trimming can't reduce floors (causing negative free workers + runaway counts).
+    var totalFloorReq = 0;
+    for (var fk0 in floorWorkersByKey) {
+      if (!floorWorkersByKey.hasOwnProperty(fk0)) continue;
+      totalFloorReq += toNum(floorWorkersByKey[fk0], 0);
+    }
+    if (totalFloorReq > remainder && totalFloorReq > 0) {
+      var s = remainder / totalFloorReq;
+      for (var fk1 in floorWorkersByKey) {
+        if (!floorWorkersByKey.hasOwnProperty(fk1)) continue;
+        floorWorkersByKey[fk1] = toNum(floorWorkersByKey[fk1], 0) * s;
       }
     }
 
-    plan.counts = counts;
-    if (remaining > 0) plan.notes.push(`Unused workers: ${remaining.toFixed(0)} (couldn't fit smallest building need).`);
+    var effByKey = {};
+    for (var b2 = 0; b2 < snapshot.buildings.length; b2++) effByKey[snapshot.buildings[b2].key] = toNum(snapshot.buildings[b2].effNeed, 0);
 
-    return plan;
-  }
-
-  /********************************************************************
-   * Market Planning (Buy = cover deficit only; Sell = surplus + drain overfill)
-   ********************************************************************/
-
-  function computeMarketPlan(snap) {
-    const m = { buy: [], sell: [], note: '' };
-    const mh = snap.market;
-    if (!mh || !mh.project) {
-      m.note = 'Market project not found.';
-      return m;
+    // Convert floor workers -> floor building counts
+    var floorCountByKey = {};
+    var floorWorkersUsed = 0;
+    for (var k in floorWorkersByKey) {
+      if (!floorWorkersByKey.hasOwnProperty(k)) continue;
+      var eff = effByKey[k] || 0;
+      if (!(eff > 0)) continue;
+      var w = floorWorkersByKey[k];
+      var ccount = Math.ceil(w / eff);
+      floorCountByKey[k] = (floorCountByKey[k] || 0) + ccount;
+      floorWorkersUsed += ccount * eff;
     }
 
-    // Build desired buy/sell quantities per resource
-    const buy = [];
-    const sell = [];
+    var remainForWeights = Math.max(0, remainder - floorWorkersUsed);
 
-    for (const r of RESOURCES) {
-      const st = STATE.resources[r.key];
-      const sr = snap.resources[r.key];
-      if (!st || !sr || !sr.unlocked) continue;
+    // Weighted pool (skips pop buildings only when hard-capped)
+    var enabled = [];
+    var sumW = 0;
+    for (var a2 = 0; a2 < alloc.length; a2++) {
+      var bld = alloc[a2];
+      var rs = rowState[bld.key] || {};
+      if (rs.enabled === false) continue;
 
-      const cat = r.cat;
+      if (bld.key === cloneKey && colonistsCapped) continue;
+      if (bld.key === androidKey && androidsCapped) continue;
 
-      // Buy: cover deficit only (baselineNet includes autobuild costs, excludes market)
-      if (st.marketBuy) {
-        const deficitPerSec = Math.max(0, -(sr.baselineNet));
-        const qty = deficitPerSec * MARKET_BUY_HORIZON_SEC;
-        if (qty > MARKET_MIN_TRADE) buy.push({ category: cat, resource: r.key, quantity: qty });
+      var wgt = Math.max(0, toNum(rs.weight, 0));
+      if (!(wgt > 0)) continue;
+      enabled.push({ b: bld, w: wgt });
+      sumW += wgt;
+    }
+
+    var targetCountByKey = {};
+    // Seed from floors
+    for (var fk in floorCountByKey) {
+      if (!floorCountByKey.hasOwnProperty(fk)) continue;
+      targetCountByKey[fk] = (targetCountByKey[fk] || 0) + floorCountByKey[fk];
+    }
+
+    // Add weighted distribution
+    if (sumW > 0 && remainForWeights > 0) {
+      for (var e2 = 0; e2 < enabled.length; e2++) {
+        var eb = enabled[e2].b;
+        var effE = Math.max(1e-9, toNum(eb.effNeed, 0));
+        var shareWorkers = remainForWeights * (enabled[e2].w / sumW);
+        var addCnt = Math.floor((shareWorkers / effE) + 1e-9);
+        targetCountByKey[eb.key] = (targetCountByKey[eb.key] || 0) + addCnt;
       }
+    }
 
-      // Sell: surplus rate PLUS overfill drain (B)
-      if (st.marketSell) {
-        const surplusPerSec = Math.max(0, sr.baselineNet);
-        let qty = surplusPerSec * MARKET_BUY_HORIZON_SEC; // sell some of the surplus promptly
-        if (sr.cap > 0) {
-          const target = clamp(st.targetFill, 0.05, 0.95);
-          const over = Math.max(0, sr.value - sr.cap * target);
-          qty += (over / MARKET_SELL_HORIZON_SEC);
+    function assignedTotalWorkers() {
+      var total = fixedWorkers;
+      for (var i3 = 0; i3 < alloc.length; i3++) {
+        var b3 = alloc[i3];
+        total += toNum(targetCountByKey[b3.key], 0) * toNum(b3.effNeed, 0);
+      }
+      return total;
+    }
+
+    // Trim overshoot (never below floor counts)
+    var assigned = assignedTotalWorkers();
+    if (assigned > workerCap + 1e-6) {
+      var overshoot = assigned - workerCap;
+      var candidates2 = [];
+      for (var cidx = 0; cidx < alloc.length; cidx++) {
+        var cbld = alloc[cidx];
+        var rs2 = rowState[cbld.key] || {};
+        var w2 = Math.max(0, toNum(rs2.weight, 0));
+        var cnt2 = toNum(targetCountByKey[cbld.key], 0);
+        var floorCnt = toNum(floorCountByKey[cbld.key], 0);
+        if (cnt2 > floorCnt) candidates2.push({ b: cbld, w: w2, cnt: cnt2, floorCnt: floorCnt });
+      }
+      candidates2.sort(function (a, b) { return a.w - b.w; });
+
+      for (var ci2 = 0; ci2 < candidates2.length && overshoot > 0; ci2++) {
+        var cnd = candidates2[ci2];
+        var effC = Math.max(1e-9, toNum(cnd.b.effNeed, 0));
+        var canRemove = Math.min(cnd.cnt - cnd.floorCnt, Math.ceil(overshoot / effC));
+        if (canRemove > 0) {
+          targetCountByKey[cnd.b.key] -= canRemove;
+          overshoot -= canRemove * effC;
         }
-        if (qty > MARKET_MIN_TRADE) sell.push({ category: cat, resource: r.key, quantity: qty });
       }
     }
 
-    // Funding protection: scale buys down if funding would go < 0 over horizon
-    const funding = getFundingObj();
-    const fundingNow = Number(funding?.value) || 0;
-
-    const baseFundingNet = (() => {
-      if (!funding) return 0;
-      const total = (Number(funding.productionRate) || 0) - (Number(funding.consumptionRate) || 0);
-      const marketNet = getMarketNetFromRates(funding); // market affects funding too
-      const autobuildAvg = getAutobuildAvgCost('colony', 'funding');
-      return total - marketNet - autobuildAvg;
-    })();
-
-    const buyCostPerSec = (() => {
-      let c = 0;
-      for (const x of buy) c += x.quantity * mh.buyPrice(x.category, x.resource);
-      return c / MARKET_BUY_HORIZON_SEC;
-    })();
-
-    const sellRevPerSec = (() => {
-      let rps = 0;
-      for (const x of sell) rps += x.quantity * mh.sellPrice(x.category, x.resource, x.quantity);
-      // x.quantity is in "units over horizon"; convert to per second
-      return rps / Math.max(MARKET_BUY_HORIZON_SEC, 1);
-    })();
-
-    const horizon = MARKET_BUY_HORIZON_SEC;
-    const projected = fundingNow + (baseFundingNet + sellRevPerSec - buyCostPerSec) * horizon;
-
-    if (projected < FUNDS_MIN_BUFFER && buy.length) {
-      const numerator = (fundingNow - FUNDS_MIN_BUFFER) + (baseFundingNet + sellRevPerSec) * horizon;
-      const denom = (buyCostPerSec * horizon);
-      const scale = denom > 0 ? clamp(numerator / denom, 0, 1) : 0;
-
-      if (scale < 1) {
-        for (const x of buy) x.quantity *= scale;
-        m.note = `Buy scaled to ${(scale * 100).toFixed(0)}% to keep funding ≥ ${FUNDS_MIN_BUFFER}.`;
+    // Fill slack to top weight building (best-effort)
+    assigned = assignedTotalWorkers();
+    if (assigned < workerCap - 1e-6) {
+      var slack = workerCap - assigned;
+      if (enabled.length) {
+        enabled.sort(function (a, b) { return b.w - a.w; });
+        var best = enabled[0].b;
+        var effB = Math.max(1e-9, toNum(best.effNeed, 0));
+        var add = Math.floor(slack / effB);
+        if (add > 0) targetCountByKey[best.key] = (targetCountByKey[best.key] || 0) + add;
       }
     }
 
-    // Remove tiny entries after scaling
-    m.buy = buy.filter(x => x.quantity > MARKET_MIN_TRADE);
-    m.sell = sell.filter(x => x.quantity > MARKET_MIN_TRADE);
-    return m;
+    // Produce apply pct + worker bars
+    var percentByKey = {};
+    var workersByKey = {};
+    var workerShareByKey = {};
+
+    for (var i4 = 0; i4 < alloc.length; i4++) {
+      var b4 = alloc[i4];
+      var cnt4 = toNum(targetCountByKey[b4.key], 0);
+      var eff4 = toNum(b4.effNeed, 0);
+      var workers = cnt4 * eff4;
+      workersByKey[b4.key] = workers;
+      workerShareByKey[b4.key] = (workerCap > 0) ? (workers / workerCap) : 0;
+      percentByKey[b4.key] = (workerCap > 0) ? (cnt4 * 100 / workerCap) : 0;
+    }
+
+    // Breakdowns for status card
+    var allocWorkersTotal = 0;
+    for (var i5 = 0; i5 < alloc.length; i5++) allocWorkersTotal += toNum(workersByKey[alloc[i5].key], 0);
+    var weightedWorkers = Math.max(0, allocWorkersTotal - floorWorkersUsed);
+
+    return {
+      workerCap: workerCap,
+      workerFree: toNum(snapshot.workerFree, 0),
+      pop: pop, popCap: popCap,
+      fixedWorkers: fixedWorkers,
+      remainder: remainder,
+      floorWorkersUsed: floorWorkersUsed,
+      weightedWorkersUsed: weightedWorkers,
+      remainForWeights: remainForWeights,
+      alloc: alloc,
+      fixed: fixed,
+      cloneKey: cloneKey, androidKey: androidKey, shipKey: shipKey, biodomeKey: biodomeKey,
+      colonistsCapped: colonistsCapped, androidsCapped: androidsCapped,
+      floorCountByKey: floorCountByKey,
+      targetCountByKey: targetCountByKey,
+      percentByKey: percentByKey,
+      workersByKey: workersByKey,
+      workerShareByKey: workerShareByKey
+    };
   }
 
-  function applyMarketPlan(marketPlan, snap) {
-    const mh = snap.market;
-    if (!mh || !mh.project) return;
+  // ---------------- apply + render ----------------
+  function applyPlan(plan) {
+    if (!state.running) return;
 
-    const proj = mh.project;
-    proj.buySelections = marketPlan.buy.map(x => ({ ...x, quantity: x.quantity }));
-    proj.sellSelections = marketPlan.sell.map(x => ({ ...x, quantity: x.quantity }));
+    var now = Date.now();
+    if (now - rt.lastApplyAt < 320) return;
+    rt.lastApplyAt = now;
 
-    // If nothing to do, don't force-start
-    if (!proj.buySelections.length && !proj.sellSelections.length) return;
+    var updates = {};
+    for (var i = 0; i < plan.alloc.length; i++) {
+      var b = plan.alloc[i];
+      var pct = toNum(plan.percentByKey[b.key], 0);
+      var prev = toNum(rt.lastAppliedPct[b.key], NaN);
+      if (!Number.isFinite(prev) || Math.abs(prev - pct) > 1e-12) {
+        updates[b.key] = { autoBuildPercent: pct };
+        rt.lastAppliedPct[b.key] = pct;
+      }
+    }
+    var keys = Object.keys(updates);
+    if (!keys.length) return;
 
-    // Start if not active, or if automation is locked and it stops quickly (keep it running)
-    if (!proj.isActive) {
-      try { globalThis.projectManager.startProject('galactic_market'); } catch {}
-    } else {
-      // ensure not paused
-      proj.isPaused = false;
+    var api = getApi();
+    var res = api && typeof api.apply === 'function' ? api.apply(updates) : null;
+    if (res && res.ok === false) {
+      state.running = false;
+      ui.runBtn.textContent = 'Start';
+      saveSettings();
+    }
+
+    // Optional nudge for engines that only recompute on helper call.
+    try {
+      var refreshAll = getPageProp('refreshAllAutoBuildTargets');
+      if (typeof refreshAll === 'function') refreshAll();
+    } catch (e) {}
+  }
+
+  function renderWaiting(reason) {
+    var msg = reason || 'Waiting for game globals (resources/buildings)…';
+    ui.statusCard.innerHTML = ''
+      + '<div class="ttwa-row" style="justify-content:space-between">'
+      + '  <div class="ttwa-kv"><div class="k">Status</div><div class="v"><span class="ttwa-badge">Not ready</span></div></div>'
+      + '  <div class="ttwa-mini ttwa-muted">Open the Colony/Buildings tabs once if the page delays global init.</div>'
+      + '</div>'
+      + '<div class="ttwa-mini ttwa-muted" style="margin-top:8px">' + escapeHtml(msg) + '</div>';
+  }
+
+  function renderStatus(snapshot, plan) {
+    var stC = snapshot && snapshot.res ? snapshot.res['colony:colonists'] : null;
+    var stA = snapshot && snapshot.res ? snapshot.res['colony:androids'] : null;
+
+    function fillStr(st) {
+      var cap = toNum(st ? st.cap : 0, 0);
+      var val = toNum(st ? st.value : 0, 0);
+      if (!(cap > 0)) return 'n/a';
+      return (val / cap * 100).toFixed(4) + '%';
+    }
+    function netStr(st) { return fmtNum(netIncludingOverflow(st)); }
+
+    var maxLabel = (state.maxResKey ? resKeyLabel(state.maxResKey) : null);
+    var score = Number.isFinite(rt.maxLearn.lastScore) ? fmtNum(rt.maxLearn.lastScore) : '…';
+    var mean = Number.isFinite(rt.maxLearn.mean) ? fmtNum(rt.maxLearn.mean) : '…';
+
+    ui.statusCard.innerHTML =
+      '<div class="ttwa-grid">'
+      + '  <div class="ttwa-kv">'
+      + '    <div class="k">Workers</div>'
+      + '    <div class="v">'
+      + '      <span class="ttwa-badge">cap ' + fmtNum(plan.workerCap) + '</span>'
+      + '      <span class="ttwa-badge">free ' + fmtNum(plan.workerFree) + '</span>'
+      + '    </div>'
+      + '    <div class="ttwa-mini ttwa-muted" style="margin-top:4px">'
+      + '      fixed ' + fmtNum(plan.fixedWorkers) + ' · floors ' + fmtNum(plan.floorWorkersUsed) + ' · weights ' + fmtNum(plan.weightedWorkersUsed)
+      + '    </div>'
+      + '  </div>'
+      + '  <div class="ttwa-kv">'
+      + '    <div class="k">Pop caps</div>'
+      + '    <div class="v">'
+      + '      <span class="ttwa-badge">colonists ' + fmtNum(toNum(stC ? stC.value : plan.pop, 0)) + '/' + fmtNum(toNum(stC ? stC.cap : plan.popCap, 0)) + ' (' + fillStr(stC) + ')</span>'
+      + '      <span class="ttwa-badge">androids ' + fmtNum(toNum(stA ? stA.value : 0, 0)) + '/' + fmtNum(toNum(stA ? stA.cap : 0, 0)) + ' (' + fillStr(stA) + ')</span>'
+      + '    </div>'
+      + '    <div class="ttwa-mini ttwa-muted" style="margin-top:4px">'
+      + '      net C ' + netStr(stC) + '/s · net A ' + netStr(stA) + '/s'
+      + '    </div>'
+      + '  </div>'
+      + '</div>'
+      + '<div class="ttwa-row" style="margin-top:8px;justify-content:space-between">'
+      + '  <div class="ttwa-mini ttwa-muted">Safeguards target ~' + Math.round(state.bufferSeconds) + 's buffers; pops are pinned to cap (cap-fill + margin if consuming).</div>'
+      + '  <div class="ttwa-mini ttwa-muted">'
+      + (maxLabel ? ('Max <b>' + escapeHtml(maxLabel) + '</b> · score ' + score + ' · mean ' + mean + (rt.maxLearn.paused ? (' · ' + escapeHtml(rt.maxLearn.paused)) : '')) : 'Max: off')
+      + '  </div>'
+      + '</div>';
+  }
+
+  function renderTable(snapshot, plan) {
+    var rows = ui.allocCard.querySelectorAll('tr[data-key]');
+    if (!rows || !rows.length) return;
+
+    var allocMap = {};
+    for (var i = 0; i < plan.alloc.length; i++) allocMap[plan.alloc[i].key] = plan.alloc[i];
+
+    for (var r = 0; r < rows.length; r++) {
+      var tr = rows[r];
+      var key = tr.getAttribute('data-key');
+      var b = allocMap[key];
+      if (!b) continue;
+
+      var cb = tr.querySelector('.ttwa-use');
+      var cbMax = tr.querySelector('.ttwa-max');
+      var inp = tr.querySelector('.ttwa-weight');
+      var infoBtn = tr.querySelector('.ttwa-info');
+      var bar = tr.querySelector('.ttwa-bar');
+      var barFill = tr.querySelector('.ttwa-barfill');
+      var barText = tr.querySelector('.ttwa-bartext');
+
+      var rs = rowState[key] || {};
+      var en = (rs.enabled !== false);
+      if (cb.checked !== en) cb.checked = en;
+
+      if (document.activeElement !== inp) {
+        var wv = toNum(rs.weight, 0);
+        if (inp.value !== String(wv)) inp.value = String(wv);
+      }
+
+      var maxrk = tr.getAttribute('data-maxrk') || '';
+      var wantMax = (state.maxBuildingKey === key);
+      if (cbMax.checked !== wantMax) cbMax.checked = wantMax;
+      cbMax.disabled = !maxrk || isExcludedForMax(maxrk);
+
+      var floorCnt = toNum(plan.floorCountByKey[key], 0);
+      var tgtCnt = toNum(plan.targetCountByKey[key], 0);
+      var eff = toNum(b.effNeed, 0);
+      var workers = toNum(plan.workersByKey[key], 0);
+      var share = toNum(plan.workerShareByKey[key], 0);
+      var boost = toNum(boostPctByKey[key], 0);
+
+      // Workers bar = worker share, not autoBuildPercent.
+      var pctFill = clamp(share * 100, 0, 100);
+      barFill.style.width = pctFill.toFixed(2) + '%';
+      barText.textContent = fmtNum(workers);
+
+      // Info tooltip
+      var produces = (b.produces || []).filter(function (x) { return x && !isExcludedForSafeguards(x); });
+      var prodStr = produces.length ? produces.map(function (x) { return '<code>' + escapeHtml(x) + '</code>'; }).join(' ') : '<span class="ttwa-muted">none</span>';
+
+      var infoHtml =
+        '<div class="tt">' + escapeHtml(b.displayName) + '</div>' +
+        '<div class="ln"><div class="lk">Key</div><div class="lv"><code>' + escapeHtml(b.key) + '</code></div></div>' +
+        '<div class="ln"><div class="lk">Enabled</div><div class="lv">' + (en ? 'yes' : 'no') + '</div></div>' +
+        '<div class="ln"><div class="lk">Weight</div><div class="lv">' + fmtPct(toNum(rs.weight, 0)) + '</div></div>' +
+        '<div class="ln"><div class="lk">Workers/building</div><div class="lv">' + fmtNum(eff) + '</div></div>' +
+        '<div class="ln"><div class="lk">Floor buildings</div><div class="lv">' + fmtNum(floorCnt) + (boost > 0 ? (' · boost ' + fmtPct(boost) + '%') : '') + '</div></div>' +
+        '<div class="ln"><div class="lk">Target buildings</div><div class="lv">' + fmtNum(tgtCnt) + '</div></div>' +
+        '<div class="ln"><div class="lk">Workers</div><div class="lv">' + fmtNum(workers) + ' (' + pctFill.toFixed(3) + '% cap)</div></div>' +
+        '<div class="ln"><div class="lk">Produces</div><div class="lv">' + prodStr + '</div></div>';
+
+      setTip(infoBtn, infoHtml);
+      setTip(bar, '<div class="tt">Workers allocation</div>' +
+        '<div class="ln"><div class="lk">Workers</div><div class="lv">' + fmtNum(workers) + '</div></div>' +
+        '<div class="ln"><div class="lk">Share</div><div class="lv">' + (pctFill.toFixed(3)) + '% of cap</div></div>');
     }
   }
 
-  /********************************************************************
-   * Apply Worker Plan to Buildings (only visible/unlocked)
-   ********************************************************************/
+  // ---------------- main loop ----------------
+  function tick() {
+    injectBridge();
 
-  function percentForTargetCount(count, base) {
-    if (!base || base <= 0) return 0;
-    if (!count || count <= 0) return 0;
-    // avoid float causing ceil to overshoot by 1
-    const pct = (count / base) * 100;
-    return Math.max(0, pct - 1e-6);
-  }
-
-  function applyPlan(plan, snap) {
-    const bdict = globalThis.buildings || {};
-    const controlledBuildings = new Set();
-
-    // For each resource with mode on/balance, find chosen producer and mark it controlled
-    for (const r of RESOURCES) {
-      const st = STATE.resources[r.key];
-      if (!st || st.mode === 'off') continue;
-
-      const producers = snap.producersByRes[r.key] || [];
-      if (!producers.length) continue;
-
-      let producerId = st.producer;
-      if (producerId === 'auto' || !snap.buildings?.[producerId]) {
-        producerId = chooseAutoProducer(r.key, producers, snap);
-      }
-      if (!producerId) continue;
-
-      const b = bdict[producerId];
-      if (!b || !isBuildingVisibleInUI(b)) continue;
-      controlledBuildings.add(producerId);
-
-      const need = getBuildingWorkerNeed(b);
-
-      // Always enable auto-active for controlled buildings (lets Balance still control activation)
-      b.autoActiveEnabled = true;
-
-      if (need > 0) {
-        // Use workers basis so percent maps to target building count via workerCap
-        b.autoBuildBasis = 'workers';
-
-        const targetCount = plan.counts[producerId] ?? Math.min(Number(b.count) || 0, Math.ceil((Number(b.active) || 0)));
-        const pct = percentForTargetCount(Math.max(0, Math.floor(targetCount)), plan.workerCap);
-        b.autoBuildPercent = pct;
-
-        // Build enable depends on mode
-        b.autoBuildEnabled = (st.mode === 'on');
-      } else {
-        // Non-worker buildings: don't force basis/percent (avoid runaway counts),
-        // but respect On vs Balance for auto-building.
-        b.autoBuildEnabled = (st.mode === 'on');
-      }
+    var api = getApi();
+    if (!api || typeof api.ready !== 'function') {
+      renderWaiting('Bridge API not available yet.');
+      return;
+    }
+    if (!api.ready()) {
+      renderWaiting('Game state not initialized yet.');
+      return;
     }
 
-    // Do not touch any other buildings.
+    var snapshot = api.snapshot();
+    ensureRows(snapshot);
+
+    adjustSafeguards(snapshot);
+    maxLearnTick(snapshot);
+
+    var plan = computePlan(snapshot);
+    applyPlan(plan);
+
+    renderStatus(snapshot, plan);
+    renderTable(snapshot, plan);
+
+    ui.body.style.maxHeight = 'calc(100vh - 24px - ' + (ui.header.getBoundingClientRect().height || 52) + 'px)';
+    ui.body.style.overflow = 'auto';
   }
 
-  /********************************************************************
-   * UI (dock-left popout, stable controls)
-   ********************************************************************/
+  // boot
+  buildUI();
+  injectBridge();
+  setInterval(tick, 500);
+  tick();
 
-  const UI = {
-    root: null,
-    rail: null,
-    panel: null,
-    rows: {},        // resKey -> row meta
-    status: null,
-    notes: null,
-    pinnedBtn: null,
-    isOpen: false,
-  };
-
-  function injectStyles() {
-    if (document.getElementById('ttwa-style')) return;
-    const style = document.createElement('style');
-    style.id = 'ttwa-style';
-    style.textContent = `
-      :root { --ttwa-pad: ${EXPAND_W}px; }
-      #ttwa-root {
-        position: fixed;
-        top: 0;
-        left: 0;
-        height: 100vh;
-        z-index: 999999;
-        display: flex;
-        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-        pointer-events: auto;
-      }
-      #ttwa-rail {
-        width: ${RAIL_W}px;
-        background: rgba(18, 22, 28, 0.92);
-        border-right: 1px solid rgba(255,255,255,0.08);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        padding: 8px 0;
-        gap: 10px;
-        box-shadow: 0 0 0 1px rgba(0,0,0,0.25) inset;
-      }
-      #ttwa-rail .ttwa-logo {
-        font-weight: 800;
-        letter-spacing: 0.5px;
-        color: rgba(255,255,255,0.85);
-        font-size: 12px;
-        user-select: none;
-      }
-      #ttwa-rail button {
-        width: 24px;
-        height: 24px;
-        border-radius: 8px;
-        border: 1px solid rgba(255,255,255,0.14);
-        background: rgba(255,255,255,0.06);
-        color: rgba(255,255,255,0.9);
-        cursor: pointer;
-      }
-      #ttwa-panel {
-        width: ${EXPAND_W}px;
-        height: 100vh;
-        background: rgba(26, 30, 38, 0.92);
-        border-right: 1px solid rgba(255,255,255,0.10);
-        box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-        display: flex;
-        flex-direction: column;
-        transform: translateX(-${EXPAND_W}px);
-        transition: transform 140ms ease-out;
-      }
-      #ttwa-root.open #ttwa-panel {
-        transform: translateX(0);
-      }
-      #ttwa-header {
-        padding: 10px 12px 8px;
-        border-bottom: 1px solid rgba(255,255,255,0.10);
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-      #ttwa-title {
-        display: flex;
-        align-items: baseline;
-        justify-content: space-between;
-        gap: 10px;
-      }
-      #ttwa-title .name {
-        color: rgba(255,255,255,0.92);
-        font-weight: 700;
-        font-size: 14px;
-      }
-      #ttwa-title .ver {
-        color: rgba(255,255,255,0.60);
-        font-size: 11px;
-      }
-      #ttwa-status {
-        color: rgba(255,255,255,0.70);
-        font-size: 12px;
-        display: flex;
-        gap: 12px;
-        flex-wrap: wrap;
-      }
-      #ttwa-notes {
-        color: rgba(255,255,255,0.65);
-        font-size: 12px;
-        padding: 6px 12px 0;
-        min-height: 18px;
-      }
-
-      #ttwa-body {
-        padding: 10px 12px 12px;
-        overflow: auto;
-        flex: 1;
-      }
-
-      .ttwa-row {
-        display: grid;
-        grid-template-columns: 120px 92px 92px 90px 1fr;
-        gap: 8px 10px;
-        align-items: center;
-        padding: 6px 8px;
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 10px;
-        margin-bottom: 8px;
-      }
-      .ttwa-row:nth-child(odd) { background: rgba(255,255,255,0.06); }
-      .ttwa-row:nth-child(even){ background: rgba(255,255,255,0.09); }
-
-      .ttwa-name {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-      }
-      .ttwa-name .lbl {
-        color: rgba(255,255,255,0.92);
-        font-weight: 700;
-        font-size: 13px;
-        line-height: 1.1;
-      }
-      .ttwa-name .sub {
-        color: rgba(255,255,255,0.65);
-        font-size: 11px;
-        line-height: 1.1;
-      }
-
-      .ttwa-metric {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-      }
-      .ttwa-metric .top {
-        color: rgba(255,255,255,0.80);
-        font-size: 12px;
-        line-height: 1.1;
-      }
-      .ttwa-metric .bot {
-        color: rgba(255,255,255,0.60);
-        font-size: 11px;
-        line-height: 1.1;
-      }
-      .ttwa-metric .good { color: rgba(170, 255, 190, 0.90); }
-      .ttwa-metric .bad  { color: rgba(255, 170, 170, 0.90); }
-
-      .ttwa-controls {
-        display: grid;
-        grid-template-columns: 88px 1fr 72px;
-        gap: 8px;
-        align-items: center;
-      }
-      .ttwa-controls select,
-      .ttwa-controls input[type="number"] {
-        width: 100%;
-        height: 28px;
-        border-radius: 8px;
-        border: 1px solid rgba(255,255,255,0.14);
-        background: rgba(16, 18, 24, 0.55);
-        color: rgba(255,255,255,0.92);
-        padding: 0 8px;
-        font-size: 12px;
-        outline: none;
-      }
-      .ttwa-controls select option { color: #e8eef7; background: #0f1218; }
-      .ttwa-controls input[type="number"]::-webkit-outer-spin-button,
-      .ttwa-controls input[type="number"]::-webkit-inner-spin-button {
-        opacity: 1;
-      }
-      .ttwa-flags {
-        display: flex;
-        align-items: center;
-        justify-content: flex-end;
-        gap: 10px;
-      }
-      .ttwa-flag {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        color: rgba(255,255,255,0.78);
-        font-size: 12px;
-        user-select: none;
-      }
-      .ttwa-flag input {
-        width: 14px;
-        height: 14px;
-        accent-color: #8fd3ff;
-      }
-
-      .ttwa-small {
-        color: rgba(255,255,255,0.62);
-        font-size: 11px;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  function setGamePadding(px) {
-    const gc = document.getElementById('game-container');
-    if (!gc) return;
-    // Apply as inline styles to avoid relying on site CSS
-    gc.style.marginLeft = `${px}px`;
-    gc.style.width = `calc(100vw - ${px}px)`;
-    gc.style.boxSizing = 'border-box';
-  }
-
-  function setOpen(open) {
-    UI.isOpen = open;
-    if (!UI.root) return;
-    UI.root.classList.toggle('open', open);
-
-    const pad = open ? EXPAND_W + RAIL_W : RAIL_W;
-    setGamePadding(pad);
-  }
-
-  function buildUI() {
-    if (UI.root) return;
-    injectStyles();
-
-    const root = document.createElement('div');
-    root.id = 'ttwa-root';
-    root.classList.toggle('open', !!STATE.pinnedOpen);
-
-    const rail = document.createElement('div');
-    rail.id = 'ttwa-rail';
-
-    const logo = document.createElement('div');
-    logo.className = 'ttwa-logo';
-    logo.textContent = 'TTWA';
-    rail.appendChild(logo);
-
-    const pinBtn = document.createElement('button');
-    pinBtn.title = 'Pin open/closed';
-    pinBtn.textContent = STATE.pinnedOpen ? '⟂' : '↔';
-    pinBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      STATE.pinnedOpen = !STATE.pinnedOpen;
-      pinBtn.textContent = STATE.pinnedOpen ? '⟂' : '↔';
-      saveStateSoon();
-      setOpen(STATE.pinnedOpen);
-    });
-    rail.appendChild(pinBtn);
-
-    const panel = document.createElement('div');
-    panel.id = 'ttwa-panel';
-
-    const header = document.createElement('div');
-    header.id = 'ttwa-header';
-
-    const title = document.createElement('div');
-    title.id = 'ttwa-title';
-
-    const name = document.createElement('div');
-    name.className = 'name';
-    name.textContent = 'Worker Allocator';
-    const ver = document.createElement('div');
-    ver.className = 'ver';
-    ver.textContent = `v${VERSION}`;
-    title.appendChild(name);
-    title.appendChild(ver);
-
-    const status = document.createElement('div');
-    status.id = 'ttwa-status';
-    status.textContent = 'Waiting for game…';
-
-    const notes = document.createElement('div');
-    notes.id = 'ttwa-notes';
-    notes.textContent = '';
-
-    header.appendChild(title);
-    header.appendChild(status);
-    header.appendChild(notes);
-
-    const body = document.createElement('div');
-    body.id = 'ttwa-body';
-
-    panel.appendChild(header);
-    panel.appendChild(body);
-
-    root.appendChild(rail);
-    root.appendChild(panel);
-    document.body.appendChild(root);
-
-    UI.root = root;
-    UI.rail = rail;
-    UI.panel = panel;
-    UI.status = status;
-    UI.notes = notes;
-    UI.pinnedBtn = pinBtn;
-
-    // Hover popout (when not pinned)
-    root.addEventListener('mouseenter', () => {
-      if (!STATE.pinnedOpen) setOpen(true);
-    });
-    root.addEventListener('mouseleave', () => {
-      if (!STATE.pinnedOpen) setOpen(false);
-    });
-
-    // Build rows once
-    for (const r of RESOURCES) {
-      const row = document.createElement('div');
-      row.className = 'ttwa-row';
-      row.dataset.resKey = r.key;
-
-      const nameCell = document.createElement('div');
-      nameCell.className = 'ttwa-name';
-      const lbl = document.createElement('div');
-      lbl.className = 'lbl';
-      lbl.textContent = r.label;
-      const sub = document.createElement('div');
-      sub.className = 'sub';
-      sub.textContent = '—';
-      nameCell.appendChild(lbl);
-      nameCell.appendChild(sub);
-
-      const fillCell = document.createElement('div');
-      fillCell.className = 'ttwa-metric';
-      const fillTop = document.createElement('div');
-      fillTop.className = 'top';
-      fillTop.textContent = 'Fill: —';
-      const fillBot = document.createElement('div');
-      fillBot.className = 'bot';
-      fillBot.textContent = 'Cap: —';
-      fillCell.appendChild(fillTop);
-      fillCell.appendChild(fillBot);
-
-      const netCell = document.createElement('div');
-      netCell.className = 'ttwa-metric';
-      const netTop = document.createElement('div');
-      netTop.className = 'top';
-      netTop.textContent = 'Net: —';
-      const netBot = document.createElement('div');
-      netBot.className = 'bot';
-      netBot.textContent = 'Base: —';
-      netCell.appendChild(netTop);
-      netCell.appendChild(netBot);
-
-      const controlsCell = document.createElement('div');
-      controlsCell.className = 'ttwa-controls';
-
-      // Mode
-      const modeSel = document.createElement('select');
-      modeSel.innerHTML = `
-        <option value="off">Off</option>
-        <option value="on">On</option>
-        <option value="balance">Balance</option>
-      `;
-      modeSel.value = STATE.resources[r.key]?.mode ?? 'off';
-      modeSel.addEventListener('change', () => {
-        STATE.resources[r.key].mode = modeSel.value;
-        saveStateSoon();
-      });
-
-      // Producer
-      const prodSel = document.createElement('select');
-      prodSel.innerHTML = `<option value="auto">Auto</option>`;
-      prodSel.value = STATE.resources[r.key]?.producer ?? 'auto';
-      prodSel.addEventListener('change', () => {
-        STATE.resources[r.key].producer = prodSel.value;
-        saveStateSoon();
-      });
-
-      // Weight
-      const wInput = document.createElement('input');
-      wInput.type = 'number';
-      wInput.step = '0.1';
-      wInput.min = '0.1';
-      wInput.max = '50';
-      wInput.value = String(STATE.resources[r.key]?.weight ?? 1.0);
-      wInput.addEventListener('input', () => {
-        const v = Number(wInput.value);
-        if (Number.isFinite(v)) {
-          STATE.resources[r.key].weight = clamp(v, 0.1, 50);
-          saveStateSoon();
-        }
-      });
-
-      controlsCell.appendChild(modeSel);
-      controlsCell.appendChild(prodSel);
-      controlsCell.appendChild(wInput);
-
-      const flagsCell = document.createElement('div');
-      flagsCell.className = 'ttwa-flags';
-
-      const buyLbl = document.createElement('label');
-      buyLbl.className = 'ttwa-flag';
-      const buyChk = document.createElement('input');
-      buyChk.type = 'checkbox';
-      buyChk.checked = !!STATE.resources[r.key]?.marketBuy;
-      buyChk.addEventListener('change', () => {
-        STATE.resources[r.key].marketBuy = buyChk.checked;
-        saveStateSoon();
-      });
-      buyLbl.appendChild(buyChk);
-      buyLbl.appendChild(document.createTextNode('Buy'));
-
-      const sellLbl = document.createElement('label');
-      sellLbl.className = 'ttwa-flag';
-      const sellChk = document.createElement('input');
-      sellChk.type = 'checkbox';
-      sellChk.checked = !!STATE.resources[r.key]?.marketSell;
-      sellChk.addEventListener('change', () => {
-        STATE.resources[r.key].marketSell = sellChk.checked;
-        saveStateSoon();
-      });
-      sellLbl.appendChild(sellChk);
-      sellLbl.appendChild(document.createTextNode('Sell'));
-
-      flagsCell.appendChild(buyLbl);
-      flagsCell.appendChild(sellLbl);
-
-      row.appendChild(nameCell);
-      row.appendChild(fillCell);
-      row.appendChild(netCell);
-      row.appendChild(controlsCell);
-      row.appendChild(flagsCell);
-
-      body.appendChild(row);
-
-      UI.rows[r.key] = {
-        row,
-        sub,
-        fillTop,
-        fillBot,
-        netTop,
-        netBot,
-        modeSel,
-        prodSel,
-        wInput,
-        buyChk,
-        sellChk,
-        producersSig: '',
-      };
-    }
-
-    // Initialize padding state
-    setOpen(!!STATE.pinnedOpen);
-  }
-
-  function updateProducerOptions(resKey, producers) {
-    const ui = UI.rows[resKey];
-    if (!ui) return;
-
-    // signature to avoid unnecessary DOM work
-    const sig = producers.map(p => `${p.id}:${p.need}`).join('|');
-    const select = ui.prodSel;
-
-    // Don't rebuild while user is interacting with select
-    const isFocused = (document.activeElement === select);
-
-    if (sig === ui.producersSig) return;
-    if (isFocused) return;
-
-    const current = select.value || 'auto';
-    select.textContent = '';
-    const optAuto = document.createElement('option');
-    optAuto.value = 'auto';
-    optAuto.textContent = 'Auto';
-    select.appendChild(optAuto);
-
-    for (const p of producers) {
-      const o = document.createElement('option');
-      o.value = p.id;
-      const needTxt = p.need > 0 ? `${p.need}w` : '0w';
-      o.textContent = `${p.name} (${needTxt})`;
-      select.appendChild(o);
-    }
-
-    // restore selection if possible
-    const exists = [...select.options].some(o => o.value === current);
-    select.value = exists ? current : 'auto';
-
-    ui.producersSig = sig;
-  }
-
-  function updateUI(snap, plan) {
-    if (!UI.root) return;
-
-    // Header status
-    const workerCap = snap.workerCap || 0;
-    const funding = getFundingObj();
-    const fNow = Number(funding?.value) || 0;
-    const fNet = funding ? ((Number(funding.productionRate)||0) - (Number(funding.consumptionRate)||0) - getMarketNetFromRates(funding) - getAutobuildAvgCost('colony','funding')) : 0;
-
-    UI.status.textContent =
-      `Workers: ${snap.workersValue.toFixed(0)}/${workerCap.toFixed(0)}  ·  Funding: ${fmt(fNow, 2)} (base ${fmt(fNet, 2)}/s)`;
-
-    // Notes
-    const notes = [];
-    if (plan?.notes?.length) notes.push(...plan.notes);
-    if (plan?.market?.note) notes.push(plan.market.note);
-    UI.notes.textContent = notes.join('  ·  ');
-
-    // Per-row updates
-    for (const r of RESOURCES) {
-      const ui = UI.rows[r.key];
-      if (!ui) continue;
-
-      const sr = snap.resources[r.key];
-      if (!sr) {
-        ui.sub.textContent = 'Not present';
-        ui.fillTop.textContent = 'Fill: —';
-        ui.fillBot.textContent = 'Cap: —';
-        ui.netTop.textContent = 'Net: —';
-        ui.netBot.textContent = 'Base: —';
-        continue;
-      }
-
-      // update producer options
-      updateProducerOptions(r.key, snap.producersByRes[r.key] || []);
-
-      const st = STATE.resources[r.key];
-
-      const capTxt = sr.cap > 0 ? fmt(sr.cap, 2) : '—';
-      const fillPct = sr.cap > 0 ? (sr.fill * 100) : 0;
-      ui.sub.textContent = sr.unlocked ? `Target ${(st.targetFill*100).toFixed(0)}%` : 'Locked';
-
-      ui.fillTop.textContent = `Fill: ${sr.cap > 0 ? fillPct.toFixed(1) + '%' : '—'}`;
-      ui.fillBot.textContent = `Val: ${fmt(sr.value, 2)} / ${capTxt}`;
-
-      // net info (show total and baseline)
-      ui.netTop.textContent = `Net: ${fmt(sr.totalNet, 2)}/s`;
-      ui.netBot.textContent = `Base: ${fmt(sr.baselineNet, 2)}/s`;
-
-      // color hints
-      ui.netTop.classList.toggle('good', sr.totalNet > 0);
-      ui.netTop.classList.toggle('bad', sr.totalNet < 0);
-    }
-  }
-
-  /********************************************************************
-   * Main Loop
-   ********************************************************************/
-
-  function mainTick() {
-    if (!gameReady()) return;
-
-    buildUI();
-
-    const snap = snapshot();
-
-    // Compute plans
-    const workerPlan = computeWorkerPlan(snap);
-    const marketPlan = computeMarketPlan(snap);
-    workerPlan.market = marketPlan;
-
-    // Apply
-    applyPlan(workerPlan, snap);
-    applyMarketPlan(marketPlan, snap);
-
-    // UI update
-    updateUI(snap, workerPlan);
-  }
-
-  // Boot
-  const boot = () => {
-    buildUI();
-    // Wait a moment for game globals to appear
-    const timer = setInterval(() => {
-      if (gameReady()) {
-        clearInterval(timer);
-        mainTick();
-        setInterval(mainTick, TICK_MS);
-      }
-    }, 400);
-  };
-
-  boot();
 })();
