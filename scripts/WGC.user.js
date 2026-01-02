@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.2.0
-// @description  Deterministic optimiser/manager for Warp Gate Command (async/non-freezing optimisation, actual artifacts/hr tracking, compact export log).
+// @version      1.2.1
+// @description  Async/non-freezing WGC optimiser + actual artifacts/hr (unit-correct) + compact export log.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
@@ -12,30 +12,35 @@
 // ==/UserScript==
 
 /*
-  v1.2.0 changes
-  1) Non-freezing optimisation:
-     - Optimisation is now ASYNC/cooperative. It yields back to the game regularly using requestIdleCallback/requestAnimationFrame.
-     - Tune via CFG.computeBudgetMsPerSlice and CFG.yieldEveryEvals.
+  v1.2.1 fixes based on your export log:
 
-  2) Actual artifacts/hr:
-     - Tracks Alien Artifacts value over time AND tracks artifacts SPENT by this script (wgtEquipment purchases).
-     - "Actual earned" = (current - old) + (spent - oldSpent). (So spending doesn't make the rate look negative.)
-     - Shows rolling rate for last 10 minutes + last 60 minutes.
+  1) Actual artifacts/hr unit mismatch FIXED:
+     Your log shows AA value ~18.3 while a single spend was ~654. That implies the internal AA pool is stored in "k-units"
+     (e.g. 18.3 == 18,300 artifacts). Prior code tracked spend in raw artifacts, but tracked pool in k-units, inflating rates.
+     Now we:
+       - Detect a unitScale = (rawCost / deltaValueUnits) from real purchases.
+       - Track BOTH:
+           * netRate (pool change only)
+           * grossEarnRate (pool change + spent, so spending doesn't look negative)
+       - Show rates in real artifacts/hr using unitScale.
 
-  3) Compact export log:
-     - window.ttWgcOpt.exportLog() returns a compact JSON string (small paste).
-     - In Chrome devtools: run `copy(ttWgcOpt.exportLog())` then paste to ChatGPT.
+  2) Less hitching during recalculation:
+     - Big reduction in compute by using a fast approximation during search (sample a few stories),
+       then full-evaluating ONLY the top K stance pairs.
+     - Optional throttling: CFG.maxRecalcTeamsPerCycle spreads heavy work across cycles.
 
-  Behaviour:
-  - Never changes difficulty/stances mid-operation.
-  - Default keepGoingMode='script' (autoStart OFF) to avoid chain-starting at low HP.
-  - Starts teams only when HP >= CFG.minDeployHpRatio.
+  3) Better diagnostics:
+     - Logs team start HP% when starting operations.
+     - exportLog() stays compact.
+
+  Notes:
+  - Still defaults keepGoingMode='script' and respects minDeployHpRatio (no starting under threshold).
 */
 
 (() => {
   'use strict';
-  if (window.__ttWgcOptimiserInjectedV120__) return;
-  window.__ttWgcOptimiserInjectedV120__ = true;
+  if (window.__ttWgcOptimiserInjectedV121__) return;
+  window.__ttWgcOptimiserInjectedV121__ = true;
 
   function injectedMain() {
     'use strict';
@@ -48,27 +53,25 @@
       enabled: true,
 
       // Cadence
-      optimiseEveryMs: 60_000,     // schedule a cycle each minute (won't overlap)
+      optimiseEveryMs: 60_000,     // schedule a cycle each minute
       uiRefreshMs: 1_000,
 
-      // Async compute tuning (prevents freezing)
-      computeBudgetMsPerSlice: 10, // time budget per slice before yielding to the game
-      yieldEveryEvals: 24,         // also yield every N evaluatePlan calls
+      // Yield tuning (still yields between eval calls)
+      computeBudgetMsPerSlice: 8,
+      yieldEveryEvals: 16,
+
+      // Spread heavy work (recalc) across cycles to avoid spikes
+      maxRecalcTeamsPerCycle: 1,  // 1 = at most one team does heavy recompute per minute
 
       // Starting logic
       autoStartIdleTeams: true,
-      minDeployHpRatio: 0.90,      // safer default; lower if you prefer more uptime
+      minDeployHpRatio: 0.90,
 
       // Keep going behaviour
-      // 'script' = script controls looping; op.autoStart kept OFF; avoids chain-starting at low HP
-      // 'native' = tick keep-going checkbox (op.autoStart=true); game will chain-start even at low HP
       keepGoingMode: 'script',     // 'script' | 'native'
       forceKeepGoingTick: true,    // only relevant in native mode
 
-      // If an active team would benefit from retuning (new difficulty/stances):
-      // - 'finish'  => (native mode) temporarily untick keep-going to stop after finish, then retune+restart
-      // - 'recall'  => recall immediately (fast retune but interrupts run)
-      // - 'never'   => do nothing
+      // Active retune
       retuneModeWhenActive: 'finish', // 'finish' | 'recall' | 'never'
 
       // Spending / stats
@@ -82,19 +85,24 @@
       // Optimiser bounds/shape
       difficultyMax: 5000,
       riskAversion: 10.0,
-      maxRecallProb: 0.02,         // hard reject plans above this risk
+      maxRecallProb: 0.02,
+
+      // Search speed/accuracy tradeoffs
+      approxStorySample: 6,        // sampled stories during search
+      fullVerifyTopKStancePairs: 3,// number of stance pairs to full-evaluate
+      localItersApprox: 10,        // per stance pair, approx local search iterations
 
       // UI
       showPanel: true,
       showDiagnostics: true,
-      panelWidth: 520,
+      panelWidth: 560,
     };
 
     /********************************************************************
      * Minimal structured log (small copy/paste)
      ********************************************************************/
     const LOG_RING = [];
-    const LOG_MAX = 120;
+    const LOG_MAX = 140;
     const now = () => Date.now();
     function logEvt(code, a=0,b=0,c=0,d=0) {
       // Compact: [t, code, a,b,c,d]
@@ -120,7 +128,7 @@
     }
 
     /********************************************************************
-     * Async yield scheduler (prevents freezing)
+     * Async yield scheduler
      ********************************************************************/
     function nextSlice() {
       return new Promise(resolve => {
@@ -131,7 +139,6 @@
         }
       });
     }
-
     async function maybeYield(budget) {
       const t = performance.now();
       if ((t - budget.sliceStart) >= CFG.computeBudgetMsPerSlice || budget.evalSinceYield >= CFG.yieldEveryEvals) {
@@ -143,7 +150,44 @@
     }
 
     /********************************************************************
-     * WGC constants (mirrors wgc.js)
+     * Deterministic PRNG (for sampling stories)
+     ********************************************************************/
+    function xmur3(str) {
+      let h = 1779033703 ^ str.length;
+      for (let i = 0; i < str.length; i++) {
+        h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+        h = (h << 13) | (h >>> 19);
+      }
+      return function() {
+        h = Math.imul(h ^ (h >>> 16), 2246822507);
+        h = Math.imul(h ^ (h >>> 13), 3266489909);
+        h ^= h >>> 16;
+        return h >>> 0;
+      };
+    }
+    function mulberry32(a) {
+      return function() {
+        let t = a += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    function sampleIndicesDeterministic(n, k, seedStr) {
+      if (k >= n) { const all=[]; for(let i=0;i<n;i++) all.push(i); return all; }
+      const seed = xmur3(seedStr)();
+      const rnd = mulberry32(seed);
+      const chosen = new Set();
+      let guard = 0;
+      while (chosen.size < k && guard++ < 10000) {
+        const idx = Math.floor(rnd() * n);
+        chosen.add(idx);
+      }
+      return Array.from(chosen);
+    }
+
+    /********************************************************************
+     * WGC constants
      ********************************************************************/
     const BASE_EVENTS = [
       { name: 'Individual Team Power Challenge', type: 'individual', skill: 'power', aliases: ['Team Power Challenge'] },
@@ -255,7 +299,7 @@
     }
 
     /********************************************************************
-     * Skill totals (mirrors resolveEvent)
+     * Skill totals
      ********************************************************************/
     function skillMultipliers(facilities) {
       const shootingRange = facilities.shootingRange || 0;
@@ -297,7 +341,7 @@
     }
 
     /********************************************************************
-     * Keep-going checkbox helper (Start button checkbox)
+     * Keep-going checkbox helper
      ********************************************************************/
     function setKeepGoing(teamIndex, desired) {
       const wgc = getWGC();
@@ -319,27 +363,50 @@
     }
 
     /********************************************************************
-     * Artifact tracking (actual achieved artifacts/hr)
+     * Artifact tracking (UNIT-CORRECT)
      ********************************************************************/
     const artTrack = {
-      t0: 0, v0: 0, spent0: 0,
-      spent: 0,
-      samples: [], // [t, val, spent]
-      lastRate10m: 0,
-      lastRate60m: 0,
+      unitScale: 1,           // real artifacts per value-unit (auto-detected)
+      unitScaleConf: 0,       // confidence counter
+      spentArtifacts: 0,      // raw artifact spend (real artifacts)
+      spentValueUnits: 0,     // spend measured in value-units (delta pool)
+      samples: [],            // [t, valueUnits, spentArtifacts]
+      lastNet10: 0,
+      lastGross10: 0,
+      lastNet60: 0,
+      lastGross60: 0,
     };
 
-    function sampleArtifacts() {
+    function getArtifactValueUnits() {
       const res = getResources();
       const v = res?.special?.alienArtifact?.value;
-      if (!Number.isFinite(v)) return;
+      return Number.isFinite(v) ? v : null;
+    }
+
+    function updateUnitScaleFromPurchase(rawCost, deltaValueUnits) {
+      if (!(rawCost > 0) || !(deltaValueUnits > 0)) return;
+      const cand = rawCost / deltaValueUnits;
+      if (!Number.isFinite(cand) || cand <= 0) return;
+      // Accept only reasonable scales
+      if (cand < 0.5 || cand > 1e9) return;
+
+      if (artTrack.unitScaleConf === 0) {
+        artTrack.unitScale = cand;
+        artTrack.unitScaleConf = 1;
+      } else {
+        // Smooth a bit (EMA) to stabilize
+        const a = 0.25;
+        artTrack.unitScale = artTrack.unitScale * (1 - a) + cand * a;
+        artTrack.unitScaleConf = Math.min(20, artTrack.unitScaleConf + 1);
+      }
+    }
+
+    function sampleArtifacts() {
+      const vUnits = getArtifactValueUnits();
+      if (vUnits == null) return;
 
       const t = now();
-      if (!artTrack.t0) {
-        artTrack.t0 = t; artTrack.v0 = v; artTrack.spent0 = artTrack.spent;
-      }
-      artTrack.samples.push([t, v, artTrack.spent]);
-      // keep last 2 hours
+      artTrack.samples.push([t, vUnits, artTrack.spentArtifacts]);
       const cutoff = t - 2*3600*1000;
       while (artTrack.samples.length && artTrack.samples[0][0] < cutoff) artTrack.samples.shift();
 
@@ -350,15 +417,28 @@
         let i = 0;
         while (i < arr.length && arr[i][0] < t0) i++;
         const base = arr[Math.max(0, i-1)] || arr[0];
-        if (!base) return 0;
+        if (!base) return { net:0, gross:0 };
         const dt = (t1 - base[0]) / 1000;
-        if (dt <= 1) return 0;
-        const earned = (v - base[1]) + (artTrack.spent - base[2]); // add spend back to get earned
-        return (earned / dt) * 3600;
+        if (dt <= 1) return { net:0, gross:0 };
+
+        const dVUnits = (vUnits - base[1]);
+        const dSpent = (artTrack.spentArtifacts - base[2]);
+
+        const netArtifacts = dVUnits * artTrack.unitScale;         // includes spend (net change)
+        const grossEarned = netArtifacts + dSpent;                  // add spent back to get earned
+
+        return {
+          net: (netArtifacts / dt) * 3600,
+          gross: (grossEarned / dt) * 3600,
+        };
       };
 
-      artTrack.lastRate10m = rateForWindow(10*60*1000);
-      artTrack.lastRate60m = rateForWindow(60*60*1000);
+      const r10 = rateForWindow(10*60*1000);
+      const r60 = rateForWindow(60*60*1000);
+      artTrack.lastNet10 = r10.net;
+      artTrack.lastGross10 = r10.gross;
+      artTrack.lastNet60 = r60.net;
+      artTrack.lastGross60 = r60.gross;
     }
 
     function patchSpendHooks() {
@@ -366,17 +446,34 @@
       if (!wgc || wgc.__ttSpendPatched) return;
       wgc.__ttSpendPatched = true;
 
+      // Wrap purchaseUpgrade to measure actual pool delta (value units) + infer unitScale.
       if (typeof wgc.purchaseUpgrade === 'function') {
         const orig = wgc.purchaseUpgrade.bind(wgc);
         wgc.purchaseUpgrade = function(upKey) {
-          let cost = 0;
+          const vBefore = getArtifactValueUnits();
+          let rawCost = 0;
           if (upKey === 'wgtEquipment' && typeof wgc.getUpgradeCost === 'function') {
-            try { cost = wgc.getUpgradeCost('wgtEquipment') || 0; } catch (_) { cost = 0; }
+            try { rawCost = wgc.getUpgradeCost('wgtEquipment') || 0; } catch (_) { rawCost = 0; }
           }
+
           const ok = orig(upKey);
-          if (ok && upKey === 'wgtEquipment' && cost > 0) {
-            artTrack.spent += cost;
-            logEvt('S', 0, 0, 0, cost); // spent
+
+          if (ok && upKey === 'wgtEquipment') {
+            const vAfter = getArtifactValueUnits();
+            const deltaUnits = (vBefore != null && vAfter != null) ? Math.max(0, vBefore - vAfter) : 0;
+
+            if (rawCost > 0) artTrack.spentArtifacts += rawCost;
+            if (deltaUnits > 0) artTrack.spentValueUnits += deltaUnits;
+
+            updateUnitScaleFromPurchase(rawCost, deltaUnits);
+
+            // Log: 'S' = spend; a=rawCost, b=deltaUnits*1e6 rounded, c=scale*1000 rounded
+            logEvt('S',
+              Math.round(rawCost),
+              Math.round(deltaUnits * 1e6),
+              Math.round(artTrack.unitScale * 1000),
+              0
+            );
           }
           return ok;
         };
@@ -384,7 +481,7 @@
     }
 
     /********************************************************************
-     * Event evaluation (expected value, deterministic)
+     * Event evaluation
      ********************************************************************/
     function evalEventOnce({
       team, facilities, equipPurchases, hazardStance, artifactStance,
@@ -613,7 +710,8 @@
       let lastTimeW = 0;
       let endP = 0;
 
-      for (let iter=0; iter<600; iter++) {
+      // Reduced cap to keep compute bounded
+      for (let iter=0; iter<420; iter++) {
         if (nodes.size === 0) break;
         const nextNodes = new Map();
 
@@ -724,10 +822,10 @@
     }
 
     /********************************************************************
-     * evaluatePlan + caching
+     * evaluatePlan + caching (supports story subset)
      ********************************************************************/
     const evalCache = new Map();   // key -> result
-    const EVAL_CACHE_MAX = 6000;
+    const EVAL_CACHE_MAX = 7000;
 
     function evalCacheGet(k) { return evalCache.get(k) || null; }
     function evalCacheSet(k, v) {
@@ -738,9 +836,13 @@
       }
     }
 
-    function evaluatePlan(team, facilities, equipPurchases, hazardStance, artifactStance, difficulty) {
+    function evaluatePlan(team, facilities, equipPurchases, hazardStance, artifactStance, difficulty, storyIdxList /* optional */) {
       const storyEventLists = getStoryEventLists(hazardStance);
       if (!storyEventLists || !storyEventLists.length) return null;
+
+      const indices = Array.isArray(storyIdxList) && storyIdxList.length
+        ? storyIdxList
+        : null;
 
       let art = 0;
       let lastTime = 0;
@@ -749,14 +851,25 @@
       const dmgMean = new Array(members.length).fill(0);
       const dmgVar = new Array(members.length).fill(0);
 
-      for (const storyEvents of storyEventLists) {
-        const r = evaluateStory({ storyEvents, team, facilities, equipPurchases, hazardStance, artifactStance, baseDifficulty: difficulty });
-        art += r.expectedArtifacts;
-        lastTime += r.expectedLastTime;
-        for (let i=0;i<members.length;i++){ dmgMean[i] += r.meanDamage[i]; dmgVar[i] += r.varDamage[i]; }
+      if (indices) {
+        for (const idx of indices) {
+          const storyEvents = storyEventLists[idx];
+          if (!storyEvents) continue;
+          const r = evaluateStory({ storyEvents, team, facilities, equipPurchases, hazardStance, artifactStance, baseDifficulty: difficulty });
+          art += r.expectedArtifacts;
+          lastTime += r.expectedLastTime;
+          for (let i=0;i<members.length;i++){ dmgMean[i] += r.meanDamage[i]; dmgVar[i] += r.varDamage[i]; }
+        }
+      } else {
+        for (const storyEvents of storyEventLists) {
+          const r = evaluateStory({ storyEvents, team, facilities, equipPurchases, hazardStance, artifactStance, baseDifficulty: difficulty });
+          art += r.expectedArtifacts;
+          lastTime += r.expectedLastTime;
+          for (let i=0;i<members.length;i++){ dmgMean[i] += r.meanDamage[i]; dmgVar[i] += r.varDamage[i]; }
+        }
       }
 
-      const n = storyEventLists.length;
+      const n = indices ? Math.max(1, indices.length) : storyEventLists.length;
       const expArtifactsPerOp = art / n;
       const expLastTime = lastTime / n;
       const duration = Math.max(600, expLastTime);
@@ -801,7 +914,6 @@
       worstDeficit = Math.max(0, worstDeficit - (percent * approxMaxHp));
       const restTime = idleHealPerSec > 0 ? (worstDeficit / idleHealPerSec) : 0;
 
-      // Hard reject overly risky plans
       if (Number.isFinite(CFG.maxRecallProb) && recallProb > CFG.maxRecallProb) {
         return { score: -Infinity, artifactsPerHour: 0, recallProb, expArtifactsPerOp, duration, restTime };
       }
@@ -815,7 +927,7 @@
     }
 
     /********************************************************************
-     * Faster optimisation search + async yielding
+     * Optimisation search (approx -> full verify)
      ********************************************************************/
     function teamSignature(team, facilities, equip) {
       const members = team.map(m => [m.classType, m.level, m.power, m.athletics, m.wit].join(':')).join('|');
@@ -827,38 +939,41 @@
       const stories = getStories();
       if (!Array.isArray(stories) || !stories.length) return null;
 
-      let best = null;
+      const storyCount = stories.length;
+      const approxIdx = sampleIndicesDeterministic(storyCount, CFG.approxStorySample, sigKey + '|approx');
 
-      const evalD = async (hz, ar, d) => {
-        const k = `${sigKey}|${hz}|${ar}|${d}`;
+      const evalD = async (hz, ar, d, idxList /* null = full */) => {
+        const tag = idxList ? ('A' + idxList.length) : 'F';
+        const k = `${sigKey}|${hz}|${ar}|${d}|${tag}`;
         const cached = evalCacheGet(k);
         if (cached) return cached;
 
         budget.evalSinceYield++;
         budget.evals++;
-        const r = evaluatePlan(team, facilities, equipPurchases, hz, ar, d);
+        const r = evaluatePlan(team, facilities, equipPurchases, hz, ar, d, idxList || null);
         evalCacheSet(k, r);
         await maybeYield(budget);
         return r;
       };
 
-      const MAX_ITERS = 14;
+      const clampD = (d) => clamp(Math.floor(d), 0, CFG.difficultyMax);
+
+      const approxBestPerPair = [];
 
       for (const hz of HAZARD_STANCES) {
         for (const ar of ARTIFACT_STANCES) {
-          let d = Math.max(0, Math.floor(Number.isFinite(currentDifficulty) ? currentDifficulty : 0));
-          d = Math.min(d, CFG.difficultyMax);
-          let step = Math.max(10, Math.floor((d + 200) / 6));
+          let d = clampD(Number.isFinite(currentDifficulty) ? currentDifficulty : 0);
+          let step = Math.max(10, Math.floor((d + 250) / 6));
 
-          let cur = await evalD(hz, ar, d);
+          let cur = await evalD(hz, ar, d, approxIdx);
           if (!cur) continue;
 
-          for (let iter=0; iter<MAX_ITERS; iter++) {
-            const upD = Math.min(CFG.difficultyMax, d + step);
-            const dnD = Math.max(0, d - step);
+          for (let iter=0; iter<CFG.localItersApprox; iter++) {
+            const upD = clampD(d + step);
+            const dnD = clampD(d - step);
 
-            const up = (upD !== d) ? await evalD(hz, ar, upD) : cur;
-            const dn = (dnD !== d) ? await evalD(hz, ar, dnD) : cur;
+            const up = (upD !== d) ? await evalD(hz, ar, upD, approxIdx) : cur;
+            const dn = (dnD !== d) ? await evalD(hz, ar, dnD, approxIdx) : cur;
 
             const bestLocal = [{d, r:cur}, {d:upD, r:up}, {d:dnD, r:dn}]
               .filter(x => x.r)
@@ -874,10 +989,22 @@
             await maybeYield(budget);
           }
 
-          if (!best || cur.score > best.r.score) best = { hazardStance: hz, artifactStance: ar, difficulty: d, r: cur };
+          approxBestPerPair.push({ hz, ar, d, approx: cur });
         }
       }
-      return best;
+
+      approxBestPerPair.sort((a,b)=> (b.approx?.score||-Infinity) - (a.approx?.score||-Infinity));
+      const top = approxBestPerPair.slice(0, Math.max(1, CFG.fullVerifyTopKStancePairs));
+
+      let bestFull = null;
+      for (const cand of top) {
+        const full = await evalD(cand.hz, cand.ar, cand.d, null);
+        if (!full) continue;
+        const obj = { hazardStance: cand.hz, artifactStance: cand.ar, difficulty: cand.d, r: full };
+        if (!bestFull || obj.r.score > bestFull.r.score) bestFull = obj;
+      }
+
+      return bestFull;
     }
 
     /********************************************************************
@@ -944,11 +1071,17 @@
       const up = wgc.rdUpgrades?.wgtEquipment;
       if (!up) return;
 
-      while (up.purchases < (up.max || 900)) {
+      // Keep this conservative: at most a few purchases per cycle to avoid bursty spend.
+      let buys = 0;
+      while (up.purchases < (up.max || 900) && buys < 3) {
         const cost = (typeof wgc.getUpgradeCost === 'function') ? (wgc.getUpgradeCost('wgtEquipment') || 0) : (up.purchases + 1);
-        if ((art.value - cost) < CFG.alienArtifactReserve) break;
+        // Compare in "real artifacts": reserve applies in real units.
+        const reserveValueUnits = CFG.alienArtifactReserve / Math.max(1e-9, artTrack.unitScale);
+        if ((art.value - (cost / Math.max(1e-9, artTrack.unitScale))) < reserveValueUnits) break;
+
         const ok = wgc.purchaseUpgrade && wgc.purchaseUpgrade('wgtEquipment');
         if (!ok) break;
+        buys++;
       }
     }
 
@@ -978,7 +1111,7 @@
       const scoreWithFacilities = (fac) => {
         let sum = 0;
         for (const { team, currentDiff } of teams) {
-          const r = evaluatePlan(team, fac, equip, 'Neutral', 'Neutral', currentDiff);
+          const r = evaluatePlan(team, fac, equip, 'Neutral', 'Neutral', currentDiff, null);
           sum += (r?.artifactsPerHour || 0);
         }
         return sum;
@@ -1053,6 +1186,14 @@
     function teamReady(team) { return teamHpRatio(team) >= CFG.minDeployHpRatio; }
 
     /********************************************************************
+     * Recalc throttling queue
+     ********************************************************************/
+    const recalcQueue = [];
+    function enqueueRecalc(teamIndex) {
+      if (recalcQueue.indexOf(teamIndex) === -1) recalcQueue.push(teamIndex);
+    }
+
+    /********************************************************************
      * Async optimisation cycle
      ********************************************************************/
     const optState = {
@@ -1062,6 +1203,7 @@
       lastCycleMs: 0,
       lastYields: 0,
       lastEvals: 0,
+      lastPredTotal: 0,
     };
 
     function needRecalc(teamIndex, sig) {
@@ -1072,7 +1214,7 @@
       return false;
     }
 
-    async function computePlanForTeam(teamIndex, budget) {
+    async function computePlanForTeam(teamIndex, budget, allowHeavy) {
       const wgc = getWGC();
       if (!wgc) return null;
 
@@ -1084,24 +1226,24 @@
       const curDiff = wgc.operations?.[teamIndex]?.difficulty || 0;
 
       const sig = teamSignature(team, facilities, equip);
-      if (!needRecalc(teamIndex, sig)) return planCache.get(teamIndex).plan;
+
+      const needs = needRecalc(teamIndex, sig);
+      if (needs) enqueueRecalc(teamIndex);
+
+      const cached = planCache.get(teamIndex);
+      if (!allowHeavy || !needs) {
+        return cached ? cached.plan : null;
+      }
 
       const op = wgc.operations?.[teamIndex];
       if (CFG.manageStats && op && !op.active) applyOptimisedStats(team, facilities);
 
       const sig2 = teamSignature(team, facilities, equip);
 
-      const bestKey = `${sig2}|_BEST`;
-      const bestCached = evalCacheGet(bestKey);
-      if (bestCached && bestCached.plan) {
-        planCache.set(teamIndex, { sig: sig2, plan: bestCached.plan, ts: now() });
-        return bestCached.plan;
-      }
-
       logEvt('C', teamIndex, 0, 0, 0);
 
       const best = await optimiseForTeamAsync(team, facilities, equip, curDiff, budget, sig2);
-      if (!best) return null;
+      if (!best) return cached ? cached.plan : null;
 
       const plan = {
         hazardousBiomassStance: best.hazardStance,
@@ -1111,7 +1253,10 @@
       };
 
       planCache.set(teamIndex, { sig: sig2, plan, ts: now() });
-      evalCacheSet(bestKey, { plan, artifactsPerHour: plan.metrics?.artifactsPerHour || 0 });
+      // mark as processed in queue
+      const qi = recalcQueue.indexOf(teamIndex);
+      if (qi !== -1) recalcQueue.splice(qi, 1);
+
       return plan;
     }
 
@@ -1132,6 +1277,21 @@
       if (CFG.autoBuyWgtEquipment) tryAutoBuyWgtEquipment();
       if (CFG.autoUpgradeFacilityWhenReady) tryAutoUpgradeFacility();
 
+      // Decide which teams may do heavy recompute this cycle
+      let heavySlots = CFG.maxRecalcTeamsPerCycle;
+      const heavyAllow = new Set();
+      while (heavySlots > 0 && recalcQueue.length > 0) {
+        heavyAllow.add(recalcQueue[0]);
+        heavySlots--;
+        // keep in queue until successfully computed (removed there)
+        break;
+      }
+
+      // Predicted total
+      let predTotal = 0;
+      for (const v of planCache.values()) predTotal += Number(v?.plan?.metrics?.artifactsPerHour || 0);
+      optState.lastPredTotal = predTotal;
+
       for (let ti=0; ti<4; ti++) {
         if (typeof wgc.isTeamUnlocked === 'function' && !wgc.isTeamUnlocked(ti)) continue;
         const team = wgc.teams?.[ti];
@@ -1149,16 +1309,18 @@
           applyPlanIfIdle(ti, plan);
 
           if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
+            const hp = Math.round(teamHpRatio(team)*100);
             wgc.startOperation(ti, plan.difficulty);
             if (CFG.keepGoingMode === 'native' && CFG.forceKeepGoingTick) setKeepGoing(ti, true);
             tryUpdateWgcUI();
-            logEvt('T', ti, 1, 0, plan.difficulty);
+            logEvt('T', ti, hp, 0, plan.difficulty);
           }
           await maybeYield(budget);
           continue;
         }
 
-        const plan = await computePlanForTeam(ti, budget);
+        const allowHeavy = heavyAllow.has(ti);
+        const plan = await computePlanForTeam(ti, budget, allowHeavy);
         if (!plan) { await maybeYield(budget); continue; }
 
         if (op.active) {
@@ -1191,10 +1353,11 @@
         applyPlanIfIdle(ti, plan);
 
         if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
+          const hp = Math.round(teamHpRatio(team)*100);
           wgc.startOperation(ti, plan.difficulty);
           if (CFG.keepGoingMode === 'native' && CFG.forceKeepGoingTick) setKeepGoing(ti, true);
           tryUpdateWgcUI();
-          logEvt('T', ti, 1, 0, plan.difficulty);
+          logEvt('T', ti, hp, 0, plan.difficulty);
         } else {
           logEvt('N', ti, Math.round(teamHpRatio(team)*100), 0, plan.difficulty);
         }
@@ -1224,20 +1387,23 @@
 
     function forceRecalc() {
       planCache.clear();
+      recalcQueue.length = 0;
+      // queue all teams
+      for (let i=0;i<4;i++) recalcQueue.push(i);
       scheduleCycle();
     }
 
     /********************************************************************
      * UI (draggable)
      ********************************************************************/
-    const LS_POS_KEY = 'ttWgcOpt.panelPos.v120';
+    const LS_POS_KEY = 'ttWgcOpt.panelPos.v121';
     let panel = null;
 
     function loadPos() { try { const raw = localStorage.getItem(LS_POS_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } }
     function savePos(left, top) { try { localStorage.setItem(LS_POS_KEY, JSON.stringify({ left, top })); } catch (_) {} }
     function clampToViewport(left, top, rect) {
       const w = rect?.width || CFG.panelWidth;
-      const h = rect?.height || 240;
+      const h = rect?.height || 260;
       const MIN_VISIBLE = 28;
       const minL = -w + MIN_VISIBLE;
       const maxL = window.innerWidth - MIN_VISIBLE;
@@ -1248,13 +1414,13 @@
 
     const btnCss = (bg, bd) => `all:unset;cursor:pointer;padding:6px 9px;border-radius:10px;background:${bg};border:1px solid ${bd};`;
     function fmt(x, d=1) { return Number.isFinite(x) ? x.toFixed(d) : '—'; }
+    function fmtI(x) { return Number.isFinite(x) ? Math.round(x).toString() : '—'; }
 
     function refreshPanel() {
       if (!panel) return;
 
       const wgc = getWGC();
-      const res = getResources();
-      const art = res?.special?.alienArtifact?.value;
+      const vUnits = getArtifactValueUnits();
       const equip = wgc?.rdUpgrades?.wgtEquipment?.purchases || 0;
       const cd = wgc?.facilityCooldown || 0;
 
@@ -1264,9 +1430,6 @@
       const teamsBox = panel.querySelector('#tt-wgc-teams');
       const diag = panel.querySelector('#tt-wgc-diag');
 
-      const actual10 = artTrack.lastRate10m;
-      const actual60 = artTrack.lastRate60m;
-
       if (!wgc) {
         status.innerHTML = `<div>Waiting for <b>warpGateCommand</b>…</div>`;
         teamsBox.innerHTML = '';
@@ -1274,10 +1437,19 @@
         status.innerHTML = `<div>WGC exists but is <b>disabled</b>. Open the WGC tab.</div>`;
         teamsBox.innerHTML = '';
       } else {
+        const unitScale = artTrack.unitScale;
+        const conf = artTrack.unitScaleConf;
+
+        const poolArtifacts = (vUnits != null) ? (vUnits * unitScale) : null;
+
         status.innerHTML = `
-          <div>Alien Artifacts: <b>${Number.isFinite(art) ? fmt(art,0) : '—'}</b> | wgtEquipment: <b>${equip}</b> | Facility CD: <b>${fmt(cd,0)}s</b></div>
-          <div style="opacity:0.9;">Actual earned: <b>${fmt(actual10,1)}</b>/hr (10m) • <b>${fmt(actual60,1)}</b>/hr (60m) | Spent tracked: <b>${fmt(artTrack.spent,0)}</b></div>
-          <div style="opacity:0.85;">Mode: <b>${CFG.keepGoingMode}</b> | Min deploy HP: <b>${Math.round(CFG.minDeployHpRatio*100)}%</b> | Retune active: <b>${CFG.retuneModeWhenActive}</b></div>
+          <div>AA pool: <b>${vUnits != null ? fmt(vUnits,3) : '—'}</b> value-units (~<b>${poolArtifacts != null ? fmtI(poolArtifacts) : '—'}</b> artifacts) | unitScale: <b>${fmt(unitScale,1)}</b> (${conf}/20)</div>
+          <div>wgtEquipment: <b>${equip}</b> | Facility CD: <b>${fmt(cd,0)}s</b> | Spent (tracked): <b>${fmtI(artTrack.spentArtifacts)}</b></div>
+          <div style="opacity:0.92;">
+            Actual <b>NET</b>: <b>${fmtI(artTrack.lastNet10)}</b>/hr (10m) • <b>${fmtI(artTrack.lastNet60)}</b>/hr (60m)
+            &nbsp;|&nbsp; Actual <b>GROSS</b>: <b>${fmtI(artTrack.lastGross10)}</b>/hr (10m) • <b>${fmtI(artTrack.lastGross60)}</b>/hr (60m)
+          </div>
+          <div style="opacity:0.85;">Pred total (cached): <b>${fmtI(optState.lastPredTotal)}</b>/hr | Mode: <b>${CFG.keepGoingMode}</b> | Min deploy HP: <b>${Math.round(CFG.minDeployHpRatio*100)}%</b></div>
         `;
 
         teamsBox.innerHTML = '';
@@ -1309,7 +1481,7 @@
               ${pendingRetune.has(ti) ? `<span style="margin-left:6px;opacity:0.9;">⏳ pending</span>` : ``}
             </div>
             <div style="margin-top:4px;opacity:0.9;">
-              Pred: ${cached ? `<b>${cached.hazardousBiomassStance}</b> / <b>${cached.artifactStance}</b> / diff <b>${cached.difficulty}</b> | <b>${fmt(cached.metrics?.artifactsPerHour,1)}</b>/hr | recall <b>${fmt((cached.metrics?.recallProb||0)*100,1)}%</b>` : '—'}
+              Pred: ${cached ? `<b>${cached.hazardousBiomassStance}</b> / <b>${cached.artifactStance}</b> / diff <b>${cached.difficulty}</b> | <b>${fmtI(cached.metrics?.artifactsPerHour)}</b>/hr | recall <b>${fmt((cached.metrics?.recallProb||0)*100,2)}%</b>` : '—'}
             </div>
           `;
           teamsBox.appendChild(row);
@@ -1321,8 +1493,8 @@
         diag.innerHTML = `
           <div style="font-weight:800;margin-bottom:4px;">Diagnostics</div>
           <div>Cycle: <b>${optState.running ? 'RUNNING' : 'idle'}</b> | last: <b>${fmt(optState.lastCycleMs,0)}ms</b> | yields: <b>${optState.lastYields}</b> | evals: <b>${optState.lastEvals}</b></div>
-          <div>Plan cache: <b>${planCache.size}</b> | Eval cache: <b>${evalCache.size}</b> | Events: <b>${LOG_RING.length}</b></div>
-          <div style="opacity:0.85;">Export log: run <code>copy(ttWgcOpt.exportLog())</code> in console.</div>
+          <div>Plan cache: <b>${planCache.size}</b> | Eval cache: <b>${evalCache.size}</b> | RecalcQ: <b>${recalcQueue.length}</b> | Events: <b>${LOG_RING.length}</b></div>
+          <div style="opacity:0.85;">Export log: <code>copy(ttWgcOpt.exportLog())</code></div>
         `;
       } else {
         diag.style.display = 'none';
@@ -1367,7 +1539,7 @@
             <input id="tt-wgc-enabled" type="checkbox" ${CFG.enabled ? 'checked' : ''} style="cursor:pointer;"/>
             Enabled
           </label>
-          <button id="tt-wgc-recalc" title="Forces a full recalculation on next cycle." style="${btnCss('rgba(255,255,255,0.10)','rgba(255,255,255,0.14)')}">Recalc</button>
+          <button id="tt-wgc-recalc" title="Queues recalculation (spread across cycles)." style="${btnCss('rgba(255,255,255,0.10)','rgba(255,255,255,0.14)')}">Recalc</button>
         </div>
 
         <div id="tt-wgc-status" style="margin-top:2px;opacity:0.92;line-height:1.35;"></div>
@@ -1449,8 +1621,7 @@
      ********************************************************************/
     function exportLog() {
       const wgc = getWGC();
-      const res = getResources();
-      const art = res?.special?.alienArtifact?.value;
+      const vUnits = getArtifactValueUnits();
 
       const teams = [];
       if (wgc) {
@@ -1476,7 +1647,7 @@
       }
 
       const payload = {
-        v: '1.2.0',
+        v: '1.2.1',
         t: now(),
         cfg: {
           e:+CFG.enabled,
@@ -1485,7 +1656,10 @@
           ra:CFG.riskAversion,
           mr:CFG.maxRecallProb,
           b:CFG.computeBudgetMsPerSlice,
-          y:CFG.yieldEveryEvals
+          y:CFG.yieldEveryEvals,
+          q:CFG.maxRecalcTeamsPerCycle,
+          ss:CFG.approxStorySample,
+          k:CFG.fullVerifyTopKStancePairs
         },
         perf: {
           run:+optState.running,
@@ -1493,13 +1667,19 @@
           yd:optState.lastYields,
           ev:optState.lastEvals,
           pc: planCache.size,
-          ec: evalCache.size
+          ec: evalCache.size,
+          rq: recalcQueue.length,
+          pr: optState.lastPredTotal
         },
         art: {
-          v: Number.isFinite(art) ? art : null,
-          sp: artTrack.spent,
-          r10: artTrack.lastRate10m,
-          r60: artTrack.lastRate60m
+          vu: (vUnits != null) ? vUnits : null,
+          sc: artTrack.unitScale,
+          cf: artTrack.unitScaleConf,
+          sp: artTrack.spentArtifacts,
+          n10: artTrack.lastNet10,
+          g10: artTrack.lastGross10,
+          n60: artTrack.lastNet60,
+          g60: artTrack.lastGross60
         },
         tm: teams,
         ev: LOG_RING
@@ -1521,11 +1701,12 @@
         forceRecalc,
         scheduleCycle,
         getWGC,
-        setKeepGoing
+        setKeepGoing,
       };
 
       setInterval(() => { try { refreshPanel(); } catch (_) {} }, CFG.uiRefreshMs);
 
+      // prime recalc queue (teams will fill as signatures seen)
       setTimeout(() => scheduleCycle(), 1500);
       setInterval(() => scheduleCycle(), CFG.optimiseEveryMs);
     }
@@ -1537,7 +1718,7 @@
 
   // Inject into PAGE scope
   const s = document.createElement('script');
-  s.id = 'tt-wgc-optimiser-injected-v120';
+  s.id = 'tt-wgc-optimiser-injected-v121';
   s.textContent = `(${injectedMain.toString()})();`;
   (document.documentElement || document.head || document.body).appendChild(s);
   s.remove();
