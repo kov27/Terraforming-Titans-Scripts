@@ -1,9 +1,8 @@
 // ==UserScript==
 // @name         Terraforming Titans Galactic Market Automator (Worker-Allocator Style Overlay)
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      0.4.0
-// @description  Automates Galactic Market by setting Buy/Sell Amount inputs + ensuring Run checkbox. Prevents zeros/negatives via floors, sells excess via ceilings, prioritizes buys under funding pressure. Firefox/Violentmonkey compatible.
-// @author       kov27
+// @version      0.4.1
+// @description  Automates Galactic Market by setting Buy Amount / Sell Amount inputs + (optionally) toggling Market Run. Robust table/row detection (fixes "Market: 0 rows").
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
@@ -18,7 +17,7 @@
   'use strict';
 
   /********************************************************************
-   * TT Shared Runtime (cross-script contract) – same pattern as allocator
+   * TT Shared Runtime (same pattern as allocator)
    ********************************************************************/
   const TT = (() => {
     const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
@@ -87,7 +86,7 @@
   })();
 
   /********************************************************************
-   * VM/Firefox sandbox bridge helpers (same approach as allocator)
+   * VM/Firefox sandbox bridge helpers
    ********************************************************************/
   const __UW__ = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   const __PAGE__ = (__UW__ && __UW__.wrappedJSObject) ? __UW__.wrappedJSObject : __UW__;
@@ -99,7 +98,7 @@
   }
 
   /********************************************************************
-   * Storage (GM fallback to localStorage)
+   * Storage
    ********************************************************************/
   const STORE_KEY = 'ttgm__';
   const hasGM = (typeof GM_getValue === 'function') && (typeof GM_setValue === 'function');
@@ -119,7 +118,7 @@
   }
 
   /********************************************************************
-   * Small utils
+   * Utils
    ********************************************************************/
   const SUFFIX_FMT = [[1e24, 'Y'], [1e21, 'Z'], [1e18, 'E'], [1e15, 'P'], [1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
   function fmtNum(x) {
@@ -150,7 +149,8 @@
   function parseNumber(text) {
     if (text == null) return NaN;
     let s = String(text).trim().replace(/,/g, '').replace(/\u2212/g, '-');
-    if (/^-?\d+(\.\d+)?e[+\-]?\d+$/i.test(s)) return Number(s);
+    const mSci = s.match(/^-?\d+(\.\d+)?e[+\-]?\d+$/i);
+    if (mSci) return Number(s);
 
     const m = s.match(/^(-?\d+(\.\d+)?)(\s*[a-zA-Z]{1,3})?$/);
     if (!m) {
@@ -168,7 +168,6 @@
       if (suf === 't') return 1e12;
       if (suf === 'qa') return 1e15;
       if (suf === 'qi') return 1e18;
-      if (suf === 'g') return 1e9;
       return 1;
     })();
     return base * mult;
@@ -178,11 +177,10 @@
   }
   function visible(el) {
     if (!el) return false;
-    const r = el.getBoundingClientRect?.();
-    if (!r) return true;
-    return r.width > 2 && r.height > 2;
+    const cs = window.getComputedStyle(el);
+    if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return false;
+    return true;
   }
-
   function setNativeValue(input, value) {
     if (!input) return;
     const v = String(value);
@@ -192,6 +190,16 @@
     else input.value = v;
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function sortByLeft(inputs) {
+    return inputs.slice().sort((a, b) => {
+      try { return a.getBoundingClientRect().left - b.getBoundingClientRect().left; }
+      catch { return 0; }
+    });
+  }
+  function looksLikeHeaderRowText(t) {
+    t = (t || '').toLowerCase();
+    return t.includes('resource') && t.includes('sell amount') && t.includes('buy amount');
   }
 
   /********************************************************************
@@ -203,26 +211,19 @@
 
     tickMs: 650,
 
-    // Buffer model
-    reserveSeconds: 8,        // adds cons*reserveSeconds to floor
-    buyHorizonSec: 10,        // fill deficits over this time constant
-    sellHorizonSec: 10,       // bleed excess over this time constant
+    reserveSeconds: 8,
+    buyHorizonSec: 10,
+    sellHorizonSec: 10,
 
-    // Funding policy
-    minFundingBuffer: 0,      // do not spend below this
-    desiredFunding: 0,        // if funding < max(minBuffer, desired), bias toward selling before buying
-    manageMarketRun: true,    // ensure Galactic Market "Run" checkbox is checked while running
+    minFundingBuffer: 0,
+    desiredFunding: 0,
+    manageMarketRun: true,
 
-    // Safety
-    dryRun: false,            // if true: compute + display only, do not write inputs/click
+    dryRun: false,
     maxBuyPerTick: 1e12,
     maxSellPerTick: 1e12,
 
-    // per-resource config by market display name
-    resources: {
-      // auto-populated when market rows are detected
-      // "Metal": { enabled:true, hardMin:0, buyFloor:0, sellCeiling:0, priority:3 }
-    }
+    resources: {}
   };
 
   const state = (() => {
@@ -236,11 +237,10 @@
   function saveSettings() { setVal('settings', state); }
 
   /********************************************************************
-   * Bridge: read live resources + rates from game globals
+   * Bridge: read live resources from game globals
    ********************************************************************/
   function getDirectApi() {
     function safeNumber(x) { return (typeof x === 'number' && isFinite(x)) ? x : 0; }
-
     function snapshot() {
       const resources = getPageProp('resources');
       if (!resources || typeof resources !== 'object') return null;
@@ -276,12 +276,10 @@
           if (!funding && (nlow === 'funding' || klow === 'funding')) funding = obj;
         }
       }
-
       return { list, funding };
     }
 
     return {
-      mode: 'direct',
       ready() {
         try {
           const resources = getPageProp('resources');
@@ -355,162 +353,164 @@
   }
 
   /********************************************************************
-   * Market DOM detection (FIXED: no “buy/sell button” assumption)
+   * Market DOM detection (FIXED)
    ********************************************************************/
   const market = {
     panel: null,
     table: null,
     runCheckbox: null,
-    rows: new Map(), // name -> { name, tr, sellInput, buyInput, sellPrice, buyPrice }
+    rows: new Map(), // name -> { name, rowEl, sellInput, buyInput, sellPrice, buyPrice }
     detected: false,
     lastSig: ''
   };
 
-  function findMarketPanel() {
-    // Prefer headings / unique text
-    const all = Array.from(document.querySelectorAll('div,section,aside'))
-      .filter(visible)
-      .filter(el => {
-        const t = (el.textContent || '').toLowerCase();
-        return t.includes('galactic market') && t.includes('total cost');
-      });
+  function findMarketTableInDocument() {
+    // Prefer tables that actually contain the column headers.
+    const tables = Array.from(document.querySelectorAll('table'));
+    let best = null;
+    let bestScore = 0;
 
-    if (all.length) {
-      all.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width);
-      return all[0];
+    for (const t of tables) {
+      if (!t || !visible(t)) continue;
+
+      const headerText = (t.querySelector('thead')?.textContent || t.textContent || '').toLowerCase();
+      let score = 0;
+      if (headerText.includes('sell amount')) score += 3;
+      if (headerText.includes('buy amount')) score += 3;
+      if (headerText.includes('buy price')) score += 2;
+      if (headerText.includes('sell price')) score += 2;
+      if (headerText.includes('saturation')) score += 1;
+      if (headerText.includes('resource')) score += 1;
+      if (headerText.includes('total cost')) score += 2;
+      if (headerText.includes('galactic market')) score += 2;
+
+      // Also require it to have multiple numeric/text inputs somewhere.
+      const inputs = t.querySelectorAll('input');
+      if (inputs.length < 6) score -= 2;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = t;
+      }
     }
 
-    // Fallback: any big panel with market-ish keywords
-    const candidates = Array.from(document.querySelectorAll('div,section,aside'))
-      .filter(visible)
-      .filter(el => {
-        const t = (el.textContent || '').toLowerCase();
-        return t.includes('galactic market') || (t.includes('sell amount') && t.includes('buy amount') && t.includes('total cost'));
-      });
+    // Require at least "sell amount" + "buy amount" to be confident.
+    if (best && bestScore >= 6) return best;
+    return null;
+  }
 
-    candidates.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width);
-    return candidates[0] || null;
+  function findMarketPanelFromTable(table) {
+    if (!table) return null;
+    // Walk upward to a container that mentions "Galactic Market"
+    let el = table;
+    for (let i = 0; i < 10 && el; i++) {
+      el = el.parentElement;
+      if (!el) break;
+      const txt = (el.textContent || '').toLowerCase();
+      if (txt.includes('galactic market')) return el;
+    }
+    return table.parentElement || null;
   }
 
   function findRunCheckbox(panel) {
     if (!panel) return null;
-    const scope = [panel, panel.parentElement].filter(Boolean);
+    const roots = [panel, panel.parentElement, panel.closest('main'), document.body].filter(Boolean);
 
-    const checks = [];
-    for (const root of scope) {
+    for (const root of roots) {
       const inputs = Array.from(root.querySelectorAll('input[type="checkbox"]'));
       for (const inp of inputs) {
         const wrap = inp.closest('label') || inp.parentElement;
-        const txt = (wrap ? wrap.textContent : inp.textContent) || '';
+        const txt = (wrap ? wrap.textContent : '') || '';
         const t = txt.toLowerCase().replace(/\s+/g, ' ').trim();
-        if (!t) continue;
-        if (t === 'run' || (t.includes('run') && !t.includes('auto start'))) checks.push({ inp, t });
+        if (t === 'run') return inp;
       }
     }
-    if (!checks.length) return null;
-    checks.sort((a, b) => a.t.length - b.t.length);
-    return checks[0].inp || null;
+    return null;
+  }
+
+  function inferPriceFromRow(rowEl, which) {
+    const t = (rowEl.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!t) return NaN;
+    const toks = t.match(/-?\d+(\.\d+)?\s*(K|M|B|T|Qa|Qi)?/g) || [];
+    const nums = toks.map(parseNumber).filter(n => Number.isFinite(n));
+    if (nums.length < 2) return NaN;
+    const filtered = nums.filter(n => Math.abs(n) <= 1e9);
+    const pool = filtered.length ? filtered : nums;
+    return (which === 'sell') ? pool[0] : pool[pool.length - 1];
+  }
+
+  function extractRowName(rowEl) {
+    // Prefer first TD text if table-based
+    const tds = rowEl.querySelectorAll('td');
+    if (tds && tds.length) {
+      const name = (tds[0].textContent || '').trim().replace(/\s+/g, ' ');
+      if (name && !looksLikeHeaderRowText(name)) return name;
+    }
+
+    // Fallback: first wordy token
+    const txt = (rowEl.textContent || '').trim().replace(/\s+/g, ' ');
+    if (!txt) return '';
+    const words = txt.split(' ');
+    // Choose first alphabetic token
+    for (const w of words) {
+      if (/^[A-Za-z][A-Za-z\-]*$/.test(w) && w.length <= 30) return w;
+    }
+    return '';
   }
 
   function scanMarket() {
-    const panel = findMarketPanel();
-    market.panel = panel;
-    market.detected = !!panel;
-    market.rows.clear();
+    market.panel = null;
     market.table = null;
     market.runCheckbox = null;
+    market.rows.clear();
+    market.detected = false;
 
-    if (!panel) {
+    const table = findMarketTableInDocument();
+    if (!table) {
       market.lastSig = '';
       return;
     }
 
-    market.runCheckbox = findRunCheckbox(panel);
+    const panel = findMarketPanelFromTable(table);
+    market.table = table;
+    market.panel = panel || table.parentElement;
+    market.detected = true;
 
-    const table = panel.querySelector('table');
-    market.table = table || null;
+    market.runCheckbox = findRunCheckbox(market.panel);
 
-    // Best path: actual table rows
-    if (table) {
-      // Map header indices if present
-      const headerCells =
-        Array.from(table.querySelectorAll('thead th')).length ? Array.from(table.querySelectorAll('thead th')) :
-        Array.from(table.querySelectorAll('tr')).length ? Array.from(table.querySelectorAll('tr'))[0].querySelectorAll('th,td') : [];
+    // Rows: DO NOT use bounding-box "visible row" filters (this was the bug).
+    let rowEls = [];
+    const tbodyRows = Array.from(table.querySelectorAll('tbody tr'));
+    if (tbodyRows.length) rowEls = tbodyRows;
+    else rowEls = Array.from(table.querySelectorAll('tr'));
 
-      const idx = {
-        resource: -1,
-        sellPrice: -1,
-        sellAmount: -1,
-        buyAmount: -1,
-        buyPrice: -1
-      };
+    for (const rowEl of rowEls) {
+      const rowText = (rowEl.textContent || '').trim().replace(/\s+/g, ' ');
+      if (!rowText) continue;
+      if (looksLikeHeaderRowText(rowText)) continue;
+      if (rowEl.querySelectorAll('th').length) continue;
 
-      if (headerCells && headerCells.length) {
-        headerCells.forEach((c, i) => {
-          const t = (c.textContent || '').toLowerCase();
-          if (t.includes('resource')) idx.resource = i;
-          if (t.includes('sell price')) idx.sellPrice = i;
-          if (t.includes('sell amount')) idx.sellAmount = i;
-          if (t.includes('buy amount')) idx.buyAmount = i;
-          if (t.includes('buy price')) idx.buyPrice = i;
-        });
-      }
+      const inputsAll = Array.from(rowEl.querySelectorAll('input')).filter(inp => inp.type !== 'checkbox');
+      if (inputsAll.length < 2) continue;
 
-      const bodyRows = Array.from(table.querySelectorAll('tbody tr')).filter(visible);
-      for (const tr of bodyRows) {
-        const tds = Array.from(tr.querySelectorAll('td'));
-        const inputs = Array.from(tr.querySelectorAll('input')).filter(inp => inp && inp.type !== 'checkbox');
-        if (inputs.length < 2) continue;
+      // Choose 2 inputs by left-to-right position (sell, buy)
+      const inputs = sortByLeft(inputsAll);
+      const sellInput = inputs[0];
+      const buyInput = inputs[inputs.length - 1];
 
-        const nameCell = (idx.resource >= 0 && tds[idx.resource]) ? tds[idx.resource] : tds[0];
-        const name = (nameCell ? nameCell.textContent : tr.textContent || '').trim().replace(/\s+/g, ' ');
-        if (!name) continue;
+      const name = extractRowName(rowEl);
+      if (!name) continue;
 
-        const sellInput = (idx.sellAmount >= 0 && tds[idx.sellAmount]) ? (tds[idx.sellAmount].querySelector('input') || null) : inputs[0];
-        const buyInput = (idx.buyAmount >= 0 && tds[idx.buyAmount]) ? (tds[idx.buyAmount].querySelector('input') || null) : inputs[1];
+      const sellPrice = inferPriceFromRow(rowEl, 'sell');
+      const buyPrice = inferPriceFromRow(rowEl, 'buy');
 
-        // Prices: from mapped cells if possible, else heuristics based on nearby cells
-        const sellPrice =
-          (idx.sellPrice >= 0 && tds[idx.sellPrice]) ? parseNumber(tds[idx.sellPrice].textContent) :
-          inferPriceFromRow(tr, 'sell');
-
-        const buyPrice =
-          (idx.buyPrice >= 0 && tds[idx.buyPrice]) ? parseNumber(tds[idx.buyPrice].textContent) :
-          inferPriceFromRow(tr, 'buy');
-
-        market.rows.set(name, { name, tr, sellInput, buyInput, sellPrice, buyPrice });
-      }
-    } else {
-      // Fallback path: any element inside panel that has 2 inputs (sell + buy)
-      const candidates = Array.from(panel.querySelectorAll('tr,div,li'))
-        .filter(visible)
-        .filter(el => Array.from(el.querySelectorAll('input')).filter(i => i.type !== 'checkbox').length >= 2);
-
-      for (const el of candidates) {
-        const inputs = Array.from(el.querySelectorAll('input')).filter(i => i.type !== 'checkbox');
-        if (inputs.length < 2) continue;
-        // Attempt to take first “wordy” part as resource name
-        const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
-        if (!txt) continue;
-        const name = txt.split(/\s{2,}|\n/)[0].trim();
-        if (!name) continue;
-
-        market.rows.set(name, {
-          name,
-          tr: el,
-          sellInput: inputs[0],
-          buyInput: inputs[1],
-          sellPrice: inferPriceFromRow(el, 'sell'),
-          buyPrice: inferPriceFromRow(el, 'buy')
-        });
-      }
+      market.rows.set(name, { name, rowEl, sellInput, buyInput, sellPrice, buyPrice });
     }
 
-    // Update signature to decide if UI rows need rebuild
     const sig = Array.from(market.rows.keys()).sort().join('|');
     market.lastSig = sig;
 
-    // Ensure config exists for detected market resources
+    // Ensure config exists for detected rows
     for (const name of market.rows.keys()) {
       if (!state.resources[name]) {
         state.resources[name] = { enabled: true, hardMin: 0, buyFloor: 0, sellCeiling: 0, priority: 3 };
@@ -519,31 +519,12 @@
     saveSettings();
   }
 
-  function inferPriceFromRow(rowEl, which) {
-    // Heuristic: find small-ish numeric tokens in row; pick sell as first price-like after saturation, buy as last.
-    const t = (rowEl.textContent || '').replace(/\s+/g, ' ').trim();
-    if (!t) return NaN;
-
-    // extract tokens like 0.5, 10, 200, 3.7T etc (we only want *prices*, usually no suffix or small)
-    const toks = t.match(/-?\d+(\.\d+)?\s*(K|M|B|T|Qa|Qi)?/g) || [];
-    const nums = toks.map(parseNumber).filter(n => Number.isFinite(n));
-    if (nums.length < 2) return NaN;
-
-    // Prefer values that are not astronomically large (exclude saturation like 3.7T etc)
-    const filtered = nums.filter(n => Math.abs(n) <= 1e9); // buy prices can be high, but usually << 1e9
-    const pool = filtered.length ? filtered : nums;
-
-    if (which === 'sell') return pool[0];
-    return pool[pool.length - 1];
-  }
-
   /********************************************************************
    * Live resource index (map market row name -> resource snapshot)
    ********************************************************************/
   function normalizeKey(s) {
     return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   }
-
   function buildResourceIndex(snapshot) {
     const idx = new Map();
     if (!snapshot || !snapshot.list) return idx;
@@ -557,19 +538,15 @@
       };
       add(name);
       add(key);
-      // singular/plural helpers
       if (name.endsWith('s')) add(name.slice(0, -1));
       if (key.endsWith('s')) add(key.slice(0, -1));
     }
     return idx;
   }
-
   function getResForMarketName(resIndex, marketName) {
     if (!resIndex) return null;
     const n = normalizeKey(marketName);
     if (resIndex.has(n)) return resIndex.get(n);
-
-    // small fallbacks: add/remove trailing s
     if (n.endsWith('s') && resIndex.has(n.slice(0, -1))) return resIndex.get(n.slice(0, -1));
     if (resIndex.has(n + 's')) return resIndex.get(n + 's');
     return null;
@@ -600,7 +577,6 @@
     const buyH = Math.max(1e-6, clamp(toNum(state.buyHorizonSec, 10), 1, 3600));
     const sellH = Math.max(1e-6, clamp(toNum(state.sellHorizonSec, 10), 1, 3600));
 
-    // first compute raw desired buy/sell amounts (rates -> "amount" input)
     const sells = [];
     const buys = [];
 
@@ -610,33 +586,25 @@
 
       const rs = getResForMarketName(resIndex, name);
       const value = rs ? toNum(rs.value, 0) : NaN;
-      const net = rs ? toNum(rs.net, 0) : NaN;
       const cons = rs ? Math.max(0, toNum(rs.cons, 0)) : 0;
 
-      // Consumption-based buffer adds to floor
       const floor = Math.max(buyFloor(name), cons * reserveS);
       const ceilV = sellCeil(name);
-
-      // Keep ceilings sane
       const ceilSafe = Math.max(ceilV, floor);
 
-      // desired amounts are per "time constant" (game market runs continuously while Run is enabled)
       const deficit = Number.isFinite(value) ? Math.max(0, floor - value) : 0;
-      const excess = (Number.isFinite(value) && Number.isFinite(ceilSafe) && ceilSafe !== Infinity) ? Math.max(0, value - ceilSafe) : 0;
+      const excess = (Number.isFinite(value) && ceilSafe !== Infinity) ? Math.max(0, value - ceilSafe) : 0;
 
-      // Critical levels: prevent 0/negative/under hardMin
       const hm = hardMin(name);
       const crit = Number.isFinite(value) ? ((value < 0) ? 2 : (value < hm ? 1 : 0)) : 0;
 
-      // Sell first (generates funding) – but only if we actually have excess
       let sellAmt = 0;
-      if (excess > 0) {
+      if (excess > 0 && ceilSafe !== Infinity) {
         sellAmt = Math.ceil(excess / sellH);
         sellAmt = Math.min(sellAmt, toNum(state.maxSellPerTick, 1e12));
         sellAmt = Math.max(0, sellAmt);
       }
 
-      // Buy if under floor
       let buyAmt = 0;
       if (deficit > 0) {
         buyAmt = Math.ceil(deficit / buyH);
@@ -644,62 +612,40 @@
         buyAmt = Math.max(0, buyAmt);
       }
 
-      // Save candidates
       if (sellAmt > 0 && ceilSafe !== Infinity) {
         sells.push({ name, sellAmt, pr: prio(name), unit: Number.isFinite(row.sellPrice) ? row.sellPrice : NaN });
       }
       if (buyAmt > 0) {
-        buys.push({
-          name,
-          buyAmt,
-          pr: prio(name),
-          crit,
-          need: deficit,
-          unit: Number.isFinite(row.buyPrice) ? row.buyPrice : NaN
-        });
+        buys.push({ name, buyAmt, pr: prio(name), crit, need: deficit, unit: Number.isFinite(row.buyPrice) ? row.buyPrice : NaN });
       }
     }
 
-    // Sort: sells by prio desc, then bigger first
     sells.sort((a, b) => (b.pr - a.pr) || (b.sellAmt - a.sellAmt));
-
-    // Sort buys: critical first, then prio desc, then need desc
     buys.sort((a, b) => (b.crit - a.crit) || (b.pr - a.pr) || (b.need - a.need));
 
-    // Funding-aware buy allocation
-    const planned = new Map(); // name -> { buy, sell }
+    const planned = new Map();
     for (const s of sells) planned.set(s.name, { buy: 0, sell: s.sellAmt });
 
     let fundsAvail = fundingKnown ? Math.max(0, funding - minBuf) : 0;
 
-    // If funding short and we have both buys and sells, bias toward selling (already done),
-    // then allocate buys only within remaining funds.
     for (const b of buys) {
-      const row = market.rows.get(b.name);
       const unit = Number.isFinite(b.unit) ? b.unit : NaN;
-
       let amt = b.buyAmt;
 
       if (!fundingKnown) {
-        // Unknown funding -> be conservative: only allow critical tiny buys
         amt = (b.crit > 0) ? Math.min(amt, 1) : 0;
       } else {
         if (fundingShort && desired > 0) {
-          // When funding is below target, only allow critical buys until we recover
           if (b.crit === 0) amt = 0;
         }
 
         if (amt > 0 && Number.isFinite(unit) && unit > 0) {
           const affordable = Math.floor(fundsAvail / unit);
-          if (affordable <= 0) {
-            // still allow 1 if critical and we have at least some buffer headroom
-            amt = (b.crit > 0 && fundsAvail > 0) ? 1 : 0;
-          } else {
-            amt = Math.min(amt, affordable);
-          }
+          if (affordable <= 0) amt = (b.crit > 0 && fundsAvail > 0) ? 1 : 0;
+          else amt = Math.min(amt, affordable);
+
           fundsAvail -= amt * unit;
         } else if (amt > 0 && (!Number.isFinite(unit) || unit <= 0)) {
-          // Unknown price: safe tiny buy only if critical and we have funds
           amt = (b.crit > 0 && fundsAvail > 0) ? 1 : 0;
         }
       }
@@ -708,17 +654,11 @@
       planned.set(b.name, { buy: amt, sell: prev.sell });
     }
 
-    return {
-      funding,
-      fundingKnown,
-      fundingTarget,
-      fundingShort,
-      planned
-    };
+    return { funding, fundingKnown, fundingTarget, fundingShort, planned, _resIndex: resIndex };
   }
 
   /********************************************************************
-   * UI (Worker Allocator style: draggable dock, no constant rebuild)
+   * UI (same "allocator style" overlay)
    ********************************************************************/
   function addStyle(css) {
     const s = document.createElement('style');
@@ -775,7 +715,6 @@
     return e;
   }
 
-  // drag / clamp (lighter version)
   function clampToViewport(root) {
     if (!root) return;
     const vw = window.innerWidth || 0;
@@ -847,7 +786,7 @@
   const ui = {
     root: null, panel: null, header: null, body: null,
     runBtn: null, dryBtn: null, minBtn: null, scanBtn: null, clearBtn: null,
-    status: null, tableWrap: null, tableBody: null,
+    status: null, tableBody: null,
     fields: {}
   };
 
@@ -871,7 +810,6 @@
 
     ui.body = el('div', { id: 'ttgm-body' });
 
-    // Settings card
     const settingsCard = el('div', { class: 'ttgm-card' });
     settingsCard.innerHTML = `
       <div class="ttgm-row" style="justify-content:space-between;align-items:flex-end;gap:12px">
@@ -909,12 +847,10 @@
     `;
     ui.body.appendChild(settingsCard);
 
-    // Status card
     ui.status = el('div', { class: 'ttgm-card' });
     ui.status.innerHTML = `<div class="ttgm-mini ttgm-muted">Status: starting…</div>`;
     ui.body.appendChild(ui.status);
 
-    // Table
     const tableCard = el('div', { class: 'ttgm-card' });
     tableCard.innerHTML = `
       <div style="font-weight:900;margin-bottom:8px">Per-resource policy</div>
@@ -957,7 +893,6 @@
     loadPos(ui.root);
     enableDrag(ui.root, ui.header);
 
-    // Wire header buttons
     ui.runBtn.addEventListener('click', () => {
       state.running = !state.running;
       ui.runBtn.textContent = state.running ? 'Running' : 'Stopped';
@@ -984,7 +919,6 @@
       clearAllMarketOrders();
     });
 
-    // Wire settings fields
     ui.fields.tick = settingsCard.querySelector('#ttgm-tick');
     ui.fields.reserve = settingsCard.querySelector('#ttgm-reserve');
     ui.fields.buyh = settingsCard.querySelector('#ttgm-buyh');
@@ -1015,6 +949,8 @@
     ui.body.style.display = state.minimized ? 'none' : 'flex';
   }
 
+  function cfg(name) { return state.resources[name] || {}; }
+
   function rebuildTable() {
     if (!ui.tableBody) return;
 
@@ -1039,18 +975,14 @@
         <td class="ttgm-mini ttgm-muted" data-cell="live">—</td>
       `;
 
+      const chk = tr.querySelector('[data-field="enabled"]');
+      chk.addEventListener('change', () => { state.resources[name].enabled = !!chk.checked; saveSettings(); });
+
       const bind = (field, fn) => {
         const inp = tr.querySelector(`[data-field="${field}"]`);
         if (!inp) return;
         inp.addEventListener('change', () => fn(inp));
       };
-
-      const chk = tr.querySelector('[data-field="enabled"]');
-      chk.addEventListener('change', () => {
-        state.resources[name].enabled = !!chk.checked;
-        saveSettings();
-      });
-
       bind('hardMin', (inp) => { state.resources[name].hardMin = Math.max(0, parseNumber(inp.value)); inp.value = String(state.resources[name].hardMin); saveSettings(); });
       bind('buyFloor', (inp) => { state.resources[name].buyFloor = Math.max(0, parseNumber(inp.value)); inp.value = String(state.resources[name].buyFloor); saveSettings(); });
       bind('sellCeiling', (inp) => { state.resources[name].sellCeiling = Math.max(0, parseNumber(inp.value)); inp.value = String(state.resources[name].sellCeiling); saveSettings(); });
@@ -1065,18 +997,9 @@
     ui.status.innerHTML = `<div class="ttgm-mini ttgm-muted">${escapeHtml(msg)}</div>`;
   }
 
-  /********************************************************************
-   * Apply to market UI
-   ********************************************************************/
   function clearAllMarketOrders() {
-    if (!market.detected || market.rows.size === 0) {
-      renderStatusLine('Clear: market not detected.');
-      return;
-    }
-    if (state.dryRun) {
-      renderStatusLine('DRY: would clear all market orders.');
-      return;
-    }
+    if (!market.detected || market.rows.size === 0) { renderStatusLine('Clear: market not detected.'); return; }
+    if (state.dryRun) { renderStatusLine('DRY: would clear all market orders.'); return; }
     for (const row of market.rows.values()) {
       if (row.sellInput) setNativeValue(row.sellInput, 0);
       if (row.buyInput) setNativeValue(row.buyInput, 0);
@@ -1087,15 +1010,13 @@
   function applyPlanToMarket(plan) {
     if (!plan) return;
 
-    // Manage Market Run checkbox if requested
     if (state.manageMarketRun && market.runCheckbox) {
-      const wantOn = state.running; // keep run on while our automation running
+      const wantOn = state.running;
       if (!!market.runCheckbox.checked !== wantOn) {
         if (!state.dryRun) market.runCheckbox.click();
       }
     }
 
-    // Write inputs
     for (const [name, row] of market.rows.entries()) {
       const rc = cfg(name);
       const cell = ui.tableBody?.querySelector(`tr[data-name="${CSS.escape(name)}"] [data-cell="live"]`) || null;
@@ -1111,7 +1032,6 @@
       if (!state.running || state.dryRun) continue;
 
       if (!rc.enabled) {
-        // If disabled, force to 0 so we don't leave stale orders
         if (row.sellInput) setNativeValue(row.sellInput, 0);
         if (row.buyInput) setNativeValue(row.buyInput, 0);
         continue;
@@ -1122,35 +1042,23 @@
     }
   }
 
-  /********************************************************************
-   * Main tick
-   ********************************************************************/
   function tick() {
     injectBridge();
 
     const api = getApi();
     const ready = api && typeof api.ready === 'function' && api.ready();
-    if (!ready) {
-      renderStatusLine('Status: waiting for game globals (resources)…');
-      return;
-    }
+    if (!ready) { renderStatusLine('Status: waiting for game globals (resources)…'); return; }
 
-    // Refresh market scan occasionally (or when missing)
-    if (!market.detected || market.rows.size === 0) {
+    // Re-scan periodically
+    if (!tick._lastScanAt || (Date.now() - tick._lastScanAt) > 2500) {
+      tick._lastScanAt = Date.now();
+      const beforeSig = market.lastSig;
       scanMarket();
-      rebuildTable();
-    } else {
-      // Lightweight re-scan every few seconds in case new rows unlock
-      if (!tick._lastScanAt || (Date.now() - tick._lastScanAt) > 3500) {
-        tick._lastScanAt = Date.now();
-        const beforeSig = market.lastSig;
-        scanMarket();
-        if (market.lastSig !== beforeSig) rebuildTable();
-      }
+      if (market.lastSig !== beforeSig) rebuildTable();
     }
 
     if (!market.detected) {
-      renderStatusLine('Status: Galactic Market panel not detected. Open Colony → Resources → Galactic Market, then click Scan.');
+      renderStatusLine('Status: Market table not detected. (Make sure Galactic Market is open.)');
       return;
     }
 
@@ -1158,9 +1066,7 @@
     const resIndex = buildResourceIndex(snap);
 
     const plan = computePlan(snap, resIndex);
-    plan._resIndex = resIndex;
 
-    // Pills
     const pills = [];
     pills.push(`<span class="ttgm-badge">Market: ${market.rows.size} rows</span>`);
     pills.push(`<span class="ttgm-badge">Run checkbox: ${market.runCheckbox ? 'found' : 'missing'}</span>`);
@@ -1174,17 +1080,13 @@
     const pillsEl = ui.body?.querySelector('#ttgm-pills');
     if (pillsEl) pillsEl.innerHTML = pills.join(' ');
 
-    // Apply
     applyPlanToMarket(plan);
 
-    // Status line
     const anyOrders = Array.from(plan.planned.values()).some(x => (x.buy > 0 || x.sell > 0));
     renderStatusLine(
-      !state.running
-        ? 'Status: Stopped (no writes).'
-        : state.dryRun
-          ? `Status: DRY (computed ${anyOrders ? 'orders' : 'idle'}).`
-          : `Status: Running (${anyOrders ? 'writing orders' : 'idle'}).`
+      !state.running ? 'Status: Stopped (no writes).' :
+      state.dryRun ? `Status: DRY (computed ${anyOrders ? 'orders' : 'idle'}).` :
+      `Status: Running (${anyOrders ? 'writing orders' : 'idle'}).`
     );
   }
 
@@ -1197,7 +1099,6 @@
   rebuildTable();
   tick();
 
-  // Use shared lock so we don't collide with other scripts spamming the DOM
   setInterval(() => {
     TT.runExclusive('galacticMarket', 800, tick);
   }, clamp(toNum(state.tickMs, 650), 200, 5000));
