@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Terraforming Titans Growth Optimizer (Land% Ecumenopolis Planner) [Bridge Fix + Exact Counts]
+// @name         Terraforming Titans Growth Optimizer (Docked Right UI) [0.1.5]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      0.1.3
-// @description  Overlay that estimates the fastest route to a Land%-sized ecumenopolis and full Colonist+Android occupancy. Includes page-bridge so it can read TT globals.
+// @version      0.1.5
+// @description  Docked-right overlay that estimates the fastest route to a Land%-sized ecumenopolis and full Colonist+Android occupancy. Includes page-bridge so it can read TT globals.
 // @author       kov27 (ChatGPT-assisted)
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -100,6 +100,9 @@
   const PANEL_ID = 'ttgo-panel';
   const UPDATE_MS = 1000;
 
+  const DOCK_WIDTH_EXPANDED = 420;
+  const DOCK_WIDTH_MINIMIZED = 240;
+
   const state = {
     landPct: clampNumber(Number(loadSetting('landPct', 30)), 0, 100),
     expandedStatus: Boolean(loadSetting('expandedStatus', true)),
@@ -109,15 +112,42 @@
   };
 
   /********************************************************************
+   * Docking (push game left so panel never blocks clicks)
+   ********************************************************************/
+  function setDockPad(px) {
+    const root = document.documentElement;
+    if (px > 0) {
+      root.classList.add('ttgo-docked');
+      root.style.setProperty('--ttgo-dock-pad', `${px}px`);
+    } else {
+      root.classList.remove('ttgo-docked');
+      root.style.setProperty('--ttgo-dock-pad', `0px`);
+    }
+  }
+
+  function applyDockingNow() {
+    if (state.hidden) return setDockPad(0);
+    setDockPad(state.minimized ? DOCK_WIDTH_MINIMIZED : DOCK_WIDTH_EXPANDED);
+  }
+
+  /********************************************************************
    * CSS
    ********************************************************************/
   const css = `
+:root{ --ttgo-dock-pad: 0px; }
+
+/* Reserve space for the docked panel */
+html.ttgo-docked body{
+  padding-right: var(--ttgo-dock-pad) !important;
+  box-sizing: border-box;
+}
+
 #${PANEL_ID}{
   position: fixed;
   top: 8px;
   right: 8px;
   bottom: 8px;
-  width: 420px;
+  width: ${DOCK_WIDTH_EXPANDED}px;
   z-index: 999999;
   display: flex;
   flex-direction: column;
@@ -131,8 +161,16 @@
   line-height: 1.25;
   overflow: hidden;
 }
+
+/* Hidden just removes the panel; docking pad also removed in JS */
 #${PANEL_ID}.ttgo-hidden{ display:none; }
-#${PANEL_ID}.ttgo-minimized{ height:auto; bottom:auto; }
+
+/* Minimized: shrink width and collapse body so it doesn't block much even if undocked */
+#${PANEL_ID}.ttgo-minimized{
+  width: ${DOCK_WIDTH_MINIMIZED}px;
+  bottom: auto;
+}
+#${PANEL_ID}.ttgo-minimized .ttgo-body{ display:none; }
 
 #${PANEL_ID} .ttgo-header{
   display:flex; align-items:center; justify-content:space-between;
@@ -311,8 +349,8 @@
 
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
-    if (state.minimized) panel.classList.add('ttgo-minimized');
     if (state.hidden) panel.classList.add('ttgo-hidden');
+    if (state.minimized) panel.classList.add('ttgo-minimized');
 
     const header = document.createElement('div');
     header.className = 'ttgo-header';
@@ -339,7 +377,7 @@
       saveSetting('minimized', state.minimized);
       minimizeBtn.textContent = state.minimized ? 'Expand' : 'Minimize';
       panel.classList.toggle('ttgo-minimized', state.minimized);
-      ui.body.style.display = state.minimized ? 'none' : 'block';
+      applyDockingNow();
     });
 
     btnWrap.appendChild(minimizeBtn);
@@ -349,7 +387,6 @@
 
     const body = document.createElement('div');
     body.className = 'ttgo-body';
-    if (state.minimized) body.style.display = 'none';
 
     // Controls
     const controls = document.createElement('div');
@@ -497,6 +534,9 @@
     ui.planSummaryRight = planRight;
     ui.planPre = planPre;
     ui.warnBox = warn;
+
+    // Apply docking after DOM is present
+    applyDockingNow();
   }
 
   function rowEl(label, valueNodeOrText) {
@@ -616,9 +656,6 @@
     return 1 - ratio;
   }
 
-  /********************************************************************
-   * Math
-   ********************************************************************/
   function etaLogisticToFraction(N0, K, a, d, fraction = 0.999) {
     if (!Number.isFinite(N0) || !Number.isFinite(K) || !Number.isFinite(a) || !Number.isFinite(d)) return { ok: false, reason: 'bad-input' };
     if (K <= 0) return { ok: false, reason: 'no-cap' };
@@ -630,17 +667,17 @@
 
     const KPrime = K * (aPrime / a);
     if (KPrime <= 0) return { ok: false, reason: 'kprime<=0' };
-    if (N0 >= KPrime) return { ok: true, seconds: 0, reachableCap: KPrime, capped: true };
+    if (N0 >= KPrime) return { ok: true, seconds: 0 };
 
     const target = Math.min(KPrime * clampNumber(fraction, 0.01, 0.9999), KPrime * 0.9999);
-    if (target <= N0) return { ok: true, seconds: 0, reachableCap: KPrime, capped: true };
+    if (target <= N0) return { ok: true, seconds: 0 };
 
     const num = target * (KPrime - N0);
     const den = N0 * (KPrime - target);
     if (den <= 0 || num <= 0) return { ok: false, reason: 'math' };
 
     const t = (1 / aPrime) * Math.log(num / den);
-    return { ok: true, seconds: t, reachableCap: KPrime, capped: Math.abs(KPrime - K) > 1e-6 };
+    return { ok: true, seconds: t };
   }
 
   function etaLinearToFraction(value, cap, netPerSec, fraction = 0.999) {
@@ -654,30 +691,39 @@
     return { ok: true, seconds: (target - value) / netPerSec };
   }
 
-  /********************************************************************
-   * Build ETA (resource-gated)
-   ********************************************************************/
+  function reasonToHuman(reason, extra) {
+    if (reason === 'no-pop') return 'No colonists yet';
+    if (reason === 'no-cap') return 'No housing cap';
+    if (reason === 'no-growth') return 'Growth = 0 (happiness ≤ 50%)';
+    if (reason === 'decay>=growth') return `Decay ≥ growth (a=${fmtNumber(extra?.a ?? 0, 6)}, d=${fmtNumber(extra?.d ?? 0, 6)})`;
+    return `— (${reason})`;
+  }
+
+  function getScaledCost(structure, buildCount) {
+    buildCount = Math.max(0, Math.floor(Number(buildCount) || 0));
+    if (!structure || buildCount <= 0) return null;
+
+    try {
+      return structure.getEffectiveCost(buildCount);
+    } catch (_) {
+      const base = structure.getEffectiveCost ? structure.getEffectiveCost(1) : null;
+      if (!base) return null;
+      const scaled = {};
+      for (const cat in base) {
+        scaled[cat] = {};
+        for (const res in base[cat]) scaled[cat][res] = (Number(base[cat][res]) || 0) * buildCount;
+      }
+      return scaled;
+    }
+  }
+
   function estimateBuildEtaSeconds(structure, buildCount) {
     buildCount = Math.max(0, Math.floor(Number(buildCount) || 0));
     if (!structure || buildCount <= 0) return 0;
 
     const { resources } = getGameRefs();
-    if (!resources) return Infinity;
-
-    let cost;
-    try {
-      cost = structure.getEffectiveCost(buildCount);
-    } catch (_) {
-      cost = structure.getEffectiveCost ? structure.getEffectiveCost(1) : null;
-      if (!cost) return Infinity;
-
-      const scaled = {};
-      for (const cat in cost) {
-        scaled[cat] = {};
-        for (const res in cost[cat]) scaled[cat][res] = (Number(cost[cat][res]) || 0) * buildCount;
-      }
-      cost = scaled;
-    }
+    const cost = getScaledCost(structure, buildCount);
+    if (!resources || !cost) return Infinity;
 
     let worst = 0;
 
@@ -696,20 +742,11 @@
         const r = netRate(resObj);
         if (r <= 0) return Infinity;
 
-        const t = missing / r;
-        if (t > worst) worst = t;
+        worst = Math.max(worst, missing / r);
       }
     }
 
     return worst;
-  }
-
-  function reasonToHuman(reason, extra) {
-    if (reason === 'no-pop') return 'No colonists yet';
-    if (reason === 'no-cap') return 'No housing cap';
-    if (reason === 'no-growth') return 'Growth = 0 (happiness ≤ 50%)';
-    if (reason === 'decay>=growth') return `Decay ≥ growth (a=${fmtNumber(extra?.a ?? 0, 6)}, d=${fmtNumber(extra?.d ?? 0, 6)})`;
-    return `— (${reason})`;
   }
 
   /********************************************************************
@@ -719,8 +756,9 @@
     try {
       injectBridge();
       ensurePanel();
+      applyDockingNow();
 
-      const { resources, colonies, populationModule, researchManager, bridgeOk } = getGameRefs();
+      const { resources, colonies, populationModule, bridgeOk } = getGameRefs();
 
       const hasRes = !!(resources && resources.colony && resources.surface);
       const hasCol = !!colonies;
@@ -751,6 +789,7 @@
       const eco = colonies.t7_colony;
       if (!eco) {
         ui.planPre.textContent = 'Ecumenopolis (t7_colony) not detected.';
+        ui.planSummaryRight.textContent = 't7 missing';
         ui.warnBox.style.display = 'none';
         return;
       }
@@ -772,23 +811,20 @@
       setText(ui.sEcoActive, fmtCount(ecoActive));
       setText(ui.sEcoBuiltInactive, fmtCount(Math.max(0, ecoCount - ecoActive)));
 
-      // ===== Land% target → districts (FLOOR + CLAMP) =====
+      // Land% target → districts (FLOOR + CLAMP)
       const targetLandPct = state.landPct;
       setText(ui.sTargetLandPct, fmtPct(targetLandPct, 1));
 
       const maxEcoByLand = (ecoReqLand > 0 && totalLand > 0) ? Math.floor(totalLand / ecoReqLand) : 0;
       const desiredReserved = totalLand * (targetLandPct / 100);
 
-      // floor = do NOT exceed target % (and never exceed total land)
       let targetEcoActive = (ecoReqLand > 0) ? Math.floor((desiredReserved / ecoReqLand) + 1e-9) : 0;
       if (maxEcoByLand > 0) targetEcoActive = Math.min(targetEcoActive, maxEcoByLand);
       targetEcoActive = Math.max(0, targetEcoActive);
 
-      // Achieved % at that discrete district count
       const achievedReserved = targetEcoActive * ecoReqLand;
       const achievedPct = totalLand > 0 ? (achievedReserved / totalLand) * 100 : 0;
 
-      // What +1 district would do (if possible)
       const nextEco = Math.min(targetEcoActive + 1, maxEcoByLand);
       const nextPct = (nextEco !== targetEcoActive && totalLand > 0)
         ? ((nextEco * ecoReqLand) / totalLand) * 100
@@ -803,15 +839,15 @@
       setText(ui.sNeedBuild, fmtCount(needBuild));
       setText(ui.sNeedActivate, fmtCount(needActivate));
 
-      // Caps now vs target (approx)
+      // Caps now vs target
       const colonists = resources.colony.colonists;
       const androids = resources.colony.androids;
 
-      setText(ui.sColonists, colonists ? `${fmtNumber(colonists.value, 2)} / ${fmtNumber(colonists.cap, 2)}` : '—');
-      setText(ui.sAndroids, androids ? `${fmtNumber(androids.value, 2)} / ${fmtNumber(androids.cap, 2)}` : '—');
-
       const colonistsCapNow = Number(colonists?.cap) || 0;
       const androidsCapNow = Number(androids?.cap) || 0;
+
+      setText(ui.sColonists, colonists ? `${fmtNumber(colonists.value, 2)} / ${fmtNumber(colonists.cap, 2)}` : '—');
+      setText(ui.sAndroids, androids ? `${fmtNumber(androids.value, 2)} / ${fmtNumber(androids.cap, 2)}` : '—');
       setText(ui.sColonistsCapNow, fmtNumber(colonistsCapNow, 2));
       setText(ui.sAndroidsCapNow, fmtNumber(androidsCapNow, 2));
 
@@ -841,9 +877,8 @@
         : 0;
       setText(ui.sGrowthNow, `${signedStr(fmtNumber(growthPctNow, 3))}%/s`);
 
-      // Build ETA, then fill ETA
       const buildEta = estimateBuildEtaSeconds(eco, needBuild);
-      const buildEtaStr = Number.isFinite(buildEta) ? formatDuration(buildEta) : '∞';
+      const buildEtaStr = (needBuild <= 0) ? '0s' : (Number.isFinite(buildEta) ? formatDuration(buildEta) : '∞');
 
       const popNetNow = Number(populationModule.getCurrentGrowthPerSecond?.() ?? populationModule.lastGrowthPerSecond ?? 0) || 0;
       const N0 = Number(colonists?.value) || 0;
@@ -882,20 +917,13 @@
       setText(ui.sWorkersReq, fmtNumber(workersReq, 2));
       setText(ui.sWorkersSlack, `${slack >= 0 ? '+' : ''}${fmtNumber(slack, 2)}`);
 
-      // Summary right: avoid insane ratio if capFactorNow ~ 0
-      const ratioStr = (capFactorNow > 0.0001)
-        ? ` | capFactor×${(capFactorTarget / capFactorNow).toFixed(2)}`
-        : '';
       ui.statusSummaryRight.textContent =
-        `${fmtPct(ecoLandPct, 2)} → ${fmtPct(targetLandPct, 1)} | capFactor ${fmtPct(capFactorNow * 100, 2)}→${fmtPct(capFactorTarget * 100, 2)}${ratioStr}`;
+        `${fmtPct(ecoLandPct, 2)} → ${fmtPct(targetLandPct, 1)} | capFactor ${fmtPct(capFactorNow * 100, 2)}→${fmtPct(capFactorTarget * 100, 2)}`;
 
-      // Plan
       const planLines = [];
       planLines.push(`Target: ${fmtPct(targetLandPct, 1)} land in Ecumenopolis`);
       planLines.push(`• Discrete target districts: ${fmtCount(targetEcoActive)} (achieves ${fmtPct(achievedPct, 3)})`);
-      if (Number.isFinite(nextPct)) planLines.push(`• Next district would be: ${fmtPct(nextPct, 3)}`);
-      else planLines.push(`• Next district: — (already at max by land)`);
-
+      planLines.push(Number.isFinite(nextPct) ? `• Next district would be: ${fmtPct(nextPct, 3)}` : `• Next district: — (already at max by land)`);
       planLines.push('');
       planLines.push(`Build: need +${fmtCount(needBuild)} | Activate: need +${fmtCount(needActivate)}`);
       planLines.push(`Est. build gating ETA (slowest resource): ${buildEtaStr}`);
@@ -912,20 +940,17 @@
       const warnings = [];
       const starvation = Number(populationModule.starvationShortage) || 0;
       const energyShort = Number(populationModule.energyShortage) || 0;
+      const workersVal = Number(workers?.value) || 0;
 
       if (a <= 0) warnings.push('Colonist base growth is 0 (happiness ≤ 50%). Improve needs/comfort/milestones.');
       if (decayD > 0 && decayD >= a) warnings.push('Decay ≥ growth: cap-limited by starvation/energy/gravity decay.');
       if (starvation > 0.001) warnings.push(`Starvation active: ${(starvation * 100).toFixed(1)}% starving.`);
       if (energyShort > 0.001) warnings.push(`Power shortage: ${(energyShort * 100).toFixed(1)}% without energy.`);
-
-      const builtInactive = Math.max(0, ecoCount - ecoActive);
-      if (builtInactive > 0 && ecoLandPct < targetLandPct - 1e-6) {
-        warnings.push(`You have ${fmtCount(builtInactive)} built but inactive eco districts — activating them usually speeds growth (unless land-locked).`);
-      }
+      if (workersVal < 0 || slack < 0) warnings.push(`Worker shortage: available workers ${fmtNumber(workersVal, 2)}, slack ${fmtNumber(slack, 2)}.`);
 
       if (warnings.length) {
         ui.warnBox.style.display = 'block';
-        ui.warnBox.classList.toggle('ttgo-bad', warnings.some(w => /Starvation|shortage|Decay|growth is 0/i.test(w)));
+        ui.warnBox.classList.toggle('ttgo-bad', true);
         ui.warnBox.textContent = '• ' + warnings.join('\n• ');
       } else {
         ui.warnBox.style.display = 'none';
@@ -939,20 +964,24 @@
   }
 
   /********************************************************************
-   * Hotkey: Alt+G toggle visibility
+   * Hotkey: Alt+G toggle visibility (and docking)
    ********************************************************************/
   window.addEventListener('keydown', (e) => {
     if (!e.altKey) return;
     if (e.code !== 'KeyG') return;
+
     state.hidden = !state.hidden;
     saveSetting('hidden', state.hidden);
+
     if (ui.panel) ui.panel.classList.toggle('ttgo-hidden', state.hidden);
+    applyDockingNow();
   }, true);
 
   /********************************************************************
    * Boot
    ********************************************************************/
   ensurePanel();
+  applyDockingNow();
   update();
   setInterval(update, UPDATE_MS);
 
