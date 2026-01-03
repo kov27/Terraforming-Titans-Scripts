@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Terraforming Titans Growth Optimizer (Docked Right UI) [0.1.5]
+// @name         Terraforming Titans Growth Optimizer (Docked Right UI + Slim Minimized Tab) [0.1.6]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      0.1.5
-// @description  Docked-right overlay that estimates the fastest route to a Land%-sized ecumenopolis and full Colonist+Android occupancy. Includes page-bridge so it can read TT globals.
+// @version      0.1.6
+// @description  Docked-right optimizer overlay for Land%-based ecumenopolis growth planning. Slim minimized tab that won't cover top UI. Includes page-bridge to read TT globals.
 // @author       kov27 (ChatGPT-assisted)
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -101,7 +101,7 @@
   const UPDATE_MS = 1000;
 
   const DOCK_WIDTH_EXPANDED = 420;
-  const DOCK_WIDTH_MINIMIZED = 240;
+  const DOCK_WIDTH_MINIMIZED = 44; // slim tab (important)
 
   const state = {
     landPct: clampNumber(Number(loadSetting('landPct', 30)), 0, 100),
@@ -112,7 +112,7 @@
   };
 
   /********************************************************************
-   * Docking (push game left so panel never blocks clicks)
+   * Docking (reserve a right strip so panel doesn't block clicks)
    ********************************************************************/
   function setDockPad(px) {
     const root = document.documentElement;
@@ -162,16 +162,44 @@ html.ttgo-docked body{
   overflow: hidden;
 }
 
-/* Hidden just removes the panel; docking pad also removed in JS */
 #${PANEL_ID}.ttgo-hidden{ display:none; }
 
-/* Minimized: shrink width and collapse body so it doesn't block much even if undocked */
+/* ===== Minimized = slim vertical tab (won't cover top UI) ===== */
 #${PANEL_ID}.ttgo-minimized{
   width: ${DOCK_WIDTH_MINIMIZED}px;
+  height: 210px;
   bottom: auto;
+  top: 50%;
+  transform: translateY(-50%);
+  border-radius: 14px;
 }
 #${PANEL_ID}.ttgo-minimized .ttgo-body{ display:none; }
+#${PANEL_ID}.ttgo-minimized .ttgo-header{
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 6px;
+  height: 100%;
+  border-bottom: none;
+}
+#${PANEL_ID}.ttgo-minimized .ttgo-title{
+  gap: 8px;
+  align-items: center;
+}
+#${PANEL_ID}.ttgo-minimized .ttgo-sub{ display:none; }
+#${PANEL_ID}.ttgo-minimized .ttgo-title strong{
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  letter-spacing: .8px;
+  font-size: 12px;
+}
+#${PANEL_ID}.ttgo-minimized .ttgo-header button{
+  padding: 8px 6px;
+  border-radius: 12px;
+  width: 100%;
+}
 
+/* ===== Normal header ===== */
 #${PANEL_ID} .ttgo-header{
   display:flex; align-items:center; justify-content:space-between;
   padding:10px 10px 8px 12px;
@@ -294,7 +322,6 @@ html.ttgo-docked body{
    ********************************************************************/
   const ui = {
     panel: null,
-    body: null,
     landRange: null,
     landNumber: null,
     statusSummaryRight: null,
@@ -358,7 +385,7 @@ html.ttgo-docked body{
     const titleWrap = document.createElement('div');
     titleWrap.className = 'ttgo-title';
     const title = document.createElement('strong');
-    title.textContent = 'TT Growth Optimizer';
+    title.textContent = 'TTGO';
     const sub = document.createElement('div');
     sub.className = 'ttgo-sub';
     sub.textContent = 'Land% target → Ecumenopolis → full Colonists + Androids';
@@ -527,7 +554,6 @@ html.ttgo-docked body{
     document.body.appendChild(panel);
 
     ui.panel = panel;
-    ui.body = body;
     ui.landRange = landRange;
     ui.landNumber = landNumber;
     ui.statusSummaryRight = statusRight;
@@ -535,7 +561,6 @@ html.ttgo-docked body{
     ui.planPre = planPre;
     ui.warnBox = warn;
 
-    // Apply docking after DOM is present
     applyDockingNow();
   }
 
@@ -950,7 +975,7 @@ html.ttgo-docked body{
 
       if (warnings.length) {
         ui.warnBox.style.display = 'block';
-        ui.warnBox.classList.toggle('ttgo-bad', true);
+        ui.warnBox.classList.add('ttgo-bad');
         ui.warnBox.textContent = '• ' + warnings.join('\n• ');
       } else {
         ui.warnBox.style.display = 'none';
