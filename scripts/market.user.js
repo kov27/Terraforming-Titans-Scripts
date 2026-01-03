@@ -84,27 +84,47 @@
   }
 
   function findMarketInputs() {
-    // Look for market UI inputs
-    const inputs = Array.from(document.querySelectorAll('input[type="number"], input[type="text"]'));
+    // Strategy 1: Look for the galacticMarket object's UI elements
+    const market = getMarket();
     
     const buyInputs = new Map();
     const sellInputs = new Map();
     
+    // Strategy 2: Find all number inputs on page
+    const inputs = Array.from(document.querySelectorAll('input[type="number"], input[type="text"]'));
+    
+    log(`Found ${inputs.length} total inputs on page`);
+    
     inputs.forEach(input => {
-      // Find parent row/container
-      let parent = input.closest('tr') || input.closest('div[class*="row"]') || input.parentElement;
+      // Skip if input is not visible
+      const rect = input.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      
+      // Find parent container
+      let parent = input.closest('tr, div[class*="row"], li, .market-row');
+      if (!parent) {
+        parent = input.parentElement?.parentElement || input.parentElement;
+      }
       if (!parent) return;
       
-      // Look for resource label nearby
+      // Get all text content from parent
       const text = parent.textContent.toLowerCase();
       
+      // Also check input attributes
+      const placeholder = (input.placeholder || "").toLowerCase();
+      const id = (input.id || "").toLowerCase();
+      const className = (input.className || "").toLowerCase();
+      const combined = text + " " + placeholder + " " + id + " " + className;
+      
       // Common resource names
-      const resources = ['metal', 'silicon', 'glass', 'electronics', 'components', 
-                        'water', 'food', 'superalloys', 'energy'];
+      const resources = [
+        'metal', 'silicon', 'glass', 'electronics', 'components', 
+        'water', 'food', 'superalloys', 'energy', 'superconductors'
+      ];
       
       let foundResource = null;
       for (const res of resources) {
-        if (text.includes(res)) {
+        if (combined.includes(res)) {
           foundResource = res;
           break;
         }
@@ -112,21 +132,37 @@
       
       if (!foundResource) return;
       
-      // Determine if buy or sell input based on context
-      const isBuy = text.includes('buy') || parent.querySelector('[class*="buy"]') || 
-                    input.placeholder?.toLowerCase().includes('buy');
-      const isSell = text.includes('sell') || parent.querySelector('[class*="sell"]') || 
-                     input.placeholder?.toLowerCase().includes('sell');
+      // Determine if buy or sell based on multiple hints
+      const isBuy = combined.includes('buy') || 
+                    combined.includes('purchase') ||
+                    parent.querySelector('[class*="buy"]') !== null;
+                    
+      const isSell = combined.includes('sell') || 
+                     parent.querySelector('[class*="sell"]') !== null;
       
       if (isBuy) {
+        log(`Found BUY input for ${foundResource}:`, input);
         buyInputs.set(foundResource, input);
       } else if (isSell) {
+        log(`Found SELL input for ${foundResource}:`, input);
         sellInputs.set(foundResource, input);
       } else {
-        // Ambiguous - store both and let context decide
-        if (!buyInputs.has(foundResource)) buyInputs.set(foundResource, input);
+        // Ambiguous - might be a combined input or first of pair
+        // Check siblings
+        const nextInput = parent.querySelector('input[type="number"]:nth-of-type(2)');
+        if (nextInput && nextInput !== input) {
+          // Assume first is buy, second is sell (common pattern)
+          log(`Found input pair for ${foundResource}`);
+          buyInputs.set(foundResource, input);
+          sellInputs.set(foundResource, nextInput);
+        } else if (!buyInputs.has(foundResource)) {
+          log(`Found ambiguous input for ${foundResource} (assuming buy)`);
+          buyInputs.set(foundResource, input);
+        }
       }
     });
+    
+    log(`Detected: ${buyInputs.size} buy inputs, ${sellInputs.size} sell inputs`);
     
     return { buyInputs, sellInputs };
   }
@@ -135,14 +171,83 @@
     // Look for "Run" or "Execute" button
     const buttons = Array.from(document.querySelectorAll('button'));
     
+    log(`Scanning ${buttons.length} buttons for market run button`);
+    
     for (const btn of buttons) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      
       const text = btn.textContent.toLowerCase().trim();
-      if (text === 'run' || text === 'execute' || text === 'trade' || text.includes('run market')) {
+      const title = (btn.title || "").toLowerCase();
+      const combined = text + " " + title;
+      
+      if (combined.includes('run') || 
+          combined.includes('execute') || 
+          combined.includes('trade') ||
+          text === 'go' ||
+          combined.includes('market run')) {
+        log("Found market run button:", btn);
         return btn;
       }
     }
     
+    log("No run button found");
     return null;
+  }
+
+  // ============ DIAGNOSTICS ============
+  function generateDiagnosticLog() {
+    const market = getMarket();
+    const res = getResources();
+    const { buyInputs, sellInputs } = findMarketInputs();
+    const runBtn = findRunButton();
+
+    const log = {
+      timestamp: new Date().toISOString(),
+      scriptVersion: "3.0.1",
+      config: CFG,
+      stats: state.trades,
+      lastAction: state.lastAction,
+      
+      detection: {
+        marketObjectExists: !!market,
+        marketObjectType: market ? typeof market : "null",
+        marketObjectKeys: market ? Object.keys(market).slice(0, 20) : [],
+        buyInputsFound: buyInputs.size,
+        sellInputsFound: sellInputs.size,
+        runButtonFound: !!runBtn,
+        runButtonText: runBtn ? runBtn.textContent : null,
+        totalInputsOnPage: document.querySelectorAll('input').length,
+        totalButtonsOnPage: document.querySelectorAll('button').length,
+      },
+      
+      detectedInputs: {
+        buy: Array.from(buyInputs.keys()),
+        sell: Array.from(sellInputs.keys()),
+      },
+      
+      resourceStates: {},
+    };
+
+    // Add resource states
+    const resources = ['metal', 'silicon', 'glass', 'electronics', 'components', 
+                      'water', 'food', 'superalloys', 'energy', 'funding'];
+    
+    resources.forEach(name => {
+      const state = getResourceState('colony', name);
+      if (state) {
+        log.resourceStates[name] = {
+          value: state.value,
+          cap: state.cap,
+          prod: state.prod,
+          cons: state.cons,
+          net: state.prod - state.cons,
+          fillPercent: state.cap > 0 ? (state.value / state.cap * 100) : 0,
+        };
+      }
+    });
+
+    return JSON.stringify(log, null, 2);
   }
 
   // ============ MARKET LOGIC ============
@@ -195,26 +300,29 @@
     if (!CFG.enabled) return;
     
     const market = getMarket();
-    if (!market) {
-      state.lastAction = "Market not detected";
-      return;
-    }
+    log("Market object:", market ? "EXISTS" : "NULL");
     
     const { buyInputs, sellInputs } = findMarketInputs();
     
     if (buyInputs.size === 0 && sellInputs.size === 0) {
-      state.lastAction = "No market inputs found - is market UI open?";
+      state.lastAction = "No market inputs found - is Galactic Market tab open and visible?";
+      log("No inputs found. Total inputs on page:", document.querySelectorAll('input').length);
       return;
     }
     
     const trades = computeTrades();
     
+    let wroteCount = 0;
+    
     // Write buy amounts
     trades.buy.forEach((amount, resource) => {
       const input = buyInputs.get(resource);
       if (input && amount > 0) {
-        setInputValue(input, amount);
-        state.trades.buys++;
+        log(`Writing BUY ${amount} ${resource}`);
+        if (setInputValue(input, amount)) {
+          state.trades.buys++;
+          wroteCount++;
+        }
       }
     });
     
@@ -222,10 +330,15 @@
     trades.sell.forEach((amount, resource) => {
       const input = sellInputs.get(resource);
       if (input && amount > 0) {
-        setInputValue(input, amount);
-        state.trades.sells++;
+        log(`Writing SELL ${amount} ${resource}`);
+        if (setInputValue(input, amount)) {
+          state.trades.sells++;
+          wroteCount++;
+        }
       }
     });
+    
+    log(`Wrote ${wroteCount} trade values`);
     
     // Click run button if found
     const runBtn = findRunButton();
@@ -233,13 +346,14 @@
       // Check funding first
       const funding = getResourceState('colony', 'funding');
       if (funding && funding.value >= CFG.minFunding) {
+        log("Clicking run button");
         setTimeout(() => runBtn.click(), 100);
         state.lastAction = `Executed trades (B:${trades.buy.size} S:${trades.sell.size})`;
       } else {
         state.lastAction = `Skipped - funding too low (${funding?.value ?? 0} < ${CFG.minFunding})`;
       }
     } else {
-      state.lastAction = `Set trade amounts (B:${trades.buy.size} S:${trades.sell.size})`;
+      state.lastAction = `Set ${wroteCount} trade amounts (no run button ${runBtn ? 'or button disabled' : 'found'})`;
     }
   }
 
@@ -352,6 +466,7 @@
       <div class="controls">
         <button id="market-toggle">${CFG.enabled ? 'STOP' : 'START'}</button>
         <button id="market-scan">Scan Now</button>
+        <button id="market-copy" title="Copy diagnostic log">📋 Debug</button>
       </div>
       
       <div class="setting">
@@ -393,6 +508,19 @@
 
     hudEl.querySelector("#market-scan").addEventListener("click", () => {
       executeTrades();
+    });
+
+    hudEl.querySelector("#market-copy").addEventListener("click", async () => {
+      const diagLog = generateDiagnosticLog();
+      try {
+        await navigator.clipboard.writeText(diagLog);
+        const btn = hudEl.querySelector("#market-copy");
+        const origText = btn.textContent;
+        btn.textContent = "✓ Copied";
+        setTimeout(() => btn.textContent = origText, 1500);
+      } catch {
+        prompt("Copy this diagnostic log:", diagLog);
+      }
     });
 
     const buyFloorInput = hudEl.querySelector("#buy-floor");
