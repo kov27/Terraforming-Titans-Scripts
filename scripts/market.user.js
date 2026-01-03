@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - Galactic Market Automator (Working)
 // @namespace    tt-market-fixed
-// @version      3.0.0
+// @version      3.0.1
 // @description  Actually working market automation - finds inputs, writes values, clicks buttons
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
