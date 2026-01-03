@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Terraforming Titans Growth Optimizer (Land% Ecumenopolis Planner) [Bridge Fix]
+// @name         Terraforming Titans Growth Optimizer (Land% Ecumenopolis Planner) [Bridge Fix + Exact Counts]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      0.1.2
+// @version      0.1.3
 // @description  Overlay that estimates the fastest route to a Land%-sized ecumenopolis and full Colonist+Android occupancy. Includes page-bridge so it can read TT globals.
 // @author       kov27 (ChatGPT-assisted)
 // @match        https://html-classic.itch.zone/html/*/index.html
@@ -19,8 +19,6 @@
 
   /********************************************************************
    * PAGE BRIDGE (critical)
-   * TT uses top-level `let colonies`, `let populationModule`, etc.
-   * Userscripts cannot access global lexical bindings, only window props.
    ********************************************************************/
   function injectBridge() {
     const BRIDGE_ID = 'ttgo-bridge-injected';
@@ -40,42 +38,14 @@
       } catch (e) {}
     };
 
-    // Safe getters using typeof so we never throw ReferenceError
-    def('colonies',
-      () => (typeof colonies !== 'undefined' ? colonies : undefined),
-      (v) => { try { colonies = v; } catch (e) {} }
-    );
+    def('colonies', () => (typeof colonies !== 'undefined' ? colonies : undefined), (v) => { try { colonies = v; } catch (e) {} });
+    def('populationModule', () => (typeof populationModule !== 'undefined' ? populationModule : undefined), (v) => { try { populationModule = v; } catch (e) {} });
+    def('researchManager', () => (typeof researchManager !== 'undefined' ? researchManager : undefined), (v) => { try { researchManager = v; } catch (e) {} });
+    def('terraforming', () => (typeof terraforming !== 'undefined' ? terraforming : undefined), (v) => { try { terraforming = v; } catch (e) {} });
+    def('structures', () => (typeof structures !== 'undefined' ? structures : undefined), (v) => { try { structures = v; } catch (e) {} });
 
-    def('populationModule',
-      () => (typeof populationModule !== 'undefined' ? populationModule : undefined),
-      (v) => { try { populationModule = v; } catch (e) {} }
-    );
-
-    def('researchManager',
-      () => (typeof researchManager !== 'undefined' ? researchManager : undefined),
-      (v) => { try { researchManager = v; } catch (e) {} }
-    );
-
-    def('terraforming',
-      () => (typeof terraforming !== 'undefined' ? terraforming : undefined),
-      (v) => { try { terraforming = v; } catch (e) {} }
-    );
-
-    def('structures',
-      () => (typeof structures !== 'undefined' ? structures : undefined),
-      (v) => { try { structures = v; } catch (e) {} }
-    );
-
-    // These are often already exposed, but harmless to define.
-    def('resources',
-      () => (typeof resources !== 'undefined' ? resources : undefined),
-      (v) => { try { resources = v; } catch (e) {} }
-    );
-
-    def('buildings',
-      () => (typeof buildings !== 'undefined' ? buildings : undefined),
-      (v) => { try { buildings = v; } catch (e) {} }
-    );
+    def('resources', () => (typeof resources !== 'undefined' ? resources : undefined), (v) => { try { resources = v; } catch (e) {} });
+    def('buildings', () => (typeof buildings !== 'undefined' ? buildings : undefined), (v) => { try { buildings = v; } catch (e) {} });
   } catch (e) {}
 })();
 `;
@@ -89,7 +59,7 @@
   injectBridge();
 
   /********************************************************************
-   * Storage helpers (GM_* with localStorage fallback)
+   * Storage helpers
    ********************************************************************/
   const STORE_PREFIX = 'TTGO:';
   const hasGMGet = typeof GM_getValue === 'function';
@@ -109,7 +79,7 @@
   }
 
   /********************************************************************
-   * Globals access (use unsafeWindow if present)
+   * Globals access
    ********************************************************************/
   const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
@@ -119,7 +89,6 @@
       colonies: W.colonies,
       populationModule: W.populationModule,
       researchManager: W.researchManager,
-      terraforming: W.terraforming,
       formatNumberFn: typeof W.formatNumber === 'function' ? W.formatNumber : null,
       bridgeOk: !!W.__TTGO_BRIDGE_OK__,
     };
@@ -283,7 +252,7 @@
   }
 
   /********************************************************************
-   * UI (stable DOM — no rebuilding on tick)
+   * UI
    ********************************************************************/
   const ui = {
     panel: null,
@@ -295,7 +264,6 @@
     planPre: null,
     warnBox: null,
 
-    // Status fields
     sGame: null,
     sBridge: null,
     sDbg: null,
@@ -307,12 +275,15 @@
     sEcoReserved: null,
     sEcoLandPct: null,
     sEcoReqLand: null,
-    sEcoCount: null,
+    sEcoBuilt: null,
     sEcoActive: null,
     sEcoBuiltInactive: null,
 
     sTargetLandPct: null,
     sTargetEcoActive: null,
+    sTargetAchievedPct: null,
+    sNextStepPct: null,
+
     sNeedBuild: null,
     sNeedActivate: null,
 
@@ -454,12 +425,15 @@
       ['Eco land reserved', '—', 'sEcoReserved'],
       ['Eco land %', '—', 'sEcoLandPct'],
       ['Eco land per district', '—', 'sEcoReqLand'],
-      ['Eco built', '—', 'sEcoCount'],
+      ['Eco built', '—', 'sEcoBuilt'],
       ['Eco active', '—', 'sEcoActive'],
       ['Built but inactive', '—', 'sEcoBuiltInactive'],
 
       ['Target Land %', '—', 'sTargetLandPct'],
       ['Target eco active', '—', 'sTargetEcoActive'],
+      ['Achieved eco land %', '—', 'sTargetAchievedPct'],
+      ['+1 district would be', '—', 'sNextStepPct'],
+
       ['Need to build', '—', 'sNeedBuild'],
       ['Need to activate', '—', 'sNeedActivate'],
 
@@ -565,8 +539,15 @@
   }
 
   /********************************************************************
-   * Helpers
+   * Helpers / formatting
    ********************************************************************/
+  const countFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+  function fmtCount(n) {
+    if (!Number.isFinite(n)) return '—';
+    return countFmt.format(Math.round(n));
+  }
+
   function clampNumber(x, lo, hi) {
     if (!Number.isFinite(x)) return lo;
     return Math.max(lo, Math.min(hi, x));
@@ -582,11 +563,6 @@
     if (abs >= 1e6) return (n / 1e6).toFixed(decimals) + 'M';
     if (abs >= 1e3) return (n / 1e3).toFixed(decimals) + 'K';
     return n.toFixed(decimals);
-  }
-
-  function fmtInt(n) {
-    if (!Number.isFinite(n)) return '—';
-    return fmtNumber(Math.round(n), 0);
   }
 
   function fmtPct(n, decimals = 1) {
@@ -641,7 +617,7 @@
   }
 
   /********************************************************************
-   * Math (logistic with decay)
+   * Math
    ********************************************************************/
   function etaLogisticToFraction(N0, K, a, d, fraction = 0.999) {
     if (!Number.isFinite(N0) || !Number.isFinite(K) || !Number.isFinite(a) || !Number.isFinite(d)) return { ok: false, reason: 'bad-input' };
@@ -728,27 +704,6 @@
     return worst;
   }
 
-  function etaToAffordResearch(research) {
-    const { resources } = getGameRefs();
-    if (!resources || !research || !research.cost) return '—';
-    if (research.isResearched) return 'done';
-
-    const entries = Object.entries(research.cost || {});
-    if (!entries.length) return '—';
-
-    const [costKey, costVal] = entries[0];
-    const resObj = resources.colony?.[costKey];
-    if (!resObj) return '—';
-
-    const cost = Number(costVal) || 0;
-    const have = Number(resObj.value) || 0;
-    if (have >= cost) return 'ready';
-
-    const r = netRate(resObj);
-    if (r <= 0) return 'blocked (net ≤ 0)';
-    return formatDuration((cost - have) / r);
-  }
-
   function reasonToHuman(reason, extra) {
     if (reason === 'no-pop') return 'No colonists yet';
     if (reason === 'no-cap') return 'No housing cap';
@@ -758,7 +713,7 @@
   }
 
   /********************************************************************
-   * Main update loop (wrapped so one bug never freezes the UI)
+   * Main update loop
    ********************************************************************/
   function update() {
     try {
@@ -779,12 +734,7 @@
         setText(ui.sGame, 'Waiting for TT globals…');
         ui.statusSummaryRight.textContent = 'Not ready';
         ui.planSummaryRight.textContent = 'Not ready';
-        ui.planPre.textContent =
-          'Waiting for game state…\n\n' +
-          'If this stays stuck:\n' +
-          '• Hard refresh (Ctrl+F5)\n' +
-          '• Ensure the script is running inside the game iframe URL (hwcdn/itch html/*/index.html)\n' +
-          '• Console: window.__TTGO_BRIDGE_OK__ (should be true)';
+        ui.planPre.textContent = 'Waiting for game state…';
         ui.warnBox.style.display = 'none';
         return;
       }
@@ -800,26 +750,7 @@
 
       const eco = colonies.t7_colony;
       if (!eco) {
-        setText(ui.sEcoReserved, '—');
-        setText(ui.sEcoLandPct, '—');
-        setText(ui.sEcoReqLand, '—');
-        setText(ui.sEcoCount, '—');
-        setText(ui.sEcoActive, '—');
-        setText(ui.sEcoBuiltInactive, '—');
-
-        setText(ui.sTargetLandPct, fmtPct(state.landPct, 1));
-        setText(ui.sTargetEcoActive, '—');
-        setText(ui.sNeedBuild, '—');
-        setText(ui.sNeedActivate, '—');
-
-        ui.planPre.textContent =
-          'Ecumenopolis (t7_colony) not detected.\n\n' +
-          'Next steps (likely):\n' +
-          '• Unlock Superalloys\n' +
-          '• Research Ecumenopolis District (t7_colony)\n\n' +
-          'Once t7 exists, this overlay computes targets + ETAs.';
-        ui.statusSummaryRight.textContent = 't7 missing';
-        ui.planSummaryRight.textContent = 'research → t7';
+        ui.planPre.textContent = 'Ecumenopolis (t7_colony) not detected.';
         ui.warnBox.style.display = 'none';
         return;
       }
@@ -837,23 +768,40 @@
       setText(ui.sEcoReserved, fmtNumber(ecoReserved, 2));
       setText(ui.sEcoLandPct, fmtPct(ecoLandPct, 3));
       setText(ui.sEcoReqLand, ecoReqLand > 0 ? fmtNumber(ecoReqLand, 0) : '—');
-      setText(ui.sEcoCount, fmtInt(ecoCount));
-      setText(ui.sEcoActive, fmtInt(ecoActive));
-      setText(ui.sEcoBuiltInactive, fmtInt(Math.max(0, ecoCount - ecoActive)));
+      setText(ui.sEcoBuilt, fmtCount(ecoCount));
+      setText(ui.sEcoActive, fmtCount(ecoActive));
+      setText(ui.sEcoBuiltInactive, fmtCount(Math.max(0, ecoCount - ecoActive)));
 
-      // Target Land% → target active eco districts
+      // ===== Land% target → districts (FLOOR + CLAMP) =====
       const targetLandPct = state.landPct;
-      const targetEcoReserved = totalLand * (targetLandPct / 100);
-      const targetEcoActive = ecoReqLand > 0 ? Math.ceil(targetEcoReserved / ecoReqLand) : 0;
-
       setText(ui.sTargetLandPct, fmtPct(targetLandPct, 1));
-      setText(ui.sTargetEcoActive, fmtInt(targetEcoActive));
+
+      const maxEcoByLand = (ecoReqLand > 0 && totalLand > 0) ? Math.floor(totalLand / ecoReqLand) : 0;
+      const desiredReserved = totalLand * (targetLandPct / 100);
+
+      // floor = do NOT exceed target % (and never exceed total land)
+      let targetEcoActive = (ecoReqLand > 0) ? Math.floor((desiredReserved / ecoReqLand) + 1e-9) : 0;
+      if (maxEcoByLand > 0) targetEcoActive = Math.min(targetEcoActive, maxEcoByLand);
+      targetEcoActive = Math.max(0, targetEcoActive);
+
+      // Achieved % at that discrete district count
+      const achievedReserved = targetEcoActive * ecoReqLand;
+      const achievedPct = totalLand > 0 ? (achievedReserved / totalLand) * 100 : 0;
+
+      // What +1 district would do (if possible)
+      const nextEco = Math.min(targetEcoActive + 1, maxEcoByLand);
+      const nextPct = (nextEco !== targetEcoActive && totalLand > 0)
+        ? ((nextEco * ecoReqLand) / totalLand) * 100
+        : NaN;
+
+      setText(ui.sTargetEcoActive, fmtCount(targetEcoActive));
+      setText(ui.sTargetAchievedPct, fmtPct(achievedPct, 3));
+      setText(ui.sNextStepPct, Number.isFinite(nextPct) ? fmtPct(nextPct, 3) : '— (max)');
 
       const needBuild = Math.max(0, targetEcoActive - ecoCount);
       const needActivate = Math.max(0, targetEcoActive - ecoActive);
-
-      setText(ui.sNeedBuild, fmtInt(needBuild));
-      setText(ui.sNeedActivate, fmtInt(needActivate));
+      setText(ui.sNeedBuild, fmtCount(needBuild));
+      setText(ui.sNeedActivate, fmtCount(needActivate));
 
       // Caps now vs target (approx)
       const colonists = resources.colony.colonists;
@@ -864,7 +812,6 @@
 
       const colonistsCapNow = Number(colonists?.cap) || 0;
       const androidsCapNow = Number(androids?.cap) || 0;
-
       setText(ui.sColonistsCapNow, fmtNumber(colonistsCapNow, 2));
       setText(ui.sAndroidsCapNow, fmtNumber(androidsCapNow, 2));
 
@@ -894,7 +841,7 @@
         : 0;
       setText(ui.sGrowthNow, `${signedStr(fmtNumber(growthPctNow, 3))}%/s`);
 
-      // Build ETA, then fill ETA (colonists logistic, androids linear)
+      // Build ETA, then fill ETA
       const buildEta = estimateBuildEtaSeconds(eco, needBuild);
       const buildEtaStr = Number.isFinite(buildEta) ? formatDuration(buildEta) : '∞';
 
@@ -935,26 +882,28 @@
       setText(ui.sWorkersReq, fmtNumber(workersReq, 2));
       setText(ui.sWorkersSlack, `${slack >= 0 ? '+' : ''}${fmtNumber(slack, 2)}`);
 
+      // Summary right: avoid insane ratio if capFactorNow ~ 0
+      const ratioStr = (capFactorNow > 0.0001)
+        ? ` | capFactor×${(capFactorTarget / capFactorNow).toFixed(2)}`
+        : '';
       ui.statusSummaryRight.textContent =
-        `${fmtPct(ecoLandPct, 2)} → ${fmtPct(targetLandPct, 1)} | capFactor ×${(capFactorTarget / Math.max(1e-9, capFactorNow)).toFixed(2)}`;
+        `${fmtPct(ecoLandPct, 2)} → ${fmtPct(targetLandPct, 1)} | capFactor ${fmtPct(capFactorNow * 100, 2)}→${fmtPct(capFactorTarget * 100, 2)}${ratioStr}`;
 
-      // Plan text
+      // Plan
       const planLines = [];
-      planLines.push(`Target: ${fmtPct(targetLandPct, 1)} land in Ecumenopolis → target active districts: ${fmtInt(targetEcoActive)}`);
+      planLines.push(`Target: ${fmtPct(targetLandPct, 1)} land in Ecumenopolis`);
+      planLines.push(`• Discrete target districts: ${fmtCount(targetEcoActive)} (achieves ${fmtPct(achievedPct, 3)})`);
+      if (Number.isFinite(nextPct)) planLines.push(`• Next district would be: ${fmtPct(nextPct, 3)}`);
+      else planLines.push(`• Next district: — (already at max by land)`);
+
       planLines.push('');
-      planLines.push(`Build: need +${fmtInt(needBuild)} | Activate: need +${fmtInt(needActivate)}`);
-      planLines.push(`Est. build gating ETA (slowest needed resource): ${buildEtaStr}`);
+      planLines.push(`Build: need +${fmtCount(needBuild)} | Activate: need +${fmtCount(needActivate)}`);
+      planLines.push(`Est. build gating ETA (slowest resource): ${buildEtaStr}`);
       planLines.push('');
       planLines.push(`Fill (99.9%): Colonists ${etaColonistsStr} | Androids ${etaAnd.ok ? formatDuration(etaAnd.seconds) : etaAnd.reason}`);
       planLines.push('');
-      planLines.push(`Active-but-empty districts help because they raise K (cap), increasing (1 − pop/cap).`);
+      planLines.push(`Active-but-empty districts are optimal for growth: they raise K (cap), boosting (1 − pop/cap).`);
       planLines.push(`Capacity factor now ${fmtPct(capFactorNow * 100, 2)} → target ${fmtPct(capFactorTarget * 100, 2)}`);
-
-      // Optional research notes
-      if (researchManager && typeof researchManager.getResearchById === 'function') {
-        const rEco = researchManager.getResearchById('t7_colony');
-        if (rEco && !rEco.isResearched) planLines.push(`\nResearch: Ecumenopolis not researched yet. ETA to afford: ${etaToAffordResearch(rEco)}`);
-      }
 
       ui.planPre.textContent = planLines.join('\n');
       ui.planSummaryRight.textContent = `build ${buildEtaStr} | fill ${etaColonistsStr}`;
@@ -971,7 +920,7 @@
 
       const builtInactive = Math.max(0, ecoCount - ecoActive);
       if (builtInactive > 0 && ecoLandPct < targetLandPct - 1e-6) {
-        warnings.push(`You have ${fmtInt(builtInactive)} built but inactive eco districts — activating them usually speeds growth (unless land-locked).`);
+        warnings.push(`You have ${fmtCount(builtInactive)} built but inactive eco districts — activating them usually speeds growth (unless land-locked).`);
       }
 
       if (warnings.length) {
@@ -982,12 +931,9 @@
         ui.warnBox.style.display = 'none';
       }
     } catch (e) {
-      // Don’t let a crash freeze everything; show the error in the panel.
       try {
         setText(ui.sErr, (e && (e.message || String(e))) ? (e.message || String(e)) : 'Unknown error');
-        ui.planPre.textContent =
-          'Update crashed.\n\n' +
-          'This is recoverable — please copy the "Last error" line from Status.\n';
+        ui.planPre.textContent = 'Update crashed. Copy “Last error” from Status.';
       } catch (_) {}
     }
   }
