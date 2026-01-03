@@ -1,1013 +1,1354 @@
 // ==UserScript==
-// @name         Terraforming Titans Growth Optimizer (Docked Right UI + Slim Minimized Tab) [0.1.6]
+// @name         Terraforming Titans Growth Optimizer (Actionable Eco Plan) [Docked Right]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      0.1.6
-// @description  Docked-right optimizer overlay for Land%-based ecumenopolis growth planning. Slim minimized tab that won't cover top UI. Includes page-bridge to read TT globals.
-// @author       kov27 (ChatGPT-assisted)
+// @version      0.3.0
+// @description  Docked overlay that outputs concrete next actions (build/activate/toggle) to reach a fully-built, fully-populated Ecumenopolis (Colonists + Androids).
+// @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
 // @match        https://*.hwcdn.net/html/*/index.html
-// @run-at       document-idle
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_addStyle
+// @grant        none
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  /********************************************************************
-   * PAGE BRIDGE (critical)
-   ********************************************************************/
-  function injectBridge() {
-    const BRIDGE_ID = 'ttgo-bridge-injected';
-    if (document.getElementById(BRIDGE_ID)) return;
-
-    const code = `
-(() => {
-  try {
-    if (window.__TTGO_BRIDGE_OK__) return;
-    window.__TTGO_BRIDGE_OK__ = true;
-
-    const def = (name, getter, setter) => {
-      try {
-        const d = Object.getOwnPropertyDescriptor(window, name);
-        if (d && (d.get || d.value !== undefined)) return;
-        Object.defineProperty(window, name, { get: getter, set: setter, configurable: true });
-      } catch (e) {}
-    };
-
-    def('colonies', () => (typeof colonies !== 'undefined' ? colonies : undefined), (v) => { try { colonies = v; } catch (e) {} });
-    def('populationModule', () => (typeof populationModule !== 'undefined' ? populationModule : undefined), (v) => { try { populationModule = v; } catch (e) {} });
-    def('researchManager', () => (typeof researchManager !== 'undefined' ? researchManager : undefined), (v) => { try { researchManager = v; } catch (e) {} });
-    def('terraforming', () => (typeof terraforming !== 'undefined' ? terraforming : undefined), (v) => { try { terraforming = v; } catch (e) {} });
-    def('structures', () => (typeof structures !== 'undefined' ? structures : undefined), (v) => { try { structures = v; } catch (e) {} });
-
-    def('resources', () => (typeof resources !== 'undefined' ? resources : undefined), (v) => { try { resources = v; } catch (e) {} });
-    def('buildings', () => (typeof buildings !== 'undefined' ? buildings : undefined), (v) => { try { buildings = v; } catch (e) {} });
-  } catch (e) {}
-})();
-`;
-    const s = document.createElement('script');
-    s.id = BRIDGE_ID;
-    s.textContent = code;
-    (document.documentElement || document.head || document.body).appendChild(s);
-    s.remove();
-  }
-
-  injectBridge();
-
-  /********************************************************************
-   * Storage helpers
-   ********************************************************************/
-  const STORE_PREFIX = 'TTGO:';
-  const hasGMGet = typeof GM_getValue === 'function';
-  const hasGMSet = typeof GM_setValue === 'function';
-
-  function loadSetting(key, def) {
-    try { if (hasGMGet) return GM_getValue(STORE_PREFIX + key, def); } catch (_) {}
-    try {
-      const raw = localStorage.getItem(STORE_PREFIX + key);
-      return raw == null ? def : JSON.parse(raw);
-    } catch (_) { return def; }
-  }
-
-  function saveSetting(key, val) {
-    try { if (hasGMSet) return GM_setValue(STORE_PREFIX + key, val); } catch (_) {}
-    try { localStorage.setItem(STORE_PREFIX + key, JSON.stringify(val)); } catch (_) {}
-  }
-
-  /********************************************************************
-   * Globals access
-   ********************************************************************/
-  const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-
-  function getGameRefs() {
-    return {
-      resources: W.resources,
-      colonies: W.colonies,
-      populationModule: W.populationModule,
-      researchManager: W.researchManager,
-      formatNumberFn: typeof W.formatNumber === 'function' ? W.formatNumber : null,
-      bridgeOk: !!W.__TTGO_BRIDGE_OK__,
-    };
-  }
-
-  /********************************************************************
-   * Config / State
-   ********************************************************************/
-  const PANEL_ID = 'ttgo-panel';
-  const UPDATE_MS = 1000;
-
-  const DOCK_WIDTH_EXPANDED = 420;
-  const DOCK_WIDTH_MINIMIZED = 44; // slim tab (important)
-
-  const state = {
-    landPct: clampNumber(Number(loadSetting('landPct', 30)), 0, 100),
-    expandedStatus: Boolean(loadSetting('expandedStatus', true)),
-    expandedPlan: Boolean(loadSetting('expandedPlan', true)),
-    minimized: Boolean(loadSetting('minimized', false)),
-    hidden: Boolean(loadSetting('hidden', false)),
+  const APP = {
+    key: 'TTGO',
+    version: '0.3.0',
+    bridgeKey: '__TTGO_BRIDGE__',
+    uiId: 'ttgo-root',
+    storageKey: 'TTGO_SETTINGS_V1',
   };
 
-  /********************************************************************
-   * Docking (reserve a right strip so panel doesn't block clicks)
-   ********************************************************************/
-  function setDockPad(px) {
-    const root = document.documentElement;
-    if (px > 0) {
-      root.classList.add('ttgo-docked');
-      root.style.setProperty('--ttgo-dock-pad', `${px}px`);
-    } else {
-      root.classList.remove('ttgo-docked');
-      root.style.setProperty('--ttgo-dock-pad', `0px`);
+  // ---------- Utilities ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const now = () => Date.now();
+
+  function safeNum(n, d = 0) {
+    return Number.isFinite(n) ? n : d;
+  }
+
+  function fmt(n, digits = 2) {
+    n = safeNum(n, 0);
+    const sign = n < 0 ? '-' : '';
+    n = Math.abs(n);
+
+    const units = [
+      ['', 1],
+      ['k', 1e3],
+      ['M', 1e6],
+      ['B', 1e9],
+      ['T', 1e12],
+      ['Qa', 1e15],
+      ['Qi', 1e18],
+      ['Sx', 1e21],
+      ['Sp', 1e24],
+      ['Oc', 1e27],
+      ['No', 1e30],
+      ['Dc', 1e33],
+    ];
+
+    let u = units[0];
+    for (let i = units.length - 1; i >= 0; i--) {
+      if (n >= units[i][1]) {
+        u = units[i];
+        break;
+      }
+    }
+    const val = u[1] === 1 ? n : n / u[1];
+    const d = val >= 100 ? 0 : val >= 10 ? 1 : digits;
+    return `${sign}${val.toFixed(d)}${u[0]}`;
+  }
+
+  function fmtPct(v, digits = 1) {
+    v = safeNum(v, 0);
+    return `${(v * 100).toFixed(digits)}%`;
+  }
+
+  function fmtETA(seconds) {
+    seconds = safeNum(seconds, Infinity);
+    if (!Number.isFinite(seconds)) return '∞';
+    if (seconds < 1) return '<1s';
+    if (seconds < 60) return `${Math.ceil(seconds)}s`;
+    const m = Math.floor(seconds / 60);
+    const s = Math.ceil(seconds - m * 60);
+    if (m < 60) return `${m}m ${s}s`;
+    const h = Math.floor(m / 60);
+    const mm = m - h * 60;
+    if (h < 48) return `${h}h ${mm}m`;
+    const d = Math.floor(h / 24);
+    const hh = h - d * 24;
+    return `${d}d ${hh}h`;
+  }
+
+  function addStyle(cssText) {
+    const el = document.createElement('style');
+    el.textContent = cssText;
+    document.documentElement.appendChild(el);
+    return el;
+  }
+
+  // ---------- Bridge Injection ----------
+  function injectBridge() {
+    if (window[APP.bridgeKey]) return;
+
+    const code = function (BRIDGE_KEY) {
+      try {
+        if (window[BRIDGE_KEY]) return;
+
+        const RES_LIST = [
+          ['surface', 'land'],
+          ['colony', 'metal'],
+          ['colony', 'water'],
+          ['colony', 'glass'],
+          ['colony', 'superalloys'],
+          ['colony', 'silicon'],
+          ['colony', 'food'],
+          ['colony', 'energy'],
+          ['colony', 'electronics'],
+          ['colony', 'androids'],
+          ['colony', 'colonists'],
+          ['colony', 'workers'],
+          ['colony', 'components'],
+        ];
+
+        const STRUCT_CANDIDATES = [
+          // Colonies
+          't1_colony',
+          't2_colony',
+          't3_colony',
+          't4_colony',
+          't5_colony',
+          't6_colony',
+          't7_colony',
+
+          // Production chain for eco build + happiness + pop seeding
+          'oreMine',
+          'recyclingFacility',
+          'waterPump',
+          'sandQuarry',
+          'glassSmelter',
+          'superalloyFoundry',
+          'electronicsFactory',
+          'androidFactory',
+          'cloningFacility',
+          'hydroponicFarm',
+
+          // Energy options
+          'dysonReceiver',
+          'fusionPowerPlant',
+          'nuclearPowerPlant',
+          'geothermalGenerator',
+          'windTurbine',
+          'solarPanel',
+        ];
+
+        function getRoot() {
+          const res = (typeof resources !== 'undefined' ? resources : globalThis.resources) || null;
+          const bld = (typeof buildings !== 'undefined' ? buildings : globalThis.buildings) || null;
+          const cols = (typeof colonies !== 'undefined' ? colonies : globalThis.colonies) || null;
+          const pop = (typeof populationModule !== 'undefined' ? populationModule : globalThis.populationModule) || null;
+          const structs = (typeof structures !== 'undefined' ? structures : globalThis.structures) || null;
+          const ge = (typeof globalEffects !== 'undefined' ? globalEffects : globalThis.globalEffects) || null;
+          return { res, bld, cols, pop, structs, ge };
+        }
+
+        function safeNum(n, d = 0) {
+          return Number.isFinite(n) ? n : d;
+        }
+
+        function pickStructure(key, root) {
+          const s = root.structs && root.structs[key];
+          if (s) return s;
+          const c = root.cols && root.cols[key];
+          if (c) return c;
+          const b = root.bld && root.bld[key];
+          if (b) return b;
+          return null;
+        }
+
+        function resSnapshot(root) {
+          const out = {};
+          for (const [cat, name] of RES_LIST) {
+            const r = root.res?.[cat]?.[name];
+            if (!r) continue;
+            out[`${cat}.${name}`] = {
+              v: safeNum(r.value),
+              cap: safeNum(r.cap),
+              prod: safeNum(r.productionRate),
+              cons: safeNum(r.consumptionRate),
+              res: safeNum(r.reserved),
+              displayName: r.displayName || name,
+            };
+          }
+
+          // land reserved breakdown
+          const land = root.res?.surface?.land;
+          const breakdown = [];
+          if (land && land.reservedSources && typeof land.reservedSources === 'object') {
+            for (const [k, v] of Object.entries(land.reservedSources)) {
+              if (!Number.isFinite(v) || v <= 0) continue;
+              breakdown.push([k, v]);
+            }
+            breakdown.sort((a, b) => b[1] - a[1]);
+          }
+
+          out.__landBreakdown = breakdown.slice(0, 10);
+          return out;
+        }
+
+        function structureSnapshot(root) {
+          const out = {};
+          for (const key of STRUCT_CANDIDATES) {
+            const s = pickStructure(key, root);
+            if (!s) continue;
+            out[key] = {
+              key,
+              name: s.name || key,
+              displayName: s.displayName || s.name || key,
+              count: safeNum(s.count),
+              active: safeNum(s.active),
+              unlocked: !!s.unlocked,
+              requiresLand: safeNum(s.requiresLand),
+              landAffordCount: typeof s.landAffordCount === 'function' ? safeNum(s.landAffordCount()) : 0,
+              maxBuildable: typeof s.maxBuildable === 'function' ? safeNum(s.maxBuildable(0)) : 0,
+              canAfford1: typeof s.canAfford === 'function' ? !!s.canAfford(1) : false,
+              happiness: safeNum(s.happiness),
+              comfort: typeof s.getComfort === 'function' ? safeNum(s.getComfort()) : safeNum(s.baseComfort),
+              filledNeeds: s.filledNeeds ? { ...s.filledNeeds } : null,
+              luxury: s.luxuryResourcesEnabled ? { ...s.luxuryResourcesEnabled } : null,
+              storageColonists: safeNum(s.storage?.colony?.colonists),
+              storageAndroids: safeNum(s.storage?.colony?.androids),
+            };
+          }
+          return out;
+        }
+
+        function getCostBlockers(root, key, buildCount = 1) {
+          const s = pickStructure(key, root);
+          if (!s || typeof s.getEffectiveCost !== 'function') return [];
+          const blockers = [];
+
+          const cost = s.getEffectiveCost(buildCount) || {};
+          for (const cat in cost) {
+            for (const resName in cost[cat]) {
+              const need = safeNum(cost[cat][resName]);
+              if (need <= 0) continue;
+              const r = root.res?.[cat]?.[resName];
+              const have = r ? safeNum(r.value - r.reserved) : 0;
+              if (have + 1e-12 < need) {
+                blockers.push({
+                  type: 'resource',
+                  key: `${cat}.${resName}`,
+                  category: cat,
+                  resource: resName,
+                  need,
+                  have,
+                  missing: need - have,
+                });
+              }
+            }
+          }
+
+          if (s.requiresLand) {
+            const land = root.res?.surface?.land;
+            const haveLand = land ? safeNum(land.value - land.reserved) : 0;
+            const needLand = safeNum(s.requiresLand) * buildCount;
+            if (haveLand + 1e-12 < needLand) {
+              blockers.push({
+                type: 'land',
+                key: 'surface.land',
+                category: 'surface',
+                resource: 'land',
+                need: needLand,
+                have: haveLand,
+                missing: needLand - haveLand,
+              });
+            }
+          }
+
+          return blockers;
+        }
+
+        function buildStructureByKey(key, count = 1, activate = true) {
+          const root = getRoot();
+          const s = pickStructure(key, root);
+          if (!s || typeof s.build !== 'function') {
+            return { ok: false, error: 'structure_not_found' };
+          }
+          count = Math.max(1, Math.floor(count));
+          try {
+            const ok = s.build(count, !!activate);
+            return { ok: !!ok };
+          } catch (e) {
+            return { ok: false, error: String(e?.message || e) };
+          }
+        }
+
+        function setActive(key, targetActive) {
+          const root = getRoot();
+          const s = pickStructure(key, root);
+          if (!s) return { ok: false, error: 'structure_not_found' };
+
+          const desired = Math.max(0, Math.min(Math.floor(targetActive), Math.floor(s.count || 0)));
+          const current = Math.floor(s.active || 0);
+          const delta = desired - current;
+          if (delta === 0) return { ok: true };
+
+          try {
+            if (s.requiresLand && typeof s.adjustLand === 'function') {
+              let d = delta;
+              if (d > 0 && typeof s.landAffordCount === 'function') {
+                d = Math.min(d, s.landAffordCount());
+              }
+              if (d !== 0) s.adjustLand(d);
+            }
+            const newActive = Math.max(0, Math.min(current + delta, Math.floor(s.count || 0)));
+            s.active = newActive;
+            if (typeof s.updateResourceStorage === 'function') s.updateResourceStorage(root.res);
+            return { ok: true };
+          } catch (e) {
+            return { ok: false, error: String(e?.message || e) };
+          }
+        }
+
+        function setLuxury(key, resourceName, enabled) {
+          const root = getRoot();
+          const s = pickStructure(key, root);
+          if (!s || !s.luxuryResourcesEnabled) return { ok: false, error: 'not_supported' };
+          try {
+            s.luxuryResourcesEnabled[resourceName] = !!enabled;
+            if (typeof s.rebuildFilledNeeds === 'function') s.rebuildFilledNeeds();
+            if (typeof globalThis.invalidateColonyNeedCache === 'function') globalThis.invalidateColonyNeedCache();
+            return { ok: true };
+          } catch (e) {
+            return { ok: false, error: String(e?.message || e) };
+          }
+        }
+
+        function scrollTo(key) {
+          try {
+            const btn = document.getElementById(`build-${key}`);
+            const row = btn ? btn.closest('.building-row, .combined-building-row') : null;
+            const el = row || btn;
+            if (!el) return { ok: false, error: 'not_found' };
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('ttgo-flash');
+            setTimeout(() => el.classList.remove('ttgo-flash'), 900);
+            return { ok: true };
+          } catch (e) {
+            return { ok: false, error: String(e?.message || e) };
+          }
+        }
+
+        function snapshot() {
+          const root = getRoot();
+          const ok = !!(root.res && (root.bld || root.structs) && root.pop);
+          const pop = root.pop;
+
+          const popInfo = pop
+            ? {
+                growthPerSec:
+                  typeof pop.getCurrentGrowthPerSecond === 'function' ? safeNum(pop.getCurrentGrowthPerSecond()) : 0,
+                growthPct:
+                  typeof pop.getCurrentGrowthPercent === 'function' ? safeNum(pop.getCurrentGrowthPercent()) : 0,
+                starvationShortage: safeNum(pop.starvationShortage),
+                energyShortage: safeNum(pop.energyShortage),
+                componentsCoverage: safeNum(pop.componentsCoverage, 1),
+                gravityDecayRate: safeNum(pop.gravityDecayRate),
+              }
+            : null;
+
+          return {
+            ok,
+            ts: Date.now(),
+            resources: resSnapshot(root),
+            structures: structureSnapshot(root),
+            pop: popInfo,
+          };
+        }
+
+        window[BRIDGE_KEY] = {
+          version: '1.0',
+          snapshot,
+          getCostBlockers: (key, count) => getCostBlockers(getRoot(), key, count),
+          build: buildStructureByKey,
+          setActive,
+          setLuxury,
+          scrollTo,
+        };
+      } catch (e) {
+        // swallow
+      }
+    };
+
+    const el = document.createElement('script');
+    el.textContent = `;(${code.toString()})(${JSON.stringify(APP.bridgeKey)});`;
+    document.documentElement.appendChild(el);
+    el.remove();
+  }
+
+  function getBridge() {
+    return window[APP.bridgeKey] || null;
+  }
+
+  // ---------- Settings ----------
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(APP.storageKey);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
     }
   }
 
-  function applyDockingNow() {
-    if (state.hidden) return setDockPad(0);
-    setDockPad(state.minimized ? DOCK_WIDTH_MINIMIZED : DOCK_WIDTH_EXPANDED);
+  function saveSettings(s) {
+    try {
+      localStorage.setItem(APP.storageKey, JSON.stringify(s));
+    } catch {
+      // ignore
+    }
   }
 
-  /********************************************************************
-   * CSS
-   ********************************************************************/
-  const css = `
-:root{ --ttgo-dock-pad: 0px; }
+  const settings = Object.assign(
+    {
+      minimized: false,
+      targetLandPct: 100,
+      actionCadenceSec: 10, // "make next district affordable within Xs" for build recommendations
+      fillTarget: 0.999, // 99.9%
+      dock: { right: 8, top: 64, width: 380, height: 0 }, // height computed
+    },
+    loadSettings() || {}
+  );
 
-/* Reserve space for the docked panel */
-html.ttgo-docked body{
-  padding-right: var(--ttgo-dock-pad) !important;
-  box-sizing: border-box;
-}
-
-#${PANEL_ID}{
-  position: fixed;
-  top: 8px;
-  right: 8px;
-  bottom: 8px;
-  width: ${DOCK_WIDTH_EXPANDED}px;
-  z-index: 999999;
-  display: flex;
-  flex-direction: column;
-  border-radius: 14px;
+  // ---------- UI ----------
+  const CSS = `
+#${APP.uiId}{
+  position:fixed;
+  z-index:999999;
+  right:${settings.dock.right}px;
+  top:${settings.dock.top}px;
+  width:${settings.dock.width}px;
+  max-height: calc(100vh - ${settings.dock.top + 12}px);
+  background: rgba(28,34,42,0.95);
+  color: #e9eef5;
   border: 1px solid rgba(255,255,255,0.10);
-  background: rgba(34, 39, 46, 0.94);
-  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-  color: rgba(255,255,255,0.92);
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-  font-size: 12.5px;
-  line-height: 1.25;
-  overflow: hidden;
-}
-
-#${PANEL_ID}.ttgo-hidden{ display:none; }
-
-/* ===== Minimized = slim vertical tab (won't cover top UI) ===== */
-#${PANEL_ID}.ttgo-minimized{
-  width: ${DOCK_WIDTH_MINIMIZED}px;
-  height: 210px;
-  bottom: auto;
-  top: 50%;
-  transform: translateY(-50%);
-  border-radius: 14px;
-}
-#${PANEL_ID}.ttgo-minimized .ttgo-body{ display:none; }
-#${PANEL_ID}.ttgo-minimized .ttgo-header{
-  flex-direction: column;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 6px;
-  height: 100%;
-  border-bottom: none;
-}
-#${PANEL_ID}.ttgo-minimized .ttgo-title{
-  gap: 8px;
-  align-items: center;
-}
-#${PANEL_ID}.ttgo-minimized .ttgo-sub{ display:none; }
-#${PANEL_ID}.ttgo-minimized .ttgo-title strong{
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-  letter-spacing: .8px;
-  font-size: 12px;
-}
-#${PANEL_ID}.ttgo-minimized .ttgo-header button{
-  padding: 8px 6px;
   border-radius: 12px;
-  width: 100%;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji","Segoe UI Emoji";
+  overflow:hidden;
+  pointer-events:auto;
 }
-
-/* ===== Normal header ===== */
-#${PANEL_ID} .ttgo-header{
-  display:flex; align-items:center; justify-content:space-between;
-  padding:10px 10px 8px 12px;
-  border-bottom:1px solid rgba(255,255,255,0.08);
-  background:rgba(255,255,255,0.03);
+#${APP.uiId} .ttgo-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:10px 10px 8px 10px;
+  background: rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  user-select:none;
+  cursor: move;
 }
-#${PANEL_ID} .ttgo-title{ display:flex; flex-direction:column; gap:2px; }
-#${PANEL_ID} .ttgo-title strong{ font-size:13.5px; letter-spacing:.2px; }
-#${PANEL_ID} .ttgo-sub{ opacity:.75; font-size:11.5px; }
-
-#${PANEL_ID} .ttgo-header button{
-  appearance:none;
-  border:1px solid rgba(255,255,255,0.12);
-  background:rgba(255,255,255,0.06);
-  color:rgba(255,255,255,0.92);
-  border-radius:10px;
-  padding:6px 9px;
-  cursor:pointer;
+#${APP.uiId} .ttgo-title{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+}
+#${APP.uiId} .ttgo-title .main{
+  font-weight:700;
+  font-size:14px;
+  line-height:1.1;
+}
+#${APP.uiId} .ttgo-title .sub{
   font-size:12px;
+  opacity:0.85;
 }
-#${PANEL_ID} .ttgo-header button:hover{ background:rgba(255,255,255,0.10); }
-
-#${PANEL_ID} .ttgo-body{ padding:10px 10px 10px 12px; overflow:auto; }
-
-#${PANEL_ID} .ttgo-card{
-  border:1px solid rgba(255,255,255,0.10);
-  border-radius:14px;
-  background:rgba(255,255,255,0.04);
+#${APP.uiId} .ttgo-btn{
+  background: rgba(255,255,255,0.07);
+  color:#e9eef5;
+  border:1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  padding:6px 10px;
+  font-size:12px;
+  cursor:pointer;
+}
+#${APP.uiId} .ttgo-btn:hover{ background: rgba(255,255,255,0.12); }
+#${APP.uiId} .ttgo-body{ padding:10px; display:flex; flex-direction:column; gap:10px; }
+#${APP.uiId}.minimized{
+  width: 280px;
+  max-height: 60px;
+}
+#${APP.uiId}.minimized .ttgo-body{ display:none; }
+#${APP.uiId} .ttgo-card{
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
   padding:10px;
-  margin-bottom:10px;
 }
-
-#${PANEL_ID} .ttgo-row{
+#${APP.uiId} .ttgo-row{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+#${APP.uiId} .ttgo-row .label{ font-size:12px; opacity:0.9; }
+#${APP.uiId} .ttgo-row .value{ font-size:12px; font-weight:600; }
+#${APP.uiId} .ttgo-goal{
   display:grid;
-  grid-template-columns:1fr auto;
+  grid-template-columns: 1fr auto;
   gap:10px;
   align-items:center;
-  padding:3px 0;
 }
-#${PANEL_ID} .ttgo-label{ opacity:.88; }
-#${PANEL_ID} .ttgo-value{
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  opacity:.96;
-  white-space:nowrap;
-}
-
-#${PANEL_ID} .ttgo-controls{
-  display:grid;
-  grid-template-columns:1fr 88px;
-  gap:8px;
-  align-items:center;
-}
-#${PANEL_ID} input[type="range"]{ width:100%; }
-#${PANEL_ID} input[type="number"]{
-  width:88px;
+#${APP.uiId} input[type="range"]{ width: 100%; }
+#${APP.uiId} input[type="number"]{
+  width:70px;
   padding:6px 8px;
   border-radius:10px;
   border:1px solid rgba(255,255,255,0.12);
-  background:rgba(0,0,0,0.18);
-  color:rgba(255,255,255,0.92);
+  background: rgba(0,0,0,0.25);
+  color:#e9eef5;
 }
-
-#${PANEL_ID} details{
-  border:1px solid rgba(255,255,255,0.10);
-  border-radius:14px;
-  background:rgba(255,255,255,0.03);
+#${APP.uiId} .ttgo-tip{
+  border-left: 3px solid rgba(255,193,7,0.9);
   padding:8px 10px;
-  margin-bottom:10px;
-}
-#${PANEL_ID} summary{
-  cursor:pointer;
-  user-select:none;
-  list-style:none;
-  display:flex;
-  justify-content:space-between;
-  gap:10px;
-}
-#${PANEL_ID} summary::-webkit-details-marker{ display:none; }
-#${PANEL_ID} .ttgo-summary-right{
-  opacity:.70;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-}
-
-#${PANEL_ID} .ttgo-warn{
-  border-left:3px solid rgba(255,199,0,0.85);
-  padding:8px 10px;
-  border-radius:10px;
-  background:rgba(255,199,0,0.08);
-  color:rgba(255,255,255,0.90);
-  margin-top:8px;
-  white-space:pre-wrap;
-}
-#${PANEL_ID} .ttgo-bad{
-  border-left-color:rgba(255,74,74,0.9);
-  background:rgba(255,74,74,0.08);
-}
-
-#${PANEL_ID} pre{
-  margin:8px 0 0 0;
-  padding:8px 10px;
-  border-radius:12px;
-  border:1px solid rgba(255,255,255,0.10);
-  background:rgba(0,0,0,0.16);
-  overflow:auto;
-  white-space:pre-wrap;
-  word-break:break-word;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size:12px;
+  line-height:1.35;
+  background: rgba(255,193,7,0.10);
+  border-radius: 10px;
+}
+#${APP.uiId} .ttgo-actions{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+#${APP.uiId} .ttgo-action{
+  display:flex;
+  gap:10px;
+  align-items:flex-start;
+  justify-content:space-between;
+  padding:10px;
+  background: rgba(0,0,0,0.18);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+}
+#${APP.uiId} .ttgo-action .left{ flex:1; min-width:0; }
+#${APP.uiId} .ttgo-action .name{
+  font-size:13px;
+  font-weight:700;
+  margin-bottom:3px;
+}
+#${APP.uiId} .ttgo-action .why{
+  font-size:12px;
+  opacity:0.9;
+  line-height:1.35;
+  white-space:normal;
+}
+#${APP.uiId} .ttgo-action .meta{
+  margin-top:6px;
+  font-size:12px;
+  opacity:0.85;
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+}
+#${APP.uiId} .ttgo-action .right{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  align-items:flex-end;
+}
+#${APP.uiId} .ttgo-small{
+  font-size:12px;
+  opacity:0.85;
+}
+#${APP.uiId} .ttgo-pill{
+  display:inline-flex;
+  gap:8px;
+  align-items:center;
+  padding:6px 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.10);
+}
+.ttgo-flash{
+  outline: 2px solid rgba(255,193,7,0.75);
+  outline-offset: 3px;
+  border-radius: 8px;
+  transition: outline 0.2s ease;
 }
 `;
-  if (typeof GM_addStyle === 'function') GM_addStyle(css);
-  else {
-    const st = document.createElement('style');
-    st.textContent = css;
-    document.head.appendChild(st);
+
+  addStyle(CSS);
+
+  function createUI() {
+    const root = document.createElement('div');
+    root.id = APP.uiId;
+    if (settings.minimized) root.classList.add('minimized');
+
+    root.innerHTML = `
+      <div class="ttgo-header">
+        <div class="ttgo-title">
+          <div class="main">TT Growth Optimizer</div>
+          <div class="sub">Land% target → Ecumenopolis → full Colonists + Androids</div>
+        </div>
+        <button class="ttgo-btn" id="ttgo-min-btn">${settings.minimized ? 'Expand' : 'Minimize'}</button>
+      </div>
+      <div class="ttgo-body">
+        <div class="ttgo-card">
+          <div class="ttgo-row" style="margin-bottom:8px;">
+            <div class="label"><strong>Goal</strong> (Land% reserved for Ecumenopolis)</div>
+            <button class="ttgo-btn" id="ttgo-use-current">Use current %</button>
+          </div>
+          <div class="ttgo-goal">
+            <div>
+              <div class="ttgo-row" style="margin-bottom:6px;">
+                <div class="label">Target Land %</div>
+                <div class="value" id="ttgo-goal-label">—</div>
+              </div>
+              <input type="range" min="1" max="100" step="1" id="ttgo-goal-range" />
+            </div>
+            <div>
+              <input type="number" min="1" max="100" step="1" id="ttgo-goal-num" />
+            </div>
+          </div>
+          <div class="ttgo-tip" style="margin-top:10px;">
+            <strong>Tip:</strong> districts can be built ahead of time, and <em>kept active</em>.
+            Active-but-empty Ecumenopolis districts raise your population cap, which boosts logistic growth
+            (<code>capacity factor = (1 - pop/cap)</code>).
+          </div>
+        </div>
+
+        <div class="ttgo-card">
+          <div class="ttgo-row" style="margin-bottom:8px;">
+            <div class="label"><strong>Quick status</strong></div>
+            <div class="ttgo-small" id="ttgo-status-badges">—</div>
+          </div>
+          <div class="ttgo-row"><div class="label">Ecumenopolis</div><div class="value" id="ttgo-eco-line">—</div></div>
+          <div class="ttgo-row"><div class="label">Colonists</div><div class="value" id="ttgo-col-line">—</div></div>
+          <div class="ttgo-row"><div class="label">Androids</div><div class="value" id="ttgo-and-line">—</div></div>
+          <div class="ttgo-row"><div class="label">Growth</div><div class="value" id="ttgo-growth-line">—</div></div>
+        </div>
+
+        <div class="ttgo-card">
+          <div class="ttgo-row" style="margin-bottom:8px;">
+            <div class="label"><strong>What to do next</strong></div>
+            <div class="ttgo-small" id="ttgo-last-updated">—</div>
+          </div>
+          <div class="ttgo-actions" id="ttgo-actions"></div>
+        </div>
+
+        <div class="ttgo-card">
+          <div class="ttgo-row">
+            <div class="label"><strong>Land usage</strong></div>
+            <div class="value" id="ttgo-land-line">—</div>
+          </div>
+          <div class="ttgo-small" id="ttgo-land-breakdown" style="margin-top:6px; line-height:1.35; opacity:0.85;"></div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(root);
+    return root;
   }
 
-  /********************************************************************
-   * UI
-   ********************************************************************/
-  const ui = {
-    panel: null,
-    landRange: null,
-    landNumber: null,
-    statusSummaryRight: null,
-    planSummaryRight: null,
-    planPre: null,
-    warnBox: null,
+  const ui = createUI();
 
-    sGame: null,
-    sBridge: null,
-    sDbg: null,
-    sErr: null,
+  // Drag (header-only)
+  (function enableDrag() {
+    const header = ui.querySelector('.ttgo-header');
+    let dragging = false;
+    let startX = 0, startY = 0, startRight = 0, startTop = 0;
 
-    sLandTotal: null,
-    sLandReserved: null,
+    header.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      dragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      const rect = ui.getBoundingClientRect();
+      startTop = rect.top;
+      startRight = window.innerWidth - rect.right;
+      e.preventDefault();
+    });
 
-    sEcoReserved: null,
-    sEcoLandPct: null,
-    sEcoReqLand: null,
-    sEcoBuilt: null,
-    sEcoActive: null,
-    sEcoBuiltInactive: null,
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
 
-    sTargetLandPct: null,
-    sTargetEcoActive: null,
-    sTargetAchievedPct: null,
-    sNextStepPct: null,
+      const newTop = clamp(startTop + dy, 8, window.innerHeight - 60);
+      const newRight = clamp(startRight - dx, 8, window.innerWidth - 180);
 
-    sNeedBuild: null,
-    sNeedActivate: null,
+      ui.style.top = `${newTop}px`;
+      ui.style.right = `${newRight}px`;
+    });
 
-    sColonists: null,
-    sColonistsCapNow: null,
-    sColonistsCapTarget: null,
-    sCapacityFactorNow: null,
-    sCapacityFactorTarget: null,
-    sGrowthNow: null,
-    sEtaColonists: null,
+    window.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
 
-    sAndroids: null,
-    sAndroidsCapNow: null,
-    sAndroidsCapTarget: null,
-    sAndroidNet: null,
-    sEtaAndroids: null,
+      const rect = ui.getBoundingClientRect();
+      settings.dock.top = Math.round(rect.top);
+      settings.dock.right = Math.round(window.innerWidth - rect.right);
+      settings.dock.width = Math.round(rect.width);
+      saveSettings(settings);
+    });
+  })();
 
-    sWorkers: null,
-    sWorkersReq: null,
-    sWorkersSlack: null,
+  // UI handlers
+  ui.querySelector('#ttgo-min-btn').addEventListener('click', () => {
+    settings.minimized = !settings.minimized;
+    ui.classList.toggle('minimized', settings.minimized);
+    ui.querySelector('#ttgo-min-btn').textContent = settings.minimized ? 'Expand' : 'Minimize';
+    saveSettings(settings);
+  });
+
+  const rangeEl = ui.querySelector('#ttgo-goal-range');
+  const numEl = ui.querySelector('#ttgo-goal-num');
+  const goalLabel = ui.querySelector('#ttgo-goal-label');
+
+  function setTargetLandPct(v) {
+    v = clamp(Math.round(safeNum(v, 100)), 1, 100);
+    settings.targetLandPct = v;
+    rangeEl.value = String(v);
+    numEl.value = String(v);
+    goalLabel.textContent = `${v}%`;
+    saveSettings(settings);
+  }
+
+  rangeEl.addEventListener('input', () => setTargetLandPct(rangeEl.value));
+  numEl.addEventListener('change', () => setTargetLandPct(numEl.value));
+  setTargetLandPct(settings.targetLandPct);
+
+  // ---------- Planner ----------
+  const RESOURCE_BUILDERS = {
+    'colony.metal': ['oreMine', 'recyclingFacility'],
+    'colony.water': ['waterPump'],
+    'colony.glass': ['glassSmelter'],
+    'colony.superalloys': ['superalloyFoundry'],
+    'colony.silicon': ['sandQuarry'],
+    'colony.food': ['hydroponicFarm'],
+    'colony.electronics': ['electronicsFactory'],
+    'colony.androids': ['androidFactory'],
+    'colony.colonists': ['cloningFacility'], // for seeding / boosting when pop is low
+    'colony.energy': ['dysonReceiver', 'fusionPowerPlant', 'nuclearPowerPlant', 'geothermalGenerator', 'windTurbine', 'solarPanel'],
   };
 
-  function ensurePanel() {
-    if (ui.panel) return;
-
-    const panel = document.createElement('div');
-    panel.id = PANEL_ID;
-    if (state.hidden) panel.classList.add('ttgo-hidden');
-    if (state.minimized) panel.classList.add('ttgo-minimized');
-
-    const header = document.createElement('div');
-    header.className = 'ttgo-header';
-
-    const titleWrap = document.createElement('div');
-    titleWrap.className = 'ttgo-title';
-    const title = document.createElement('strong');
-    title.textContent = 'TTGO';
-    const sub = document.createElement('div');
-    sub.className = 'ttgo-sub';
-    sub.textContent = 'Land% target → Ecumenopolis → full Colonists + Androids';
-    titleWrap.appendChild(title);
-    titleWrap.appendChild(sub);
-
-    const btnWrap = document.createElement('div');
-    btnWrap.style.display = 'flex';
-    btnWrap.style.gap = '8px';
-
-    const minimizeBtn = document.createElement('button');
-    minimizeBtn.type = 'button';
-    minimizeBtn.textContent = state.minimized ? 'Expand' : 'Minimize';
-    minimizeBtn.addEventListener('click', () => {
-      state.minimized = !state.minimized;
-      saveSetting('minimized', state.minimized);
-      minimizeBtn.textContent = state.minimized ? 'Expand' : 'Minimize';
-      panel.classList.toggle('ttgo-minimized', state.minimized);
-      applyDockingNow();
-    });
-
-    btnWrap.appendChild(minimizeBtn);
-
-    header.appendChild(titleWrap);
-    header.appendChild(btnWrap);
-
-    const body = document.createElement('div');
-    body.className = 'ttgo-body';
-
-    // Controls
-    const controls = document.createElement('div');
-    controls.className = 'ttgo-card';
-
-    const controlsHeader = document.createElement('div');
-    controlsHeader.style.display = 'flex';
-    controlsHeader.style.justifyContent = 'space-between';
-    controlsHeader.style.alignItems = 'center';
-    controlsHeader.style.marginBottom = '8px';
-
-    const controlsTitle = document.createElement('div');
-    controlsTitle.innerHTML = `<span style="opacity:.9"><strong>Goal</strong></span><span style="opacity:.7"> (Land% for ecumenopolis)</span>`;
-    controlsHeader.appendChild(controlsTitle);
-
-    const landRange = document.createElement('input');
-    landRange.type = 'range';
-    landRange.min = '0';
-    landRange.max = '100';
-    landRange.step = '0.1';
-    landRange.value = String(state.landPct);
-
-    const landNumber = document.createElement('input');
-    landNumber.type = 'number';
-    landNumber.min = '0';
-    landNumber.max = '100';
-    landNumber.step = '0.1';
-    landNumber.value = String(state.landPct);
-
-    const controlsGrid = document.createElement('div');
-    controlsGrid.className = 'ttgo-controls';
-    controlsGrid.appendChild(landRange);
-    controlsGrid.appendChild(landNumber);
-
-    landRange.addEventListener('input', () => setLandPct(Number(landRange.value)));
-    landNumber.addEventListener('input', () => setLandPct(Number(landNumber.value)));
-
-    controls.appendChild(controlsHeader);
-    controls.appendChild(rowEl('Target Land %', controlsGrid));
-
-    const tip = document.createElement('div');
-    tip.className = 'ttgo-warn';
-    tip.textContent =
-      'Tip: districts can be built ahead of time, but leaving built districts inactive is usually wasted growth.\n' +
-      'Active-but-empty districts raise your population cap (K), increasing the logistic growth “capacity factor” (1 − pop/cap).';
-    controls.appendChild(tip);
-
-    // Status
-    const status = document.createElement('details');
-    status.open = state.expandedStatus;
-    status.addEventListener('toggle', () => {
-      state.expandedStatus = status.open;
-      saveSetting('expandedStatus', state.expandedStatus);
-    });
-
-    const statusSummary = document.createElement('summary');
-    statusSummary.innerHTML = `<span><strong>Status</strong></span>`;
-    const statusRight = document.createElement('span');
-    statusRight.className = 'ttgo-summary-right';
-    statusRight.textContent = '…';
-    statusSummary.appendChild(statusRight);
-    status.appendChild(statusSummary);
-
-    addStatusRows(status, [
-      ['Game', '—', 'sGame'],
-      ['Bridge', '—', 'sBridge'],
-      ['Debug', '—', 'sDbg'],
-      ['Last error', '—', 'sErr'],
-
-      ['Land total', '—', 'sLandTotal'],
-      ['Land reserved (all)', '—', 'sLandReserved'],
-
-      ['Eco land reserved', '—', 'sEcoReserved'],
-      ['Eco land %', '—', 'sEcoLandPct'],
-      ['Eco land per district', '—', 'sEcoReqLand'],
-      ['Eco built', '—', 'sEcoBuilt'],
-      ['Eco active', '—', 'sEcoActive'],
-      ['Built but inactive', '—', 'sEcoBuiltInactive'],
-
-      ['Target Land %', '—', 'sTargetLandPct'],
-      ['Target eco active', '—', 'sTargetEcoActive'],
-      ['Achieved eco land %', '—', 'sTargetAchievedPct'],
-      ['+1 district would be', '—', 'sNextStepPct'],
-
-      ['Need to build', '—', 'sNeedBuild'],
-      ['Need to activate', '—', 'sNeedActivate'],
-
-      ['Colonists', '—', 'sColonists'],
-      ['Colonist cap (now)', '—', 'sColonistsCapNow'],
-      ['Colonist cap (target)', '—', 'sColonistsCapTarget'],
-      ['Capacity factor (now)', '—', 'sCapacityFactorNow'],
-      ['Capacity factor (target)', '—', 'sCapacityFactorTarget'],
-      ['Growth (now)', '—', 'sGrowthNow'],
-      ['ETA colonists (to 99.9%)', '—', 'sEtaColonists'],
-
-      ['Androids', '—', 'sAndroids'],
-      ['Android cap (now)', '—', 'sAndroidsCapNow'],
-      ['Android cap (target)', '—', 'sAndroidsCapTarget'],
-      ['Android net', '—', 'sAndroidNet'],
-      ['ETA androids (to 99.9%)', '—', 'sEtaAndroids'],
-
-      ['Workers', '—', 'sWorkers'],
-      ['Workers required', '—', 'sWorkersReq'],
-      ['Workers slack', '—', 'sWorkersSlack'],
-    ]);
-
-    // Plan
-    const plan = document.createElement('details');
-    plan.open = state.expandedPlan;
-    plan.addEventListener('toggle', () => {
-      state.expandedPlan = plan.open;
-      saveSetting('expandedPlan', state.expandedPlan);
-    });
-
-    const planSummary = document.createElement('summary');
-    planSummary.innerHTML = `<span><strong>Fastest path plan</strong></span>`;
-    const planRight = document.createElement('span');
-    planRight.className = 'ttgo-summary-right';
-    planRight.textContent = '…';
-    planSummary.appendChild(planRight);
-    plan.appendChild(planSummary);
-
-    const planPre = document.createElement('pre');
-    planPre.textContent = 'Waiting for game state…';
-    plan.appendChild(planPre);
-
-    const warn = document.createElement('div');
-    warn.className = 'ttgo-warn';
-    warn.style.display = 'none';
-    plan.appendChild(warn);
-
-    body.appendChild(controls);
-    body.appendChild(status);
-    body.appendChild(plan);
-
-    panel.appendChild(header);
-    panel.appendChild(body);
-    document.body.appendChild(panel);
-
-    ui.panel = panel;
-    ui.landRange = landRange;
-    ui.landNumber = landNumber;
-    ui.statusSummaryRight = statusRight;
-    ui.planSummaryRight = planRight;
-    ui.planPre = planPre;
-    ui.warnBox = warn;
-
-    applyDockingNow();
-  }
-
-  function rowEl(label, valueNodeOrText) {
-    const row = document.createElement('div');
-    row.className = 'ttgo-row';
-    const l = document.createElement('div');
-    l.className = 'ttgo-label';
-    l.textContent = label;
-    const v = document.createElement('div');
-    v.className = 'ttgo-value';
-    if (typeof valueNodeOrText === 'string') v.textContent = valueNodeOrText;
-    else v.appendChild(valueNodeOrText);
-    row.appendChild(l);
-    row.appendChild(v);
-    return row;
-  }
-
-  function addStatusRows(detailsEl, rows) {
-    for (const [label, initial, key] of rows) {
-      const v = document.createElement('span');
-      v.textContent = initial;
-      detailsEl.appendChild(rowEl(label, v));
-      ui[key] = v;
+  function chooseBestUnlocked(structures, keys) {
+    // Prefer: unlocked + has some active/counted already. Otherwise first unlocked.
+    let best = null;
+    for (const k of keys) {
+      const s = structures[k];
+      if (!s || !s.unlocked) continue;
+      if (s.active > 0) return k;
+      if (!best) best = k;
     }
+    return best;
   }
 
-  function setText(el, text) {
-    if (!el) return;
-    el.textContent = text;
+  function getNet(res, key) {
+    const r = res[key];
+    if (!r) return 0;
+    return safeNum(r.prod) - safeNum(r.cons);
   }
 
-  function setLandPct(val) {
-    const next = clampNumber(Number(val), 0, 100);
-    state.landPct = next;
-    saveSetting('landPct', state.landPct);
-
-    const active = document.activeElement;
-    if (ui.landRange && active !== ui.landRange) ui.landRange.value = String(next);
-    if (ui.landNumber && active !== ui.landNumber) ui.landNumber.value = String(next);
+  function getAvail(res, key) {
+    const r = res[key];
+    if (!r) return 0;
+    return Math.max(0, safeNum(r.v) - safeNum(r.res));
   }
 
-  /********************************************************************
-   * Helpers / formatting
-   ********************************************************************/
-  const countFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+  function estimatePerActiveFromRates(snapshot, structureKey, outResKey) {
+    // Try to infer per-active output for outResKey by using productionRateBySource:
+    // We don't have the full bySource map in the snapshot (kept light),
+    // so instead we approximate by: current net for resource / active count of that producer *if the producer is the dominant source*
+    // For reliability, if active==0 -> null.
+    const s = snapshot.structures?.[structureKey];
+    const r = snapshot.resources?.[outResKey];
+    if (!s || !r || s.active <= 0) return null;
 
-  function fmtCount(n) {
-    if (!Number.isFinite(n)) return '—';
-    return countFmt.format(Math.round(n));
+    // If net is negative, producer isn't helping. But this is still "some" magnitude.
+    // We'll take total production as a rough upper bound by assuming consumption isn't from this producer.
+    const approxProd = safeNum(r.prod);
+    return approxProd / Math.max(1, s.active);
   }
 
-  function clampNumber(x, lo, hi) {
-    if (!Number.isFinite(x)) return lo;
-    return Math.max(lo, Math.min(hi, x));
+  function perBuildingFallback(structureKey, outResKey) {
+    // Base (unbuffed) fallback numbers from the game's default configs:
+    // (Only used if we can't infer from live rates.)
+    const base = {
+      oreMine: { 'colony.metal': 1 },
+      recyclingFacility: { 'colony.metal': 0.1 },
+      waterPump: { 'colony.water': 1 },
+      sandQuarry: { 'colony.silicon': 1 },
+      glassSmelter: { 'colony.glass': 1 },
+      superalloyFoundry: { 'colony.superalloys': 0.01 },
+      electronicsFactory: { 'colony.electronics': 0.1 },
+      androidFactory: { 'colony.androids': 0.1 },
+      cloningFacility: { 'colony.colonists': 0.1 },
+      hydroponicFarm: { 'colony.food': 5 },
+      solarPanel: { 'colony.energy': 300000 },
+      windTurbine: { 'colony.energy': 400000 },
+      geothermalGenerator: { 'colony.energy': 10000000 },
+      nuclearPowerPlant: { 'colony.energy': 500000000 },
+      fusionPowerPlant: { 'colony.energy': 5000000000 },
+      dysonReceiver: { 'colony.energy': 100000000000 },
+    };
+    return base?.[structureKey]?.[outResKey] ?? null;
   }
 
-  function fmtNumber(n, decimals = 2) {
-    if (!Number.isFinite(n)) return '—';
-    const { formatNumberFn } = getGameRefs();
-    if (formatNumberFn) return formatNumberFn(n, false, clampNumber(decimals, 0, 6));
-    const abs = Math.abs(n);
-    if (abs >= 1e12) return (n / 1e12).toFixed(decimals) + 'T';
-    if (abs >= 1e9) return (n / 1e9).toFixed(decimals) + 'B';
-    if (abs >= 1e6) return (n / 1e6).toFixed(decimals) + 'M';
-    if (abs >= 1e3) return (n / 1e3).toFixed(decimals) + 'K';
-    return n.toFixed(decimals);
-  }
+  function recommendBuildCount(snapshot, outResKey, missingAmount, desiredSeconds) {
+    const structures = snapshot.structures || {};
+    const candidates = RESOURCE_BUILDERS[outResKey] || [];
+    const chosen = chooseBestUnlocked(structures, candidates) || candidates[0] || null;
+    if (!chosen) return null;
 
-  function fmtPct(n, decimals = 1) {
-    if (!Number.isFinite(n)) return '—';
-    return `${n.toFixed(decimals)}%`;
-  }
+    const netNow = getNet(snapshot.resources, outResKey);
+    const targetNet = missingAmount / Math.max(1, desiredSeconds);
+    const addNet = Math.max(0, targetNet - Math.max(0, netNow));
 
-  function signedStr(nStrOrNum) {
-    const n = Number(nStrOrNum);
-    if (!Number.isFinite(n)) return String(nStrOrNum);
-    const s = String(nStrOrNum);
-    return n >= 0 ? `+${s}` : s;
-  }
-
-  function formatDuration(seconds) {
-    if (!Number.isFinite(seconds)) return '∞';
-    seconds = Math.max(0, seconds);
-    if (seconds < 1) return '<1s';
-    const s = Math.floor(seconds % 60);
-    const m = Math.floor((seconds / 60) % 60);
-    const h = Math.floor((seconds / 3600) % 24);
-    const d = Math.floor(seconds / 86400);
-    const parts = [];
-    if (d) parts.push(`${d}d`);
-    if (h || d) parts.push(`${h}h`);
-    if (m || h || d) parts.push(`${m}m`);
-    parts.push(`${s}s`);
-    return parts.join(' ');
-  }
-
-  function netRate(resObj) {
-    if (!resObj) return 0;
-    const prod = Number(resObj.productionRate) || 0;
-    const cons = Number(resObj.consumptionRate) || 0;
-    return prod - cons;
-  }
-
-  function availableAmount(resObj) {
-    if (!resObj) return 0;
-    const v = Number(resObj.value) || 0;
-    const r = Number(resObj.reserved) || 0;
-    return Math.max(0, v - r);
-  }
-
-  function calcCapacityFactor(pop, cap) {
-    pop = Number(pop) || 0;
-    cap = Number(cap) || 0;
-    if (cap <= 0) return 0;
-    const ratio = pop / cap;
-    if (ratio >= 1) return 0;
-    return 1 - ratio;
-  }
-
-  function etaLogisticToFraction(N0, K, a, d, fraction = 0.999) {
-    if (!Number.isFinite(N0) || !Number.isFinite(K) || !Number.isFinite(a) || !Number.isFinite(d)) return { ok: false, reason: 'bad-input' };
-    if (K <= 0) return { ok: false, reason: 'no-cap' };
-    if (N0 <= 0) return { ok: false, reason: 'no-pop' };
-    if (a <= 0) return { ok: false, reason: 'no-growth' };
-
-    const aPrime = a - d;
-    if (aPrime <= 0) return { ok: false, reason: 'decay>=growth', a, d };
-
-    const KPrime = K * (aPrime / a);
-    if (KPrime <= 0) return { ok: false, reason: 'kprime<=0' };
-    if (N0 >= KPrime) return { ok: true, seconds: 0 };
-
-    const target = Math.min(KPrime * clampNumber(fraction, 0.01, 0.9999), KPrime * 0.9999);
-    if (target <= N0) return { ok: true, seconds: 0 };
-
-    const num = target * (KPrime - N0);
-    const den = N0 * (KPrime - target);
-    if (den <= 0 || num <= 0) return { ok: false, reason: 'math' };
-
-    const t = (1 / aPrime) * Math.log(num / den);
-    return { ok: true, seconds: t };
-  }
-
-  function etaLinearToFraction(value, cap, netPerSec, fraction = 0.999) {
-    value = Number(value) || 0;
-    cap = Number(cap) || 0;
-    netPerSec = Number(netPerSec) || 0;
-    if (cap <= 0) return { ok: false, reason: 'no cap' };
-    const target = cap * clampNumber(fraction, 0.01, 0.9999);
-    if (value >= target) return { ok: true, seconds: 0 };
-    if (netPerSec <= 0) return { ok: false, reason: 'net ≤ 0' };
-    return { ok: true, seconds: (target - value) / netPerSec };
-  }
-
-  function reasonToHuman(reason, extra) {
-    if (reason === 'no-pop') return 'No colonists yet';
-    if (reason === 'no-cap') return 'No housing cap';
-    if (reason === 'no-growth') return 'Growth = 0 (happiness ≤ 50%)';
-    if (reason === 'decay>=growth') return `Decay ≥ growth (a=${fmtNumber(extra?.a ?? 0, 6)}, d=${fmtNumber(extra?.d ?? 0, 6)})`;
-    return `— (${reason})`;
-  }
-
-  function getScaledCost(structure, buildCount) {
-    buildCount = Math.max(0, Math.floor(Number(buildCount) || 0));
-    if (!structure || buildCount <= 0) return null;
-
-    try {
-      return structure.getEffectiveCost(buildCount);
-    } catch (_) {
-      const base = structure.getEffectiveCost ? structure.getEffectiveCost(1) : null;
-      if (!base) return null;
-      const scaled = {};
-      for (const cat in base) {
-        scaled[cat] = {};
-        for (const res in base[cat]) scaled[cat][res] = (Number(base[cat][res]) || 0) * buildCount;
-      }
-      return scaled;
+    if (addNet <= 0) {
+      return {
+        structureKey: chosen,
+        count: 0,
+        note: `At current net (${fmt(netNow)}/s) you’ll hit it in ${fmtETA(missingAmount / Math.max(1e-12, netNow))}.`,
+      };
     }
+
+    let perActive = estimatePerActiveFromRates(snapshot, chosen, outResKey);
+    if (!perActive || perActive <= 0) perActive = perBuildingFallback(chosen, outResKey);
+
+    if (!perActive || perActive <= 0) {
+      return {
+        structureKey: chosen,
+        count: null,
+        note: `Need +${fmt(addNet)}/s ${outResKey} but couldn’t infer per-building output.`,
+      };
+    }
+
+    const count = Math.ceil(addNet / perActive);
+    return {
+      structureKey: chosen,
+      count,
+      note: `Target: make it affordable in ~${desiredSeconds}s (need +${fmt(addNet)}/s).`,
+    };
   }
 
-  function estimateBuildEtaSeconds(structure, buildCount) {
-    buildCount = Math.max(0, Math.floor(Number(buildCount) || 0));
-    if (!structure || buildCount <= 0) return 0;
+  function buildActionCard(action) {
+    const wrap = document.createElement('div');
+    wrap.className = 'ttgo-action';
 
-    const { resources } = getGameRefs();
-    const cost = getScaledCost(structure, buildCount);
-    if (!resources || !cost) return Infinity;
+    const left = document.createElement('div');
+    left.className = 'left';
 
-    let worst = 0;
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = action.title;
 
-    for (const category in cost) {
-      for (const resKey in cost[category]) {
-        const need = Number(cost[category][resKey]) || 0;
-        if (need <= 0) continue;
+    const why = document.createElement('div');
+    why.className = 'why';
+    why.textContent = action.why || '';
 
-        const resObj = resources?.[category]?.[resKey];
-        if (!resObj) continue;
-
-        const have = availableAmount(resObj);
-        const missing = Math.max(0, need - have);
-        if (missing <= 0) continue;
-
-        const r = netRate(resObj);
-        if (r <= 0) return Infinity;
-
-        worst = Math.max(worst, missing / r);
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    if (action.meta && action.meta.length) {
+      for (const m of action.meta) {
+        const pill = document.createElement('span');
+        pill.className = 'ttgo-pill';
+        pill.textContent = m;
+        meta.appendChild(pill);
       }
     }
 
-    return worst;
+    left.appendChild(name);
+    if (action.why) left.appendChild(why);
+    if (action.meta && action.meta.length) left.appendChild(meta);
+
+    const right = document.createElement('div');
+    right.className = 'right';
+
+    for (const b of action.buttons || []) {
+      const btn = document.createElement('button');
+      btn.className = 'ttgo-btn';
+      btn.textContent = b.label;
+      btn.addEventListener('click', b.onClick);
+      right.appendChild(btn);
+    }
+
+    wrap.appendChild(left);
+    wrap.appendChild(right);
+    return wrap;
   }
 
-  /********************************************************************
-   * Main update loop
-   ********************************************************************/
-  function update() {
+  function plan(snapshot) {
+    const actions = [];
+    const res = snapshot.resources || {};
+    const structures = snapshot.structures || {};
+    const pop = snapshot.pop || null;
+
+    const eco = structures.t7_colony;
+    const land = res['surface.land'];
+
+    // Badges
+    const badges = [];
+    badges.push(`Game: ${snapshot.ok ? 'OK' : '…'}`);
+    if (eco?.unlocked) badges.push(`Eco: unlocked`);
+    else badges.push(`Eco: locked`);
+
+    // Target districts
+    const landTotal = safeNum(land?.v, 0);
+    const landAvail = Math.max(0, safeNum(land?.v, 0) - safeNum(land?.res, 0));
+    const landPct = landTotal > 0 ? safeNum(land?.res, 0) / landTotal : 0;
+
+    const ecoLand = safeNum(eco?.requiresLand, 100000);
+    const targetPct = clamp(settings.targetLandPct, 1, 100);
+    const targetEcoActive = ecoLand > 0 ? Math.floor((landTotal * (targetPct / 100)) / ecoLand) : 0;
+
+    const ecoBuilt = safeNum(eco?.count, 0);
+    const ecoActive = safeNum(eco?.active, 0);
+
+    // Quick Lines
+    const colonists = res['colony.colonists'];
+    const androids = res['colony.androids'];
+
+    const colV = safeNum(colonists?.v, 0);
+    const colCap = safeNum(colonists?.cap, 0);
+    const andV = safeNum(androids?.v, 0);
+    const andCap = safeNum(androids?.cap, 0);
+
+    const colNet = getNet(res, 'colony.colonists');
+    const andNet = getNet(res, 'colony.androids');
+
+    // ------------- ACTIONS (prioritized) -------------
+
+    // A) Ecumenopolis: activate built-but-inactive first (this is pure upside for growth)
+    if (eco?.unlocked && ecoBuilt > ecoActive) {
+      const delta = ecoBuilt - ecoActive;
+      actions.push({
+        title: `Activate Ecumenopolis ×${fmt(delta, 0)}`,
+        why: `Built-but-inactive districts do nothing for caps. Keeping them active boosts colonist/android caps and speeds growth.`,
+        meta: [`Eco active: ${fmt(ecoActive, 0)} → ${fmt(ecoBuilt, 0)}`],
+        buttons: [
+          {
+            label: 'Activate',
+            onClick: () => {
+              const br = getBridge();
+              br?.setActive?.('t7_colony', ecoBuilt);
+            },
+          },
+          {
+            label: 'Show',
+            onClick: () => {
+              const br = getBridge();
+              br?.scrollTo?.('t7_colony');
+            },
+          },
+        ],
+      });
+    }
+
+    // B) Ecumenopolis: build + activate as many as possible now
+    if (eco?.unlocked) {
+      const needBuild = Math.max(0, targetEcoActive - ecoBuilt);
+      const canBuildByRes = safeNum(eco.maxBuildable, 0);
+      const canBuildByLand = safeNum(eco.landAffordCount, 0);
+      const canBuildNow = Math.max(0, Math.min(needBuild, canBuildByRes, canBuildByLand));
+
+      if (needBuild > 0 && canBuildNow > 0) {
+        actions.push({
+          title: `Build Ecumenopolis ×${fmt(canBuildNow, 0)} (now)`,
+          why: `This directly increases caps. Empty-but-active districts are essentially free (consumption scales with pop/cap), but they accelerate growth.`,
+          meta: [
+            `Target eco active: ${fmt(targetEcoActive, 0)}`,
+            `Built: ${fmt(ecoBuilt, 0)} → ${fmt(ecoBuilt + canBuildNow, 0)}`,
+          ],
+          buttons: [
+            {
+              label: 'Build',
+              onClick: () => {
+                const br = getBridge();
+                br?.build?.('t7_colony', canBuildNow, true);
+              },
+            },
+            {
+              label: 'Show',
+              onClick: () => {
+                const br = getBridge();
+                br?.scrollTo?.('t7_colony');
+              },
+            },
+          ],
+        });
+      } else if (needBuild > 0 && canBuildNow === 0) {
+        // blockers for 1 district
+        const br = getBridge();
+        const blockers = br?.getCostBlockers?.('t7_colony', 1) || [];
+        const top = blockers.slice(0, 2);
+
+        const blockerText = top.length
+          ? top
+              .map((b) => {
+                const key = `${b.category}.${b.resource}`;
+                return `${key} missing ${fmt(b.missing)}`;
+              })
+              .join(' • ')
+          : 'Unknown blockers (bridge not ready)';
+
+        const meta = [];
+        for (const b of top) {
+          const rKey = `${b.category}.${b.resource}`;
+          if (rKey.startsWith('colony.')) {
+            const net = getNet(res, rKey);
+            const eta = net > 0 ? b.missing / net : Infinity;
+            meta.push(`${rKey}: ETA ${fmtETA(eta)} (net ${fmt(net)}/s)`);
+          }
+          if (rKey === 'surface.land') {
+            meta.push(`Land avail ${fmt(landAvail)} (reserved ${fmt(landPct * 100, 0)}%)`);
+          }
+        }
+
+        actions.push({
+          title: `Can’t build Ecumenopolis yet`,
+          why: blockerText,
+          meta: meta.length ? meta : [`Try: build/boost the missing resource(s)`],
+          buttons: [
+            {
+              label: 'Show Eco',
+              onClick: () => {
+                const br2 = getBridge();
+                br2?.scrollTo?.('t7_colony');
+              },
+            },
+          ],
+        });
+
+        // Recommend specific producer builds for the #1 blocker (and a chain if needed)
+        if (top.length) {
+          const b0 = top[0];
+          const rKey = `${b0.category}.${b0.resource}`;
+
+          // Special case: land is blocked → show land breakdown so user can deactivate others
+          if (rKey === 'surface.land') {
+            actions.push({
+              title: `Free up land reservations`,
+              why: `You’re land-blocked. Deactivate other land-using colonies/structures until you can reserve ${fmt(b0.need)} land for the next Eco district.`,
+              meta: [`Land short by ${fmt(b0.missing)}`],
+              buttons: [],
+            });
+          } else {
+            const rec = recommendBuildCount(snapshot, rKey, b0.missing, settings.actionCadenceSec);
+            if (rec) {
+              const sKey = rec.structureKey;
+              const s = structures[sKey];
+              const countText =
+                rec.count === null ? 'some' : rec.count === 0 ? '0' : String(rec.count);
+
+              actions.push({
+                title:
+                  rec.count && rec.count > 0
+                    ? `Build ${s?.displayName || sKey} ×${countText}`
+                    : `Wait (or boost) ${s?.displayName || sKey}`,
+                why:
+                  rec.count && rec.count > 0
+                    ? `This is the fastest way to cover the current blocker (${rKey}).`
+                    : `You’re already accumulating ${rKey}; you can just wait. If you want it faster, add more ${s?.displayName || sKey}.`,
+                meta: [
+                  `Blocker: ${rKey} short ${fmt(b0.missing)}`,
+                  rec.note || '',
+                ].filter(Boolean),
+                buttons: [
+                  {
+                    label: 'Show',
+                    onClick: () => {
+                      const br2 = getBridge();
+                      br2?.scrollTo?.(sKey);
+                    },
+                  },
+                  ...(rec.count && rec.count > 0
+                    ? [
+                        {
+                          label: 'Build',
+                          onClick: () => {
+                            const br2 = getBridge();
+                            br2?.build?.(sKey, rec.count, true);
+                          },
+                        },
+                      ]
+                    : []),
+                ],
+              });
+
+              // If we recommend Glass Smelters, check silicon net as a chain hint
+              if (sKey === 'glassSmelter') {
+                const siliconNet = getNet(res, 'colony.silicon');
+                if (siliconNet <= 0) {
+                  actions.push({
+                    title: `Build Sand Quarry to feed Glass Smelters`,
+                    why: `Glass Smelters consume silicon. Your silicon net is ${fmt(siliconNet)}/s, so glass will stall without more silicon.`,
+                    meta: [`Silicon net: ${fmt(siliconNet)}/s`],
+                    buttons: [
+                      {
+                        label: 'Show Sand Quarry',
+                        onClick: () => getBridge()?.scrollTo?.('sandQuarry'),
+                      },
+                    ],
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      // Eco not unlocked: advise the next colony tier chain
+      const t2 = structures.t2_colony;
+      const t6 = structures.t6_colony;
+      actions.push({
+        title: `Unlock Ecumenopolis (colony chain)`,
+        why: `Ecumenopolis isn’t unlocked yet. Push the colony tiers upward until you reach Metropolis → Ecumenopolis.`,
+        meta: [
+          `Have Permanent Outpost: ${t2?.unlocked ? 'yes' : 'no'}`,
+          `Have Metropolis: ${t6?.unlocked ? 'yes' : 'no'}`,
+        ],
+        buttons: [
+          { label: 'Show Colonies', onClick: () => getBridge()?.scrollTo?.('t1_colony') },
+        ],
+      });
+    }
+
+    // C) Turn ON luxury needs on Ecumenopolis (explicit instruction you asked for)
+    if (eco?.unlocked && eco?.luxury) {
+      if (eco.luxury.electronics === false) {
+        actions.push({
+          title: `Enable electronics consumption (Ecumenopolis checkbox)`,
+          why: `Electronics is a luxury “need” that boosts happiness once you can supply it. Turning it on is a direct player action.`,
+          meta: [`Eco electronics: OFF → ON`],
+          buttons: [
+            {
+              label: 'Enable',
+              onClick: () => getBridge()?.setLuxury?.('t7_colony', 'electronics', true),
+            },
+            { label: 'Show Eco', onClick: () => getBridge()?.scrollTo?.('t7_colony') },
+          ],
+        });
+      }
+      if (eco.luxury.androids === false) {
+        actions.push({
+          title: `Enable androids consumption (Ecumenopolis checkbox)`,
+          why: `Same deal: this is a luxury need toggle. Turn it on when you can keep android net ≥ 0.`,
+          meta: [`Eco androids: OFF → ON`],
+          buttons: [
+            {
+              label: 'Enable',
+              onClick: () => getBridge()?.setLuxury?.('t7_colony', 'androids', true),
+            },
+            { label: 'Show Eco', onClick: () => getBridge()?.scrollTo?.('t7_colony') },
+          ],
+        });
+      }
+    }
+
+    // D) Colonists: if zero, seed with cloning facility (specific!)
+    const fillTarget = clamp(settings.fillTarget, 0.5, 0.999999);
+    const colTarget = colCap > 0 ? colCap * fillTarget : 0;
+
+    if (colV <= 0.000001) {
+      const clone = structures.cloningFacility;
+      if (clone?.unlocked) {
+        // Suggest at least 1 if none active
+        const need = clone.active > 0 ? 0 : 1;
+        actions.push({
+          title: need > 0 ? `Build Cloning Facility ×${need}` : `Cloning Facility running`,
+          why: `Population growth can’t start from 0 (it multiplies by current population). Cloning produces the first colonists so growth can take over.`,
+          meta: [
+            `Colonists: ${fmt(colV)} / ${fmt(colCap)} cap`,
+            `Colonist net: ${fmt(colNet)}/s`,
+          ],
+          buttons: [
+            { label: 'Show', onClick: () => getBridge()?.scrollTo?.('cloningFacility') },
+            ...(need > 0
+              ? [{ label: 'Build', onClick: () => getBridge()?.build?.('cloningFacility', need, true) }]
+              : []),
+          ],
+        });
+      } else {
+        actions.push({
+          title: `Colonists are 0 — get a colonist source`,
+          why: `You need a source that increases colonists from 0 (Cloning Facility is the usual one).`,
+          meta: [],
+          buttons: [{ label: 'Show Colonies', onClick: () => getBridge()?.scrollTo?.('t1_colony') }],
+        });
+      }
+    }
+
+    // E) If growth is stalled, give concrete “fix happiness/needs” instructions
+    if (colV > 0 && pop) {
+      const growthPerSec = safeNum(pop.growthPerSec, 0);
+      const growthPct = safeNum(pop.growthPct, 0);
+
+      if (growthPerSec <= 0) {
+        // The game’s core reasons: happiness <= 50%, or shortages (food/energy), or gravity decay.
+        const foodShort = safeNum(pop.starvationShortage, 0);
+        const energyShort = safeNum(pop.energyShortage, 0);
+
+        if (foodShort > 0.001) {
+          const foodNet = getNet(res, 'colony.food');
+          actions.push({
+            title: `Fix food shortage (build farms)`,
+            why: `Your colonist growth is being killed by starvation pressure. Increase food net until it stays ≥ 0.`,
+            meta: [
+              `Food net: ${fmt(foodNet)}/s`,
+              `Shortage: ${(foodShort * 100).toFixed(1)}%`,
+            ],
+            buttons: [{ label: 'Show Farm', onClick: () => getBridge()?.scrollTo?.('hydroponicFarm') }],
+          });
+        }
+        if (energyShort > 0.001) {
+          const eNet = getNet(res, 'colony.energy');
+          const pick = chooseBestUnlocked(structures, RESOURCE_BUILDERS['colony.energy'] || []);
+          actions.push({
+            title: `Fix energy shortage (build power)`,
+            why: `Energy shortage causes population decay / stalls growth. Add power until energy net stays ≥ 0.`,
+            meta: [
+              `Energy net: ${fmt(eNet)}/s`,
+              `Shortage: ${(energyShort * 100).toFixed(1)}%`,
+              pick ? `Suggested: ${structures[pick]?.displayName || pick}` : '',
+            ].filter(Boolean),
+            buttons: pick
+              ? [
+                  { label: 'Show', onClick: () => getBridge()?.scrollTo?.(pick) },
+                ]
+              : [],
+          });
+        }
+
+        if (foodShort <= 0.001 && energyShort <= 0.001) {
+          actions.push({
+            title: `Growth stalled: raise happiness above 50%`,
+            why: `If Food/Energy aren’t the issue, your weighted happiness is likely ≤ 50%. For Ecumenopolis, turning on + supplying luxuries (electronics/androids) is the usual fix.`,
+            meta: [
+              `Growth: ${fmt(growthPerSec)}/s (${growthPct.toFixed(2)}%/s)`,
+            ],
+            buttons: [{ label: 'Show Eco', onClick: () => getBridge()?.scrollTo?.('t7_colony') }],
+          });
+        }
+      }
+    }
+
+    // F) Androids: if net <= 0, tell exactly what to build (or what to toggle)
+    const andTarget = andCap > 0 ? andCap * fillTarget : 0;
+    if (andCap > 0 && andV < andTarget && andNet <= 0) {
+      const af = structures.androidFactory;
+      actions.push({
+        title: `Androids not filling → build Androids Factory`,
+        why: `Your android net is ${fmt(andNet)}/s, so androids can’t rise toward cap. Add factories (or disable android luxury on colonies until you’re ready).`,
+        meta: [
+          `Androids: ${fmt(andV)} / ${fmt(andCap)} cap`,
+          `Net: ${fmt(andNet)}/s`,
+        ],
+        buttons: [
+          { label: 'Show Factory', onClick: () => getBridge()?.scrollTo?.('androidFactory') },
+          ...(af?.unlocked
+            ? [{ label: 'Build 1', onClick: () => getBridge()?.build?.('androidFactory', 1, true) }]
+            : []),
+        ],
+      });
+    }
+
+    // If no actions, add a friendly default
+    if (!actions.length) {
+      actions.push({
+        title: `Waiting for game state…`,
+        why: `Once the bridge sees resources/colonies, I’ll give concrete build/activate steps.`,
+        meta: [],
+        buttons: [],
+      });
+    }
+
+    return {
+      actions,
+      badges,
+      lines: {
+        eco: eco?.unlocked
+          ? `target ${fmt(targetEcoActive, 0)} | built ${fmt(ecoBuilt, 0)} | active ${fmt(ecoActive, 0)}`
+          : `locked`,
+        col: `${fmt(colV)} / ${fmt(colCap)} (target ~${fmt(colTarget)})  | net ${fmt(colNet)}/s`,
+        and: `${fmt(andV)} / ${fmt(andCap)} (target ~${fmt(andTarget)}) | net ${fmt(andNet)}/s`,
+        growth: pop
+          ? `${fmt(pop.growthPerSec)}/s (${safeNum(pop.growthPct, 0).toFixed(2)}%/s)`
+          : '—',
+        land: landTotal > 0
+          ? `${fmt(landPct * 100, 0)}% reserved | ${fmt(landAvail)} free`
+          : '—',
+        landBreakdown: (res.__landBreakdown || [])
+          .map(([k, v]) => `• ${k}: ${fmt(v)} land`)
+          .join('\n'),
+        currentLandPct: landTotal > 0 ? Math.round(landPct * 100) : null,
+      },
+      targetEcoActive,
+    };
+  }
+
+  // ---------- Render loop ----------
+  function render(snapshot, planOut) {
+    ui.querySelector('#ttgo-last-updated').textContent = `Updated: ${new Date(snapshot.ts).toLocaleTimeString()}`;
+
+    ui.querySelector('#ttgo-status-badges').textContent = planOut.badges.join(' • ');
+    ui.querySelector('#ttgo-eco-line').textContent = planOut.lines.eco;
+    ui.querySelector('#ttgo-col-line').textContent = planOut.lines.col;
+    ui.querySelector('#ttgo-and-line').textContent = planOut.lines.and;
+    ui.querySelector('#ttgo-growth-line').textContent = planOut.lines.growth;
+    ui.querySelector('#ttgo-land-line').textContent = planOut.lines.land;
+
+    const bd = ui.querySelector('#ttgo-land-breakdown');
+    bd.textContent = planOut.lines.landBreakdown || '—';
+
+    // actions
+    const list = ui.querySelector('#ttgo-actions');
+    list.textContent = '';
+    for (const a of planOut.actions.slice(0, 8)) {
+      list.appendChild(buildActionCard(a));
+    }
+
+    // goal label
+    goalLabel.textContent = `${settings.targetLandPct}%`;
+
+    // "Use current %" button logic
+    const useCurrentBtn = ui.querySelector('#ttgo-use-current');
+    useCurrentBtn.disabled = planOut.lines.currentLandPct == null;
+  }
+
+  ui.querySelector('#ttgo-use-current').addEventListener('click', () => {
+    const br = getBridge();
+    const snap = br?.snapshot?.();
+    if (!snap?.ok) return;
+    const land = snap.resources?.['surface.land'];
+    const pct = land?.v > 0 ? Math.round((land.res || 0) / land.v * 100) : null;
+    if (pct) setTargetLandPct(pct);
+  });
+
+  // ---------- Main Tick ----------
+  injectBridge();
+
+  let lastSnapTs = 0;
+
+  function tick() {
     try {
       injectBridge();
-      ensurePanel();
-      applyDockingNow();
+      const br = getBridge();
+      const snap = br?.snapshot?.();
+      if (!snap || !snap.ts) return;
 
-      const { resources, colonies, populationModule, bridgeOk } = getGameRefs();
+      // Avoid repainting too aggressively
+      if (snap.ts === lastSnapTs) return;
+      lastSnapTs = snap.ts;
 
-      const hasRes = !!(resources && resources.colony && resources.surface);
-      const hasCol = !!colonies;
-      const hasPop = !!populationModule;
-
-      setText(ui.sBridge, bridgeOk ? 'OK' : 'injecting…');
-      setText(ui.sDbg, `resources:${hasRes ? 'Y' : 'N'} colonies:${hasCol ? 'Y' : 'N'} pop:${hasPop ? 'Y' : 'N'}`);
-      setText(ui.sErr, '—');
-
-      if (!hasRes || !hasCol || !hasPop) {
-        setText(ui.sGame, 'Waiting for TT globals…');
-        ui.statusSummaryRight.textContent = 'Not ready';
-        ui.planSummaryRight.textContent = 'Not ready';
-        ui.planPre.textContent = 'Waiting for game state…';
-        ui.warnBox.style.display = 'none';
-        return;
-      }
-
-      setText(ui.sGame, 'OK');
-
-      const land = resources.surface.land;
-      const totalLand = Number(land.value) || 0;
-      const reservedLand = Number(land.reserved) || 0;
-
-      setText(ui.sLandTotal, fmtNumber(totalLand, 2));
-      setText(ui.sLandReserved, `${fmtNumber(reservedLand, 2)} (${fmtPct(totalLand > 0 ? (reservedLand / totalLand) * 100 : 0, 2)})`);
-
-      const eco = colonies.t7_colony;
-      if (!eco) {
-        ui.planPre.textContent = 'Ecumenopolis (t7_colony) not detected.';
-        ui.planSummaryRight.textContent = 't7 missing';
-        ui.warnBox.style.display = 'none';
-        return;
-      }
-
-      const ecoActive = Number(eco.active) || 0;
-      const ecoCount = Number(eco.count) || 0;
-      const ecoReqLand = Number(eco.requiresLand) || 0;
-
-      const ecoReserved = land.getReservedAmountForSource
-        ? (Number(land.getReservedAmountForSource('building:t7_colony')) || 0)
-        : ecoActive * ecoReqLand;
-
-      const ecoLandPct = totalLand > 0 ? (ecoReserved / totalLand) * 100 : 0;
-
-      setText(ui.sEcoReserved, fmtNumber(ecoReserved, 2));
-      setText(ui.sEcoLandPct, fmtPct(ecoLandPct, 3));
-      setText(ui.sEcoReqLand, ecoReqLand > 0 ? fmtNumber(ecoReqLand, 0) : '—');
-      setText(ui.sEcoBuilt, fmtCount(ecoCount));
-      setText(ui.sEcoActive, fmtCount(ecoActive));
-      setText(ui.sEcoBuiltInactive, fmtCount(Math.max(0, ecoCount - ecoActive)));
-
-      // Land% target → districts (FLOOR + CLAMP)
-      const targetLandPct = state.landPct;
-      setText(ui.sTargetLandPct, fmtPct(targetLandPct, 1));
-
-      const maxEcoByLand = (ecoReqLand > 0 && totalLand > 0) ? Math.floor(totalLand / ecoReqLand) : 0;
-      const desiredReserved = totalLand * (targetLandPct / 100);
-
-      let targetEcoActive = (ecoReqLand > 0) ? Math.floor((desiredReserved / ecoReqLand) + 1e-9) : 0;
-      if (maxEcoByLand > 0) targetEcoActive = Math.min(targetEcoActive, maxEcoByLand);
-      targetEcoActive = Math.max(0, targetEcoActive);
-
-      const achievedReserved = targetEcoActive * ecoReqLand;
-      const achievedPct = totalLand > 0 ? (achievedReserved / totalLand) * 100 : 0;
-
-      const nextEco = Math.min(targetEcoActive + 1, maxEcoByLand);
-      const nextPct = (nextEco !== targetEcoActive && totalLand > 0)
-        ? ((nextEco * ecoReqLand) / totalLand) * 100
-        : NaN;
-
-      setText(ui.sTargetEcoActive, fmtCount(targetEcoActive));
-      setText(ui.sTargetAchievedPct, fmtPct(achievedPct, 3));
-      setText(ui.sNextStepPct, Number.isFinite(nextPct) ? fmtPct(nextPct, 3) : '— (max)');
-
-      const needBuild = Math.max(0, targetEcoActive - ecoCount);
-      const needActivate = Math.max(0, targetEcoActive - ecoActive);
-      setText(ui.sNeedBuild, fmtCount(needBuild));
-      setText(ui.sNeedActivate, fmtCount(needActivate));
-
-      // Caps now vs target
-      const colonists = resources.colony.colonists;
-      const androids = resources.colony.androids;
-
-      const colonistsCapNow = Number(colonists?.cap) || 0;
-      const androidsCapNow = Number(androids?.cap) || 0;
-
-      setText(ui.sColonists, colonists ? `${fmtNumber(colonists.value, 2)} / ${fmtNumber(colonists.cap, 2)}` : '—');
-      setText(ui.sAndroids, androids ? `${fmtNumber(androids.value, 2)} / ${fmtNumber(androids.cap, 2)}` : '—');
-      setText(ui.sColonistsCapNow, fmtNumber(colonistsCapNow, 2));
-      setText(ui.sAndroidsCapNow, fmtNumber(androidsCapNow, 2));
-
-      const storageMult = typeof eco.getEffectiveStorageMultiplier === 'function'
-        ? (eco.getEffectiveStorageMultiplier() || 1)
-        : 1;
-
-      const ecoColPer = (eco.storage?.colony?.colonists ?? 0) * storageMult;
-      const ecoAndPer = (eco.storage?.colony?.androids ?? 0) * storageMult;
-
-      const otherColonistCap = Math.max(0, colonistsCapNow - ecoActive * ecoColPer);
-      const otherAndroidCap = Math.max(0, androidsCapNow - ecoActive * ecoAndPer);
-
-      const colonistsCapTarget = otherColonistCap + targetEcoActive * ecoColPer;
-      const androidsCapTarget = otherAndroidCap + targetEcoActive * ecoAndPer;
-
-      setText(ui.sColonistsCapTarget, fmtNumber(colonistsCapTarget, 2));
-      setText(ui.sAndroidsCapTarget, fmtNumber(androidsCapTarget, 2));
-
-      const capFactorNow = calcCapacityFactor(colonists?.value, colonistsCapNow);
-      const capFactorTarget = calcCapacityFactor(colonists?.value, colonistsCapTarget);
-      setText(ui.sCapacityFactorNow, fmtPct(capFactorNow * 100, 2));
-      setText(ui.sCapacityFactorTarget, fmtPct(capFactorTarget * 100, 2));
-
-      const growthPctNow = (typeof populationModule.getCurrentGrowthPercent === 'function')
-        ? (populationModule.getCurrentGrowthPercent() || 0)
-        : 0;
-      setText(ui.sGrowthNow, `${signedStr(fmtNumber(growthPctNow, 3))}%/s`);
-
-      const buildEta = estimateBuildEtaSeconds(eco, needBuild);
-      const buildEtaStr = (needBuild <= 0) ? '0s' : (Number.isFinite(buildEta) ? formatDuration(buildEta) : '∞');
-
-      const popNetNow = Number(populationModule.getCurrentGrowthPerSecond?.() ?? populationModule.lastGrowthPerSecond ?? 0) || 0;
-      const N0 = Number(colonists?.value) || 0;
-      const N1 = Math.max(0, N0 + Math.max(0, popNetNow) * (Number.isFinite(buildEta) ? buildEta : 0));
-
-      const A0 = Number(androids?.value) || 0;
-      const aNet = netRate(androids);
-      const A1 = Math.max(0, A0 + Math.max(0, aNet) * (Number.isFinite(buildEta) ? buildEta : 0));
-
-      const baseR = Number(populationModule.growthRate) || 0;
-      const multM = (typeof populationModule.getEffectiveGrowthMultiplier === 'function')
-        ? (Number(populationModule.getEffectiveGrowthMultiplier()) || 1)
-        : 1;
-      const decayD =
-        (Number(populationModule.starvationDecayRate) || 0) +
-        (Number(populationModule.energyDecayRate) || 0) +
-        (Number(populationModule.gravityDecayRate) || 0);
-
-      const a = baseR * multM;
-
-      const etaCol = etaLogisticToFraction(Math.max(1, N1), colonistsCapTarget, a, decayD, 0.999);
-      const etaColonistsStr = etaCol.ok ? formatDuration(etaCol.seconds) : reasonToHuman(etaCol.reason, etaCol);
-      setText(ui.sEtaColonists, etaColonistsStr);
-
-      const etaAnd = etaLinearToFraction(A1, androidsCapTarget, aNet, 0.999);
-      setText(ui.sAndroidNet, `${signedStr(fmtNumber(aNet, 3))}/s`);
-      setText(ui.sEtaAndroids, etaAnd.ok ? formatDuration(etaAnd.seconds) : etaAnd.reason);
-
-      // Workers
-      const workers = resources.colony.workers;
-      const workersCap = Number(workers?.cap) || 0;
-      const workersReq = Number(populationModule.totalWorkersRequired) || 0;
-      const slack = workersCap - workersReq;
-
-      setText(ui.sWorkers, workers ? `${fmtNumber(workers.value, 2)} / ${fmtNumber(workers.cap, 2)}` : '—');
-      setText(ui.sWorkersReq, fmtNumber(workersReq, 2));
-      setText(ui.sWorkersSlack, `${slack >= 0 ? '+' : ''}${fmtNumber(slack, 2)}`);
-
-      ui.statusSummaryRight.textContent =
-        `${fmtPct(ecoLandPct, 2)} → ${fmtPct(targetLandPct, 1)} | capFactor ${fmtPct(capFactorNow * 100, 2)}→${fmtPct(capFactorTarget * 100, 2)}`;
-
-      const planLines = [];
-      planLines.push(`Target: ${fmtPct(targetLandPct, 1)} land in Ecumenopolis`);
-      planLines.push(`• Discrete target districts: ${fmtCount(targetEcoActive)} (achieves ${fmtPct(achievedPct, 3)})`);
-      planLines.push(Number.isFinite(nextPct) ? `• Next district would be: ${fmtPct(nextPct, 3)}` : `• Next district: — (already at max by land)`);
-      planLines.push('');
-      planLines.push(`Build: need +${fmtCount(needBuild)} | Activate: need +${fmtCount(needActivate)}`);
-      planLines.push(`Est. build gating ETA (slowest resource): ${buildEtaStr}`);
-      planLines.push('');
-      planLines.push(`Fill (99.9%): Colonists ${etaColonistsStr} | Androids ${etaAnd.ok ? formatDuration(etaAnd.seconds) : etaAnd.reason}`);
-      planLines.push('');
-      planLines.push(`Active-but-empty districts are optimal for growth: they raise K (cap), boosting (1 − pop/cap).`);
-      planLines.push(`Capacity factor now ${fmtPct(capFactorNow * 100, 2)} → target ${fmtPct(capFactorTarget * 100, 2)}`);
-
-      ui.planPre.textContent = planLines.join('\n');
-      ui.planSummaryRight.textContent = `build ${buildEtaStr} | fill ${etaColonistsStr}`;
-
-      // Warnings
-      const warnings = [];
-      const starvation = Number(populationModule.starvationShortage) || 0;
-      const energyShort = Number(populationModule.energyShortage) || 0;
-      const workersVal = Number(workers?.value) || 0;
-
-      if (a <= 0) warnings.push('Colonist base growth is 0 (happiness ≤ 50%). Improve needs/comfort/milestones.');
-      if (decayD > 0 && decayD >= a) warnings.push('Decay ≥ growth: cap-limited by starvation/energy/gravity decay.');
-      if (starvation > 0.001) warnings.push(`Starvation active: ${(starvation * 100).toFixed(1)}% starving.`);
-      if (energyShort > 0.001) warnings.push(`Power shortage: ${(energyShort * 100).toFixed(1)}% without energy.`);
-      if (workersVal < 0 || slack < 0) warnings.push(`Worker shortage: available workers ${fmtNumber(workersVal, 2)}, slack ${fmtNumber(slack, 2)}.`);
-
-      if (warnings.length) {
-        ui.warnBox.style.display = 'block';
-        ui.warnBox.classList.add('ttgo-bad');
-        ui.warnBox.textContent = '• ' + warnings.join('\n• ');
-      } else {
-        ui.warnBox.style.display = 'none';
-      }
-    } catch (e) {
-      try {
-        setText(ui.sErr, (e && (e.message || String(e))) ? (e.message || String(e)) : 'Unknown error');
-        ui.planPre.textContent = 'Update crashed. Copy “Last error” from Status.';
-      } catch (_) {}
+      const out = plan(snap);
+      render(snap, out);
+    } catch {
+      // ignore
     }
   }
 
-  /********************************************************************
-   * Hotkey: Alt+G toggle visibility (and docking)
-   ********************************************************************/
-  window.addEventListener('keydown', (e) => {
-    if (!e.altKey) return;
-    if (e.code !== 'KeyG') return;
-
-    state.hidden = !state.hidden;
-    saveSetting('hidden', state.hidden);
-
-    if (ui.panel) ui.panel.classList.toggle('ttgo-hidden', state.hidden);
-    applyDockingNow();
-  }, true);
-
-  /********************************************************************
-   * Boot
-   ********************************************************************/
-  ensurePanel();
-  applyDockingNow();
-  update();
-  setInterval(update, UPDATE_MS);
+  // Start
+  const interval = setInterval(tick, 500);
+  tick();
 
 })();
