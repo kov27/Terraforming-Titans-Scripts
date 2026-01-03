@@ -1,13 +1,13 @@
 // ==UserScript==
-// @name         Terraforming Titans Galactic Market Automator [Funding-Aware + Autobuild-Safe]
+// @name         Terraforming Titans Galactic Market Automator (Worker-Allocator Style Overlay)
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      0.1.0
-// @description  Auto-manages Galactic Market buy/sell rates with per-resource floors/ceilings, funding-aware prioritization, and autobuild starvation protection.
+// @version      0.4.0
+// @description  Automates Galactic Market by setting Buy/Sell Amount inputs + ensuring Run checkbox. Prevents zeros/negatives via floors, sells excess via ceilings, prioritizes buys under funding pressure. Firefox/Violentmonkey compatible.
 // @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
-// @match        https://html-classic.itch.zone/html/*/index.html?*
-// @match        https://itch.io/embed-upload/*?color=*
-// @match        https://itch.io/embed-upload/*
+// @match        https://html.itch.zone/html/*/index.html
+// @match        https://*.ssl.hwcdn.net/html/*/index.html
+// @match        https://*.hwcdn.net/html/*/index.html
 // @run-at       document-idle
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -17,845 +17,1189 @@
 (function () {
   'use strict';
 
-  const SCRIPT_NAME = 'TT Galactic Market Automator';
-  const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  /********************************************************************
+   * TT Shared Runtime (cross-script contract) – same pattern as allocator
+   ********************************************************************/
+  const TT = (() => {
+    const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const LS = (() => { try { return W.localStorage; } catch { return null; } })();
+    const scriptName =
+      (typeof GM_info !== 'undefined' && GM_info?.script?.name) ? GM_info.script.name : 'TT-Script';
 
-  /* =========================
-   * Shared runtime (same contract as Worker Allocator)
-   * ========================= */
-  const TT = (function ensureSharedRuntime(scriptName) {
-    if (UW.TT_SHARED_RUNTIME && UW.TT_SHARED_RUNTIME.__ok) return UW.TT_SHARED_RUNTIME;
+    const shared = W.__TT_SHARED__ || (W.__TT_SHARED__ = {
+      masterEnabled: true,
+      pauseUntil: 0,
+      locks: {},
+      lastAction: '',
+      lastError: '',
+    });
 
-    const rt = {
-      __ok: true,
-      version: 'shared-1.0',
-      locks: new Map(),
-      logPrefix: '[TT]',
-      async runExclusive(key, fn) {
-        const prev = rt.locks.get(key) || Promise.resolve();
-        let release;
-        const cur = new Promise((res) => (release = res));
-        rt.locks.set(key, prev.then(() => cur));
-        await prev;
-        try { return await fn(); }
-        finally {
-          release();
-          rt.locks.delete(key);
-        }
+    if (LS && LS.getItem('tt.masterEnabled') != null) {
+      shared.masterEnabled = LS.getItem('tt.masterEnabled') === '1';
+    }
+
+    function note(msg) {
+      const line = `[${new Date().toISOString()}] ${scriptName}: ${msg}`;
+      shared.lastAction = line;
+      console.debug(line);
+    }
+    function error(msg, err) {
+      const line = `[${new Date().toISOString()}] ${scriptName}: ERROR ${msg}${err ? ` | ${String(err)}` : ''}`;
+      shared.lastError = line;
+      console.warn(line);
+    }
+    function isPaused() { return Date.now() < (shared.pauseUntil || 0); }
+    function pause(ms, reason = '') {
+      const until = Date.now() + Math.max(0, ms | 0);
+      shared.pauseUntil = Math.max(shared.pauseUntil || 0, until);
+      note(`PAUSE ${ms}ms${reason ? `: ${reason}` : ''}`);
+    }
+    function shouldRun() { return !!shared.masterEnabled && !isPaused(); }
+
+    function tryLock(name, ttlMs = 2500) {
+      const now = Date.now();
+      const lock = shared.locks[name];
+      if (lock && lock.expiresAt > now && lock.owner !== scriptName) return false;
+      shared.locks[name] = { owner: scriptName, expiresAt: now + Math.max(250, ttlMs | 0) };
+      return true;
+    }
+    function unlock(name) {
+      const lock = shared.locks[name];
+      if (lock && lock.owner === scriptName) delete shared.locks[name];
+    }
+    function runExclusive(lockName, ttlMs, fn) {
+      if (!shouldRun()) return false;
+      if (!tryLock(lockName, ttlMs)) return false;
+      try {
+        fn();
+        return true;
+      } catch (e) {
+        error(`runExclusive(${lockName})`, e);
+        pause(1500, `exception in ${lockName}`);
+        return false;
+      } finally {
+        unlock(lockName);
       }
-    };
-    UW.TT_SHARED_RUNTIME = rt;
-    return rt;
-  })(SCRIPT_NAME);
+    }
 
-  const log = (...args) => console.log(TT.logPrefix, ...args);
-  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-  const now = () => Date.now();
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    W.__TT = W.__TT || { shared, pause };
+    return { shared, scriptName, note, error, pause, shouldRun, runExclusive };
+  })();
 
-  function tryParseNum(s, fallback = 0) {
-    const n = Number(String(s).trim());
-    return Number.isFinite(n) ? n : fallback;
-  }
+  /********************************************************************
+   * VM/Firefox sandbox bridge helpers (same approach as allocator)
+   ********************************************************************/
+  const __UW__ = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+  const __PAGE__ = (__UW__ && __UW__.wrappedJSObject) ? __UW__.wrappedJSObject : __UW__;
 
-  function fmt2(n) {
-    if (!isFinite(n)) return '∞';
-    return (Math.round(n * 100) / 100).toLocaleString(undefined, { maximumFractionDigits: 2 });
-  }
-  function fmtInt(n) {
-    if (!isFinite(n)) return '∞';
-    return Math.floor(n).toLocaleString();
-  }
-
-  /* =========================
-   * Storage
-   * ========================= */
-  const STORE_KEY = 'tt_gal_market_v010';
-  const defaultState = {
-    enabled: false,
-    minimized: false,
-
-    tickMs: 650,
-    applyThrottleMs: 650,
-
-    // How quickly to push stock toward floor/ceiling (seconds)
-    buyHorizonSec: 10,
-    sellHorizonSec: 10,
-
-    // Safety buffers
-    reserveSeconds: 8,           // keep at least this many seconds of (consumption + autobuildCost)
-    fundingBuffer: 0,            // never spend below this funding
-    fundingMinRunwaySec: 20,     // cap net spend so funding lasts at least this long (unless sells cover)
-
-    // Per-resource config:
-    // key: "colony:metal" etc
-    resources: {
-      // enabled, buyFloor, sellCeiling, hardMin, priority, maxBuyRate, maxSellRate
-    },
-
-    ui: { panelX: 18, panelY: 520, width: 720 }
-  };
-
-  function safeJsonParse(s, fallback) {
-    try { return JSON.parse(s); } catch { return fallback; }
-  }
-
-  function loadState() {
-    const raw = GM_getValue(STORE_KEY, null);
-    if (!raw) return structuredClone(defaultState);
-    const parsed = safeJsonParse(raw, null);
-    if (!parsed) return structuredClone(defaultState);
-
-    const s = structuredClone(defaultState);
-    Object.assign(s, parsed);
-    s.resources = Object.assign({}, defaultState.resources, parsed.resources || {});
-    s.ui = Object.assign({}, defaultState.ui, parsed.ui || {});
-    return s;
-  }
-
-  function saveState() {
-    GM_setValue(STORE_KEY, JSON.stringify(state));
-  }
-
-  let state = loadState();
-
-  /* =========================
-   * Page access helpers
-   * ========================= */
   function getPageProp(name) {
-    try {
-      if (UW && UW[name] !== undefined) return UW[name];
-      if (UW && UW.wrappedJSObject && UW.wrappedJSObject[name] !== undefined) return UW.wrappedJSObject[name];
-    } catch {}
+    try { if (__PAGE__ && typeof __PAGE__[name] !== 'undefined') return __PAGE__[name]; } catch { }
+    try { if (__UW__ && typeof __UW__[name] !== 'undefined') return __UW__[name]; } catch { }
     return undefined;
   }
 
+  /********************************************************************
+   * Storage (GM fallback to localStorage)
+   ********************************************************************/
+  const STORE_KEY = 'ttgm__';
+  const hasGM = (typeof GM_getValue === 'function') && (typeof GM_setValue === 'function');
+
+  function getVal(key, def) {
+    try {
+      if (hasGM) return GM_getValue(key, def);
+      const raw = localStorage.getItem(STORE_KEY + key);
+      return (raw == null) ? def : JSON.parse(raw);
+    } catch { return def; }
+  }
+  function setVal(key, val) {
+    try {
+      if (hasGM) return GM_setValue(key, val);
+      localStorage.setItem(STORE_KEY + key, JSON.stringify(val));
+    } catch { }
+  }
+
+  /********************************************************************
+   * Small utils
+   ********************************************************************/
+  const SUFFIX_FMT = [[1e24, 'Y'], [1e21, 'Z'], [1e18, 'E'], [1e15, 'P'], [1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+  function fmtNum(x) {
+    if (!Number.isFinite(x)) return '—';
+    const ax = Math.abs(x);
+    for (let i = 0; i < SUFFIX_FMT.length; i++) {
+      const [v, s] = SUFFIX_FMT[i];
+      if (ax >= v) {
+        const d = (ax >= v * 100) ? 0 : (ax >= v * 10) ? 1 : 2;
+        return (x / v).toFixed(d) + s;
+      }
+    }
+    if (ax >= 100) return x.toFixed(0);
+    if (ax >= 10) return x.toFixed(1);
+    if (ax >= 1) return x.toFixed(2);
+    if (ax === 0) return '0';
+    return x.toExponential(3);
+  }
+  function clamp(x, a, b) {
+    const n = Number(x);
+    if (!Number.isFinite(n)) return a;
+    return Math.max(a, Math.min(b, n));
+  }
+  function toNum(x, d = 0) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : d;
+  }
+  function parseNumber(text) {
+    if (text == null) return NaN;
+    let s = String(text).trim().replace(/,/g, '').replace(/\u2212/g, '-');
+    if (/^-?\d+(\.\d+)?e[+\-]?\d+$/i.test(s)) return Number(s);
+
+    const m = s.match(/^(-?\d+(\.\d+)?)(\s*[a-zA-Z]{1,3})?$/);
+    if (!m) {
+      const t = s.match(/-?\d+(\.\d+)?(e[+\-]?\d+)?/i);
+      return t ? parseNumber(t[0]) : NaN;
+    }
+    const base = Number(m[1]);
+    if (!Number.isFinite(base)) return NaN;
+    const suf = (m[3] || '').trim().toLowerCase();
+    const mult = (() => {
+      if (!suf) return 1;
+      if (suf === 'k') return 1e3;
+      if (suf === 'm') return 1e6;
+      if (suf === 'b') return 1e9;
+      if (suf === 't') return 1e12;
+      if (suf === 'qa') return 1e15;
+      if (suf === 'qi') return 1e18;
+      if (suf === 'g') return 1e9;
+      return 1;
+    })();
+    return base * mult;
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  function visible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect?.();
+    if (!r) return true;
+    return r.width > 2 && r.height > 2;
+  }
+
+  function setNativeValue(input, value) {
+    if (!input) return;
+    const v = String(value);
+    const proto = Object.getPrototypeOf(input);
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(input, v);
+    else input.value = v;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  /********************************************************************
+   * Settings
+   ********************************************************************/
+  const DEFAULTS = {
+    running: false,
+    minimized: false,
+
+    tickMs: 650,
+
+    // Buffer model
+    reserveSeconds: 8,        // adds cons*reserveSeconds to floor
+    buyHorizonSec: 10,        // fill deficits over this time constant
+    sellHorizonSec: 10,       // bleed excess over this time constant
+
+    // Funding policy
+    minFundingBuffer: 0,      // do not spend below this
+    desiredFunding: 0,        // if funding < max(minBuffer, desired), bias toward selling before buying
+    manageMarketRun: true,    // ensure Galactic Market "Run" checkbox is checked while running
+
+    // Safety
+    dryRun: false,            // if true: compute + display only, do not write inputs/click
+    maxBuyPerTick: 1e12,
+    maxSellPerTick: 1e12,
+
+    // per-resource config by market display name
+    resources: {
+      // auto-populated when market rows are detected
+      // "Metal": { enabled:true, hardMin:0, buyFloor:0, sellCeiling:0, priority:3 }
+    }
+  };
+
+  const state = (() => {
+    const s = getVal('settings', DEFAULTS);
+    const out = {};
+    for (const k in DEFAULTS) out[k] = DEFAULTS[k];
+    for (const k in s) out[k] = s[k];
+    out.resources = out.resources || {};
+    return out;
+  })();
+  function saveSettings() { setVal('settings', state); }
+
+  /********************************************************************
+   * Bridge: read live resources + rates from game globals
+   ********************************************************************/
+  function getDirectApi() {
+    function safeNumber(x) { return (typeof x === 'number' && isFinite(x)) ? x : 0; }
+
+    function snapshot() {
+      const resources = getPageProp('resources');
+      if (!resources || typeof resources !== 'object') return null;
+
+      const list = [];
+      let funding = null;
+
+      for (const cat in resources) {
+        const grp = resources[cat];
+        if (!grp || typeof grp !== 'object') continue;
+        for (const key in grp) {
+          const r = grp[key];
+          if (!r || typeof r !== 'object') continue;
+          if (typeof r.value === 'undefined') continue;
+
+          const name = (r.displayName || r.name || key);
+          const obj = {
+            id: `${cat}:${key}`,
+            cat, key,
+            name: String(name),
+            value: safeNumber(r.value),
+            cap: safeNumber(r.cap),
+            prod: safeNumber(r.productionRate),
+            cons: safeNumber(r.consumptionRate),
+            net: safeNumber(r.productionRate) - safeNumber(r.consumptionRate),
+            overflow: safeNumber(r.overflowRate),
+            unlocked: !!r.unlocked
+          };
+          list.push(obj);
+
+          const nlow = String(name).toLowerCase();
+          const klow = String(key).toLowerCase();
+          if (!funding && (nlow === 'funding' || klow === 'funding')) funding = obj;
+        }
+      }
+
+      return { list, funding };
+    }
+
+    return {
+      mode: 'direct',
+      ready() {
+        try {
+          const resources = getPageProp('resources');
+          return !!(resources && resources.colony);
+        } catch { return false; }
+      },
+      snapshot
+    };
+  }
+
   function injectBridge() {
-    if (UW.__TT_MARKET_BRIDGE__) return;
+    if (getPageProp('__TT_MARKET__')) return;
 
-    const code = `
-      (function(){
-        if (window.__TT_MARKET_BRIDGE__) return;
-
-        function pick(obj, keys){
-          const out = {};
-          for (const k of keys) out[k] = obj[k];
-          return out;
-        }
-
-        function getMarketProject(){
-          try{
-            const pm = window.projectManager;
-            if (!pm || !pm.projects) return null;
-            return pm.projects.galactic_market || null;
-          }catch(e){ return null; }
-        }
-
-        function listTradeable(){
-          const p = getMarketProject();
-          if (!p || !p.attributes || !p.attributes.resourceChoiceGainCost) return [];
-          const rcgc = p.attributes.resourceChoiceGainCost;
-          const out = [];
-          for (const cat in rcgc){
-            for (const rk in rcgc[cat]){
-              out.push({ cat, rk });
+    const code =
+      `(function(){
+        if (window.__TT_MARKET__) return;
+        function safeNumber(x){ return (typeof x==='number' && isFinite(x)) ? x : 0; }
+        window.__TT_MARKET__ = {
+          ready: function(){
+            try { return (typeof resources!=='undefined') && resources && resources.colony; } catch(e){ return false; }
+          },
+          snapshot: function(){
+            try{
+              var out = { list: [], funding: null };
+              if (typeof resources==='undefined' || !resources) return out;
+              for (var cat in resources){
+                var grp = resources[cat];
+                if (!grp || typeof grp!=='object') continue;
+                for (var key in grp){
+                  var r = grp[key];
+                  if (!r || typeof r!=='object') continue;
+                  if (typeof r.value==='undefined') continue;
+                  var name = (r.displayName || r.name || key);
+                  var obj = {
+                    id: String(cat)+':'+String(key),
+                    cat: String(cat),
+                    key: String(key),
+                    name: String(name),
+                    value: safeNumber(r.value),
+                    cap: safeNumber(r.cap),
+                    prod: safeNumber(r.productionRate),
+                    cons: safeNumber(r.consumptionRate),
+                    net: safeNumber(r.productionRate) - safeNumber(r.consumptionRate),
+                    overflow: safeNumber(r.overflowRate),
+                    unlocked: !!r.unlocked
+                  };
+                  out.list.push(obj);
+                  var nlow = String(name).toLowerCase();
+                  var klow = String(key).toLowerCase();
+                  if (!out.funding && (nlow==='funding' || klow==='funding')) out.funding = obj;
+                }
+              }
+              return out;
+            } catch(e){
+              return { list: [], funding: null };
             }
           }
-          return out;
-        }
+        };
+      })();`;
 
-        function getAutoBuildCostPerSec(cat, rk){
-          try{
-            const t = window.autobuildCostTracker;
-            if (!t || !t.getAverageCost) return 0;
-            return Number(t.getAverageCost(cat, rk) || 0);
-          }catch(e){ return 0; }
-        }
-
-        function ready(){
-          return !!(window.resources && window.projectManager && window.autobuildCostTracker);
-        }
-
-        function snapshot(){
-          const p = getMarketProject();
-          const resources = window.resources;
-          const list = listTradeable();
-
-          const funding = (resources.colony && resources.colony.funding) ? pick(resources.colony.funding, ['value','cap','production','consumption','net','unlocked']) : null;
-
-          const outRes = [];
-          for (const it of list){
-            const r = (resources[it.cat] && resources[it.cat][it.rk]) ? resources[it.cat][it.rk] : null;
-            if (!r) continue;
-
-            const autoCost = getAutoBuildCostPerSec(it.cat, it.rk);
-            outRes.push({
-              key: it.cat + ':' + it.rk,
-              cat: it.cat,
-              rk: it.rk,
-              value: Number(r.value || 0),
-              cap: Number(r.cap || 0),
-              production: Number(r.production || 0),
-              consumption: Number(r.consumption || 0),
-              net: Number(r.net || 0),
-              unlocked: (r.unlocked !== false),
-              autoCost: autoCost,
-              autobuildShortage: !!r.autobuildShortage,
-            });
-          }
-
-          // Market availability: project must be unlocked and completed at least once (repeatCount>0)
-          const marketStatus = p ? {
-            exists: true,
-            unlocked: (p.unlocked !== false),
-            repeatCount: Number(p.repeatCount || 0),
-            // prices can be fetched via methods on p
-          } : { exists: false, unlocked: false, repeatCount: 0 };
-
-          return {
-            ts: Date.now(),
-            market: marketStatus,
-            funding,
-            res: outRes
-          };
-        }
-
-        function apply(orders){
-          // orders: { buy:[{cat,rk,qty}], sell:[{cat,rk,qty}] }
-          const p = getMarketProject();
-          if (!p) return;
-
-          // sanitize to expected selection objects
-          p.buySelections = (orders.buy || []).map(o => ({ category: o.cat, name: o.rk, quantity: Number(o.qty || 0) }));
-          p.sellSelections = (orders.sell || []).map(o => ({ category: o.cat, name: o.rk, quantity: Number(o.qty || 0) }));
-
-          // UI updates are safe even if UI isn't open (they no-op if elements missing)
-          try { if (p.updateSelectedResources) p.updateSelectedResources(); } catch(e){}
-          try { if (p.updateTotalCostDisplay) p.updateTotalCostDisplay(); } catch(e){}
-        }
-
-        function prices(cat, rk, qtyBuy, qtySell){
-          const p = getMarketProject();
-          if (!p) return null;
-          try{
-            const bp = p.getBuyPrice(cat, rk, Number(qtyBuy || 0));
-            const sp = p.getSellPrice(cat, rk, Number(qtySell || 0));
-            const sat = p.getSaturationSellAmount ? p.getSaturationSellAmount(cat, rk) : null;
-            return { buyPrice: Number(bp||0), sellPrice: Number(sp||0), saturation: sat==null?null:Number(sat||0) };
-          }catch(e){ return null; }
-        }
-
-        window.__TT_MARKET_BRIDGE__ = { ready, snapshot, apply, prices };
-      })();
-    `;
-    const el = document.createElement('script');
-    el.textContent = code;
-    document.documentElement.appendChild(el);
-    el.remove();
+    const s = document.createElement('script');
+    s.textContent = code;
+    document.documentElement.appendChild(s);
+    s.parentNode.removeChild(s);
   }
 
   function getApi() {
-    // Prefer direct, else bridge.
-    const resources = getPageProp('resources');
-    const projectManager = getPageProp('projectManager');
-    const autobuildCostTracker = getPageProp('autobuildCostTracker');
-
-    if (resources && projectManager && autobuildCostTracker) {
-      const p = projectManager.projects && projectManager.projects.galactic_market;
-      return {
-        ready: () => true,
-        snapshot: () => {
-          const list = [];
-          const rcgc = p && p.attributes && p.attributes.resourceChoiceGainCost;
-          if (rcgc) {
-            for (const cat in rcgc) for (const rk in rcgc[cat]) list.push({ cat, rk });
-          }
-
-          const funding = (resources.colony && resources.colony.funding) ? {
-            value: Number(resources.colony.funding.value || 0),
-            cap: Number(resources.colony.funding.cap || 0),
-            production: Number(resources.colony.funding.production || 0),
-            consumption: Number(resources.colony.funding.consumption || 0),
-            net: Number(resources.colony.funding.net || 0),
-            unlocked: (resources.colony.funding.unlocked !== false),
-          } : null;
-
-          const outRes = [];
-          for (const it of list) {
-            const r = resources[it.cat] && resources[it.cat][it.rk];
-            if (!r) continue;
-            const autoCost = Number(autobuildCostTracker.getAverageCost(it.cat, it.rk) || 0);
-            outRes.push({
-              key: it.cat + ':' + it.rk,
-              cat: it.cat,
-              rk: it.rk,
-              value: Number(r.value || 0),
-              cap: Number(r.cap || 0),
-              production: Number(r.production || 0),
-              consumption: Number(r.consumption || 0),
-              net: Number(r.net || 0),
-              unlocked: (r.unlocked !== false),
-              autoCost,
-              autobuildShortage: !!r.autobuildShortage,
-            });
-          }
-
-          const market = p ? {
-            exists: true,
-            unlocked: (p.unlocked !== false),
-            repeatCount: Number(p.repeatCount || 0),
-          } : { exists: false, unlocked: false, repeatCount: 0 };
-
-          return { ts: Date.now(), market, funding, res: outRes };
-        },
-        apply: (orders) => {
-          if (!p) return;
-          p.buySelections = (orders.buy || []).map(o => ({ category: o.cat, name: o.rk, quantity: Number(o.qty || 0) }));
-          p.sellSelections = (orders.sell || []).map(o => ({ category: o.cat, name: o.rk, quantity: Number(o.qty || 0) }));
-          try { if (p.updateSelectedResources) p.updateSelectedResources(); } catch {}
-          try { if (p.updateTotalCostDisplay) p.updateTotalCostDisplay(); } catch {}
-        },
-        prices: (cat, rk, qtyBuy, qtySell) => {
-          if (!p) return null;
-          try {
-            const buyPrice = Number(p.getBuyPrice(cat, rk, Number(qtyBuy || 0)) || 0);
-            const sellPrice = Number(p.getSellPrice(cat, rk, Number(qtySell || 0)) || 0);
-            const saturation = p.getSaturationSellAmount ? Number(p.getSaturationSellAmount(cat, rk) || 0) : null;
-            return { buyPrice, sellPrice, saturation };
-          } catch { return null; }
-        }
-      };
-    }
-
-    injectBridge();
-    const bridge = UW.__TT_MARKET_BRIDGE__ || (UW.wrappedJSObject && UW.wrappedJSObject.__TT_MARKET_BRIDGE__);
-    if (!bridge || !bridge.ready || !bridge.ready()) return null;
-    return bridge;
+    const injected = getPageProp('__TT_MARKET__');
+    if (injected && typeof injected.ready === 'function') return injected;
+    return getDirectApi();
   }
 
-  /* =========================
-   * Planner
-   * ========================= */
-  function ensureResCfg(key) {
-    if (!state.resources[key]) {
-      state.resources[key] = {
-        enabled: false,
-        buyFloor: 0,
-        sellCeiling: 0,
-        hardMin: 0,
-        priority: 50,
-        maxBuyRate: 0,   // 0 = unlimited
-        maxSellRate: 0,  // 0 = unlimited
-      };
+  /********************************************************************
+   * Market DOM detection (FIXED: no “buy/sell button” assumption)
+   ********************************************************************/
+  const market = {
+    panel: null,
+    table: null,
+    runCheckbox: null,
+    rows: new Map(), // name -> { name, tr, sellInput, buyInput, sellPrice, buyPrice }
+    detected: false,
+    lastSig: ''
+  };
+
+  function findMarketPanel() {
+    // Prefer headings / unique text
+    const all = Array.from(document.querySelectorAll('div,section,aside'))
+      .filter(visible)
+      .filter(el => {
+        const t = (el.textContent || '').toLowerCase();
+        return t.includes('galactic market') && t.includes('total cost');
+      });
+
+    if (all.length) {
+      all.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width);
+      return all[0];
     }
-    return state.resources[key];
+
+    // Fallback: any big panel with market-ish keywords
+    const candidates = Array.from(document.querySelectorAll('div,section,aside'))
+      .filter(visible)
+      .filter(el => {
+        const t = (el.textContent || '').toLowerCase();
+        return t.includes('galactic market') || (t.includes('sell amount') && t.includes('buy amount') && t.includes('total cost'));
+      });
+
+    candidates.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width);
+    return candidates[0] || null;
   }
 
-  function planOrders(snap, api) {
-    const funding = snap.funding;
-    const marketOk =
-      snap.market &&
-      snap.market.exists &&
-      snap.market.unlocked &&
-      snap.market.repeatCount > 0;
+  function findRunCheckbox(panel) {
+    if (!panel) return null;
+    const scope = [panel, panel.parentElement].filter(Boolean);
 
-    const debug = {
-      marketOk,
-      totalBuyCostPerSec: 0,
-      totalSellGainPerSec: 0,
-      netFundingPerSec: 0,
-      allocations: []
-    };
+    const checks = [];
+    for (const root of scope) {
+      const inputs = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+      for (const inp of inputs) {
+        const wrap = inp.closest('label') || inp.parentElement;
+        const txt = (wrap ? wrap.textContent : inp.textContent) || '';
+        const t = txt.toLowerCase().replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        if (t === 'run' || (t.includes('run') && !t.includes('auto start'))) checks.push({ inp, t });
+      }
+    }
+    if (!checks.length) return null;
+    checks.sort((a, b) => a.t.length - b.t.length);
+    return checks[0].inp || null;
+  }
 
-    if (!marketOk) {
-      return { orders: { buy: [], sell: [] }, debug, reason: 'Market not active (complete Galactic Market project once).' };
+  function scanMarket() {
+    const panel = findMarketPanel();
+    market.panel = panel;
+    market.detected = !!panel;
+    market.rows.clear();
+    market.table = null;
+    market.runCheckbox = null;
+
+    if (!panel) {
+      market.lastSig = '';
+      return;
     }
 
-    const fundingVal = funding ? Number(funding.value || 0) : 0;
-    const fundingNet = funding ? Number(funding.net || 0) : 0;
-    const fundingBuffer = Math.max(0, Number(state.fundingBuffer || 0));
-    const runwaySec = Math.max(5, Number(state.fundingMinRunwaySec || 20));
+    market.runCheckbox = findRunCheckbox(panel);
 
-    // Build needs list
-    const wants = [];
-    const sells = [];
+    const table = panel.querySelector('table');
+    market.table = table || null;
 
-    for (const r of snap.res) {
-      const cfg = ensureResCfg(r.key);
+    // Best path: actual table rows
+    if (table) {
+      // Map header indices if present
+      const headerCells =
+        Array.from(table.querySelectorAll('thead th')).length ? Array.from(table.querySelectorAll('thead th')) :
+        Array.from(table.querySelectorAll('tr')).length ? Array.from(table.querySelectorAll('tr'))[0].querySelectorAll('th,td') : [];
 
-      if (!cfg.enabled) continue;
-      if (r.unlocked === false) continue;
+      const idx = {
+        resource: -1,
+        sellPrice: -1,
+        sellAmount: -1,
+        buyAmount: -1,
+        buyPrice: -1
+      };
 
-      const consTotal = Math.max(0, Number(r.consumption || 0)) + Math.max(0, Number(r.autoCost || 0));
-      const reserve = consTotal * Math.max(0, Number(state.reserveSeconds || 0));
-      const hardMin = Math.max(0, Number(cfg.hardMin || 0), reserve);
-
-      const buyFloor = Math.max(0, Number(cfg.buyFloor || 0), hardMin);
-      const sellCeiling = Math.max(0, Number(cfg.sellCeiling || 0));
-
-      // BUY: if below floor, compute buy rate to reach in buyHorizonSec
-      if (buyFloor > 0 && r.value < buyFloor) {
-        const need = (buyFloor - r.value);
-        let rate = need / Math.max(1, Number(state.buyHorizonSec || 10));
-        if (cfg.maxBuyRate > 0) rate = Math.min(rate, Number(cfg.maxBuyRate));
-        // Autobuild shortage -> bump urgency a bit
-        const urgency = (r.autobuildShortage ? 1.25 : 1.0) * (need / Math.max(1, buyFloor));
-        wants.push({
-          cat: r.cat, rk: r.rk, key: r.key,
-          priority: Number(cfg.priority || 50),
-          urgency,
-          rate
+      if (headerCells && headerCells.length) {
+        headerCells.forEach((c, i) => {
+          const t = (c.textContent || '').toLowerCase();
+          if (t.includes('resource')) idx.resource = i;
+          if (t.includes('sell price')) idx.sellPrice = i;
+          if (t.includes('sell amount')) idx.sellAmount = i;
+          if (t.includes('buy amount')) idx.buyAmount = i;
+          if (t.includes('buy price')) idx.buyPrice = i;
         });
       }
 
-      // SELL: if above ceiling, compute sell rate to reach in sellHorizonSec
-      if (sellCeiling > 0 && r.value > sellCeiling) {
-        const excess = (r.value - sellCeiling);
-        let rate = excess / Math.max(1, Number(state.sellHorizonSec || 10));
-        // Never sell below hardMin
-        const maxSafe = Math.max(0, (r.value - hardMin) / Math.max(1, Number(state.sellHorizonSec || 10)));
-        rate = Math.min(rate, maxSafe);
-        if (cfg.maxSellRate > 0) rate = Math.min(rate, Number(cfg.maxSellRate));
-        if (rate > 0) sells.push({ cat: r.cat, rk: r.rk, key: r.key, rate });
+      const bodyRows = Array.from(table.querySelectorAll('tbody tr')).filter(visible);
+      for (const tr of bodyRows) {
+        const tds = Array.from(tr.querySelectorAll('td'));
+        const inputs = Array.from(tr.querySelectorAll('input')).filter(inp => inp && inp.type !== 'checkbox');
+        if (inputs.length < 2) continue;
+
+        const nameCell = (idx.resource >= 0 && tds[idx.resource]) ? tds[idx.resource] : tds[0];
+        const name = (nameCell ? nameCell.textContent : tr.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!name) continue;
+
+        const sellInput = (idx.sellAmount >= 0 && tds[idx.sellAmount]) ? (tds[idx.sellAmount].querySelector('input') || null) : inputs[0];
+        const buyInput = (idx.buyAmount >= 0 && tds[idx.buyAmount]) ? (tds[idx.buyAmount].querySelector('input') || null) : inputs[1];
+
+        // Prices: from mapped cells if possible, else heuristics based on nearby cells
+        const sellPrice =
+          (idx.sellPrice >= 0 && tds[idx.sellPrice]) ? parseNumber(tds[idx.sellPrice].textContent) :
+          inferPriceFromRow(tr, 'sell');
+
+        const buyPrice =
+          (idx.buyPrice >= 0 && tds[idx.buyPrice]) ? parseNumber(tds[idx.buyPrice].textContent) :
+          inferPriceFromRow(tr, 'buy');
+
+        market.rows.set(name, { name, tr, sellInput, buyInput, sellPrice, buyPrice });
+      }
+    } else {
+      // Fallback path: any element inside panel that has 2 inputs (sell + buy)
+      const candidates = Array.from(panel.querySelectorAll('tr,div,li'))
+        .filter(visible)
+        .filter(el => Array.from(el.querySelectorAll('input')).filter(i => i.type !== 'checkbox').length >= 2);
+
+      for (const el of candidates) {
+        const inputs = Array.from(el.querySelectorAll('input')).filter(i => i.type !== 'checkbox');
+        if (inputs.length < 2) continue;
+        // Attempt to take first “wordy” part as resource name
+        const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!txt) continue;
+        const name = txt.split(/\s{2,}|\n/)[0].trim();
+        if (!name) continue;
+
+        market.rows.set(name, {
+          name,
+          tr: el,
+          sellInput: inputs[0],
+          buyInput: inputs[1],
+          sellPrice: inferPriceFromRow(el, 'sell'),
+          buyPrice: inferPriceFromRow(el, 'buy')
+        });
       }
     }
 
-    // Compute sell gain estimate (rough; uses current price at that qty)
-    // We do sells first so buys can be funded by them.
-    const sellOrders = [];
-    let sellGainPerSec = 0;
-    for (const s of sells) {
-      const pr = api.prices ? api.prices(s.cat, s.rk, 0, s.rate) : null;
-      const sellPrice = pr ? Number(pr.sellPrice || 0) : 0;
-      // Saturation guard (don’t exceed saturation too much)
-      if (pr && pr.saturation && pr.saturation > 0) {
-        const sat = pr.saturation;
-        const capped = Math.min(s.rate, sat * 0.95);
-        if (capped <= 0) continue;
-        s.rate = capped;
+    // Update signature to decide if UI rows need rebuild
+    const sig = Array.from(market.rows.keys()).sort().join('|');
+    market.lastSig = sig;
+
+    // Ensure config exists for detected market resources
+    for (const name of market.rows.keys()) {
+      if (!state.resources[name]) {
+        state.resources[name] = { enabled: true, hardMin: 0, buyFloor: 0, sellCeiling: 0, priority: 3 };
       }
-      sellGainPerSec += s.rate * sellPrice;
-      sellOrders.push({ cat: s.cat, rk: s.rk, qty: s.rate });
     }
-
-    // Funding budget for buys:
-    // We aim to keep funding above buffer and not spend so fast that runway would drop below runwaySec.
-    // Available runway spend per sec approx = (fundingVal - buffer)/runwaySec + max(0, fundingNet) + sellGainPerSec
-    const spendCapPerSec = Math.max(0, (fundingVal - fundingBuffer) / runwaySec) + Math.max(0, fundingNet) + Math.max(0, sellGainPerSec);
-
-    // Sort buys by priority then urgency
-    wants.sort((a, b) => {
-      const dp = (b.priority - a.priority);
-      if (dp !== 0) return dp;
-      return (b.urgency - a.urgency);
-    });
-
-    const buyOrders = [];
-    let remainingSpend = spendCapPerSec;
-
-    for (const w of wants) {
-      if (remainingSpend <= 0) break;
-      const pr = api.prices ? api.prices(w.cat, w.rk, w.rate, 0) : null;
-      const buyPrice = pr ? Number(pr.buyPrice || 0) : 0;
-      if (buyPrice <= 0) continue;
-
-      const maxRateBySpend = remainingSpend / buyPrice;
-      const qty = Math.max(0, Math.min(w.rate, maxRateBySpend));
-      if (qty <= 0) continue;
-
-      buyOrders.push({ cat: w.cat, rk: w.rk, qty });
-      remainingSpend -= qty * buyPrice;
-
-      debug.allocations.push({ key: w.key, qty, buyPrice, costPerSec: qty * buyPrice, priority: w.priority, urgency: w.urgency });
-    }
-
-    // Final funding deltas (rough)
-    let buyCostPerSec = 0;
-    for (const b of buyOrders) {
-      const pr = api.prices ? api.prices(b.cat, b.rk, b.qty, 0) : null;
-      const buyPrice = pr ? Number(pr.buyPrice || 0) : 0;
-      buyCostPerSec += b.qty * buyPrice;
-    }
-
-    debug.totalBuyCostPerSec = buyCostPerSec;
-    debug.totalSellGainPerSec = sellGainPerSec;
-    debug.netFundingPerSec = sellGainPerSec - buyCostPerSec + Math.max(0, fundingNet);
-
-    return { orders: { buy: buyOrders, sell: sellOrders }, debug, reason: null };
+    saveSettings();
   }
 
-  /* =========================
-   * UI (Worker Allocator style)
-   * ========================= */
-  const dom = {};
-  let dragging = false;
-  let dragOffX = 0;
-  let dragOffY = 0;
+  function inferPriceFromRow(rowEl, which) {
+    // Heuristic: find small-ish numeric tokens in row; pick sell as first price-like after saturation, buy as last.
+    const t = (rowEl.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!t) return NaN;
 
-  function injectStyles() {
-    const css = `
-      :root { color-scheme: dark; }
-      .ttgm-root {
-        position: fixed;
-        left: ${state.ui.panelX}px;
-        top: ${state.ui.panelY}px;
-        width: ${state.ui.width}px;
-        z-index: 2147483645;
-        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-        font-size: 12px;
-        color: #e6e6e6;
-      }
-      .ttgm-panel {
-        background: rgba(25,25,28,0.92);
-        border: 1px solid rgba(255,255,255,0.10);
-        border-radius: 10px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.4);
-        overflow: hidden;
-        user-select: none;
-      }
-      .ttgm-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px 10px;
-        background: rgba(45,45,52,0.90);
-        border-bottom: 1px solid rgba(255,255,255,0.08);
-        cursor: move;
-      }
-      .ttgm-title { font-weight: 700; letter-spacing: 0.2px; }
-      .ttgm-btns { display: flex; gap: 6px; }
-      .ttgm-btn {
-        appearance: none;
-        border: 1px solid rgba(255,255,255,0.12);
-        background: rgba(0,0,0,0.15);
-        color: #e6e6e6;
-        padding: 6px 8px;
-        border-radius: 8px;
-        cursor: pointer;
-      }
-      .ttgm-btn:hover { background: rgba(255,255,255,0.06); }
-      .ttgm-btn.primary {
-        background: rgba(70,120,255,0.25);
-        border-color: rgba(70,120,255,0.40);
-      }
-      .ttgm-btn.danger {
-        background: rgba(255,80,80,0.22);
-        border-color: rgba(255,80,80,0.35);
-      }
-      .ttgm-body { padding: 10px; }
-      .ttgm-row { display:flex; gap: 10px; align-items:center; margin-bottom: 8px; }
-      .ttgm-spacer { flex: 1; }
-      .ttgm-pill {
-        display: inline-flex;
-        gap: 8px;
-        align-items: center;
-        padding: 6px 8px;
-        border: 1px solid rgba(255,255,255,0.12);
-        background: rgba(0,0,0,0.12);
-        border-radius: 10px;
-      }
-      .ttgm-toggle { display:inline-flex; align-items:center; gap:8px; }
-      .ttgm-toggle input[type="checkbox"] { transform: translateY(1px); }
-      .ttgm-input {
-        border: 1px solid rgba(255,255,255,0.12);
-        background: rgba(0,0,0,0.15);
-        color: #e6e6e6;
-        border-radius: 8px;
-        padding: 6px 8px;
-        outline: none;
-      }
-      .ttgm-input.small { width: 90px; }
-      .ttgm-grid {
-        display: grid;
-        grid-template-columns: 1.25fr 0.55fr 0.75fr 0.75fr 0.75fr 0.6fr 0.8fr;
-        gap: 6px;
-        align-items: center;
-      }
-      .ttgm-grid .hdr { opacity: 0.75; font-weight: 700; padding: 4px 0; }
-      .ttgm-cell { padding: 2px 0; }
-      .ttgm-muted { opacity: 0.7; }
-      .ttgm-hr { height:1px; background: rgba(255,255,255,0.08); margin: 10px 0; }
-      .ttgm-status { white-space: pre-wrap; }
-    `;
-    const style = document.createElement('style');
-    style.textContent = css;
-    document.head.appendChild(style);
+    // extract tokens like 0.5, 10, 200, 3.7T etc (we only want *prices*, usually no suffix or small)
+    const toks = t.match(/-?\d+(\.\d+)?\s*(K|M|B|T|Qa|Qi)?/g) || [];
+    const nums = toks.map(parseNumber).filter(n => Number.isFinite(n));
+    if (nums.length < 2) return NaN;
+
+    // Prefer values that are not astronomically large (exclude saturation like 3.7T etc)
+    const filtered = nums.filter(n => Math.abs(n) <= 1e9); // buy prices can be high, but usually << 1e9
+    const pool = filtered.length ? filtered : nums;
+
+    if (which === 'sell') return pool[0];
+    return pool[pool.length - 1];
   }
 
-  function el(tag, attrs = {}, children = []) {
+  /********************************************************************
+   * Live resource index (map market row name -> resource snapshot)
+   ********************************************************************/
+  function normalizeKey(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  }
+
+  function buildResourceIndex(snapshot) {
+    const idx = new Map();
+    if (!snapshot || !snapshot.list) return idx;
+    for (const r of snapshot.list) {
+      const name = String(r.name || '').trim();
+      const key = String(r.key || '').trim();
+      const add = (k) => {
+        const nk = normalizeKey(k);
+        if (!nk) return;
+        if (!idx.has(nk)) idx.set(nk, r);
+      };
+      add(name);
+      add(key);
+      // singular/plural helpers
+      if (name.endsWith('s')) add(name.slice(0, -1));
+      if (key.endsWith('s')) add(key.slice(0, -1));
+    }
+    return idx;
+  }
+
+  function getResForMarketName(resIndex, marketName) {
+    if (!resIndex) return null;
+    const n = normalizeKey(marketName);
+    if (resIndex.has(n)) return resIndex.get(n);
+
+    // small fallbacks: add/remove trailing s
+    if (n.endsWith('s') && resIndex.has(n.slice(0, -1))) return resIndex.get(n.slice(0, -1));
+    if (resIndex.has(n + 's')) return resIndex.get(n + 's');
+    return null;
+  }
+
+  /********************************************************************
+   * Decision logic
+   ********************************************************************/
+  function cfg(name) { return state.resources[name] || {}; }
+  function prio(name) { return clamp(toNum(cfg(name).priority, 3), 1, 9); }
+  function hardMin(name) { return Math.max(0, toNum(cfg(name).hardMin, 0)); }
+  function buyFloor(name) { return Math.max(hardMin(name), Math.max(0, toNum(cfg(name).buyFloor, 0))); }
+  function sellCeil(name) {
+    const v = toNum(cfg(name).sellCeiling, 0);
+    if (!Number.isFinite(v) || v <= 0) return Infinity;
+    return Math.max(buyFloor(name), v);
+  }
+
+  function computePlan(snapshot, resIndex) {
+    const funding = snapshot?.funding ? snapshot.funding.value : NaN;
+    const fundingKnown = Number.isFinite(funding);
+    const minBuf = Math.max(0, toNum(state.minFundingBuffer, 0));
+    const desired = Math.max(0, toNum(state.desiredFunding, 0));
+    const fundingTarget = Math.max(minBuf, desired);
+    const fundingShort = fundingKnown ? (funding < fundingTarget) : false;
+
+    const reserveS = clamp(toNum(state.reserveSeconds, 8), 0, 600);
+    const buyH = Math.max(1e-6, clamp(toNum(state.buyHorizonSec, 10), 1, 3600));
+    const sellH = Math.max(1e-6, clamp(toNum(state.sellHorizonSec, 10), 1, 3600));
+
+    // first compute raw desired buy/sell amounts (rates -> "amount" input)
+    const sells = [];
+    const buys = [];
+
+    for (const [name, row] of market.rows.entries()) {
+      const rc = cfg(name);
+      if (!rc.enabled) continue;
+
+      const rs = getResForMarketName(resIndex, name);
+      const value = rs ? toNum(rs.value, 0) : NaN;
+      const net = rs ? toNum(rs.net, 0) : NaN;
+      const cons = rs ? Math.max(0, toNum(rs.cons, 0)) : 0;
+
+      // Consumption-based buffer adds to floor
+      const floor = Math.max(buyFloor(name), cons * reserveS);
+      const ceilV = sellCeil(name);
+
+      // Keep ceilings sane
+      const ceilSafe = Math.max(ceilV, floor);
+
+      // desired amounts are per "time constant" (game market runs continuously while Run is enabled)
+      const deficit = Number.isFinite(value) ? Math.max(0, floor - value) : 0;
+      const excess = (Number.isFinite(value) && Number.isFinite(ceilSafe) && ceilSafe !== Infinity) ? Math.max(0, value - ceilSafe) : 0;
+
+      // Critical levels: prevent 0/negative/under hardMin
+      const hm = hardMin(name);
+      const crit = Number.isFinite(value) ? ((value < 0) ? 2 : (value < hm ? 1 : 0)) : 0;
+
+      // Sell first (generates funding) – but only if we actually have excess
+      let sellAmt = 0;
+      if (excess > 0) {
+        sellAmt = Math.ceil(excess / sellH);
+        sellAmt = Math.min(sellAmt, toNum(state.maxSellPerTick, 1e12));
+        sellAmt = Math.max(0, sellAmt);
+      }
+
+      // Buy if under floor
+      let buyAmt = 0;
+      if (deficit > 0) {
+        buyAmt = Math.ceil(deficit / buyH);
+        buyAmt = Math.min(buyAmt, toNum(state.maxBuyPerTick, 1e12));
+        buyAmt = Math.max(0, buyAmt);
+      }
+
+      // Save candidates
+      if (sellAmt > 0 && ceilSafe !== Infinity) {
+        sells.push({ name, sellAmt, pr: prio(name), unit: Number.isFinite(row.sellPrice) ? row.sellPrice : NaN });
+      }
+      if (buyAmt > 0) {
+        buys.push({
+          name,
+          buyAmt,
+          pr: prio(name),
+          crit,
+          need: deficit,
+          unit: Number.isFinite(row.buyPrice) ? row.buyPrice : NaN
+        });
+      }
+    }
+
+    // Sort: sells by prio desc, then bigger first
+    sells.sort((a, b) => (b.pr - a.pr) || (b.sellAmt - a.sellAmt));
+
+    // Sort buys: critical first, then prio desc, then need desc
+    buys.sort((a, b) => (b.crit - a.crit) || (b.pr - a.pr) || (b.need - a.need));
+
+    // Funding-aware buy allocation
+    const planned = new Map(); // name -> { buy, sell }
+    for (const s of sells) planned.set(s.name, { buy: 0, sell: s.sellAmt });
+
+    let fundsAvail = fundingKnown ? Math.max(0, funding - minBuf) : 0;
+
+    // If funding short and we have both buys and sells, bias toward selling (already done),
+    // then allocate buys only within remaining funds.
+    for (const b of buys) {
+      const row = market.rows.get(b.name);
+      const unit = Number.isFinite(b.unit) ? b.unit : NaN;
+
+      let amt = b.buyAmt;
+
+      if (!fundingKnown) {
+        // Unknown funding -> be conservative: only allow critical tiny buys
+        amt = (b.crit > 0) ? Math.min(amt, 1) : 0;
+      } else {
+        if (fundingShort && desired > 0) {
+          // When funding is below target, only allow critical buys until we recover
+          if (b.crit === 0) amt = 0;
+        }
+
+        if (amt > 0 && Number.isFinite(unit) && unit > 0) {
+          const affordable = Math.floor(fundsAvail / unit);
+          if (affordable <= 0) {
+            // still allow 1 if critical and we have at least some buffer headroom
+            amt = (b.crit > 0 && fundsAvail > 0) ? 1 : 0;
+          } else {
+            amt = Math.min(amt, affordable);
+          }
+          fundsAvail -= amt * unit;
+        } else if (amt > 0 && (!Number.isFinite(unit) || unit <= 0)) {
+          // Unknown price: safe tiny buy only if critical and we have funds
+          amt = (b.crit > 0 && fundsAvail > 0) ? 1 : 0;
+        }
+      }
+
+      const prev = planned.get(b.name) || { buy: 0, sell: 0 };
+      planned.set(b.name, { buy: amt, sell: prev.sell });
+    }
+
+    return {
+      funding,
+      fundingKnown,
+      fundingTarget,
+      fundingShort,
+      planned
+    };
+  }
+
+  /********************************************************************
+   * UI (Worker Allocator style: draggable dock, no constant rebuild)
+   ********************************************************************/
+  function addStyle(css) {
+    const s = document.createElement('style');
+    s.textContent = css;
+    document.head.appendChild(s);
+  }
+
+  addStyle(
+    "#ttgm-root{position:fixed;bottom:18px;right:18px;z-index:999999;font:12px/1.25 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;color:#eaeaf0}" +
+    "#ttgm-root *{box-sizing:border-box}" +
+    "#ttgm-panel{width:920px;max-width:calc(100vw - 24px);background:linear-gradient(180deg, rgba(38,32,55,.96) 0%, rgba(20,18,28,.96) 80%);border:1px solid rgba(140,200,255,.36);border-radius:14px;box-shadow:0 22px 70px rgba(0,0,0,.62), 0 0 0 1px rgba(255,255,255,.06) inset;overflow:hidden;backdrop-filter:blur(7px);user-select:none;display:flex;flex-direction:column;resize:horizontal}" +
+    "#ttgm-header{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.10);cursor:move;background:rgba(0,0,0,.14)}" +
+    "#ttgm-title{font-weight:850;font-size:13px;letter-spacing:.25px}" +
+    "#ttgm-spacer{flex:1}" +
+    ".ttgm-btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:#eaeaf0;border-radius:10px;padding:6px 10px;cursor:pointer}" +
+    ".ttgm-btn:hover{background:rgba(255,255,255,.14)}" +
+    ".ttgm-btn:active{transform:translateY(1px)}" +
+    ".ttgm-btn.primary{background:rgba(140,200,255,.18);border-color:rgba(140,200,255,.42)}" +
+    ".ttgm-btn.primary:hover{background:rgba(140,200,255,.26)}" +
+    ".ttgm-btn.danger{background:rgba(255,90,90,.14);border-color:rgba(255,90,90,.35)}" +
+    ".ttgm-btn.danger:hover{background:rgba(255,90,90,.22)}" +
+    ".ttgm-mini{opacity:.78;font-size:11px}" +
+    ".ttgm-muted{opacity:.72}" +
+    ".ttgm-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}" +
+    ".ttgm-input{padding:6px 8px;border-radius:10px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.24);color:#eaeaf0;outline:none}" +
+    ".ttgm-input:focus{border-color:rgba(140,200,255,.55)}" +
+    ".ttgm-badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.16);font-size:11px;white-space:nowrap}" +
+    "#ttgm-body{padding:10px 12px;display:flex;flex-direction:column;gap:10px;overflow:auto;max-height:38vh}" +
+    ".ttgm-card{border:1px solid rgba(255,255,255,.10);border-radius:14px;padding:10px;background:rgba(0,0,0,.18)}" +
+    ".ttgm-tablewrap{overflow:auto;border-radius:12px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.10)}" +
+    "table.ttgm-table{width:100%;border-collapse:collapse;table-layout:fixed}" +
+    ".ttgm-table th,.ttgm-table td{padding:7px 7px;border-bottom:1px solid rgba(255,255,255,.08);vertical-align:middle}" +
+    ".ttgm-table th{font-weight:850;background:rgba(0,0,0,.18);position:sticky;top:0;z-index:2}" +
+    ".ttgm-right{text-align:right}" +
+    ".ttgm-center{text-align:center}" +
+    ".ttgm-name{font-weight:850;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}" +
+    ".ttgm-small{width:84px;text-align:right}" +
+    ".ttgm-pri{width:54px;text-align:right}"
+  );
+
+  function el(tag, attrs, kids) {
     const e = document.createElement(tag);
+    attrs = attrs || {};
+    kids = kids || [];
     for (const k in attrs) {
-      if (k === 'class') e.className = attrs[k];
-      else if (k === 'text') e.textContent = attrs[k];
-      else if (k.startsWith('on') && typeof attrs[k] === 'function') e.addEventListener(k.slice(2), attrs[k]);
-      else e.setAttribute(k, attrs[k]);
+      const v = attrs[k];
+      if (k === 'class') e.className = v;
+      else if (k === 'text') e.textContent = v;
+      else if (k === 'html') e.innerHTML = v;
+      else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
     }
-    for (const c of children) e.appendChild(c);
+    for (const c of kids) e.appendChild(c);
     return e;
   }
 
-  function buildUI() {
-    injectStyles();
+  // drag / clamp (lighter version)
+  function clampToViewport(root) {
+    if (!root) return;
+    const vw = window.innerWidth || 0;
+    const vh = window.innerHeight || 0;
+    if (!vw || !vh) return;
+    const r = root.getBoundingClientRect();
+    const minX = 60, minY = 40;
+    let left = r.left, top = r.top;
+    left = Math.min(Math.max(left, -r.width + minX), vw - minX);
+    top = Math.min(Math.max(top, -r.height + minY), vh - minY);
+    root.style.left = left + 'px';
+    root.style.top = top + 'px';
+    root.style.right = 'auto';
+    root.style.bottom = 'auto';
+    setVal('pos', { left: Math.round(left), top: Math.round(top) });
+  }
 
-    dom.root = el('div', { class: 'ttgm-root' });
-    dom.panel = el('div', { class: 'ttgm-panel' });
+  function loadPos(root) {
+    const p = getVal('pos', null);
+    if (p && Number.isFinite(p.left) && Number.isFinite(p.top)) {
+      root.style.left = p.left + 'px';
+      root.style.top = p.top + 'px';
+      root.style.right = 'auto';
+      root.style.bottom = 'auto';
+    }
+    clampToViewport(root);
+  }
 
-    dom.head = el('div', { class: 'ttgm-head' });
-    dom.title = el('div', { class: 'ttgm-title', text: 'Galactic Market Automator' });
-
-    dom.btns = el('div', { class: 'ttgm-btns' });
-    dom.btnToggle = el('button', {
-      class: 'ttgm-btn primary',
-      text: state.enabled ? 'Running' : 'Stopped',
-      onclick: () => { state.enabled = !state.enabled; saveState(); renderHeader(); }
-    });
-    dom.btnMin = el('button', {
-      class: 'ttgm-btn',
-      text: state.minimized ? 'Expand' : 'Minimize',
-      onclick: () => { state.minimized = !state.minimized; saveState(); renderAll(); }
-    });
-
-    dom.btns.append(dom.btnToggle, dom.btnMin);
-    dom.head.append(dom.title, dom.btns);
-
-    // drag
-    dom.head.addEventListener('mousedown', (ev) => {
-      if (ev.button !== 0) return;
+  function enableDrag(root, handle) {
+    let dragging = false, pid = null, sx = 0, sy = 0, ox = 0, oy = 0;
+    function isInteractive(t) {
+      try { return !!(t && t.closest && t.closest('button, input, select, textarea, a, label')); }
+      catch { return false; }
+    }
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      if (isInteractive(e.target)) return;
       dragging = true;
-      const rect = dom.root.getBoundingClientRect();
-      dragOffX = ev.clientX - rect.left;
-      dragOffY = ev.clientY - rect.top;
-      ev.preventDefault();
+      pid = e.pointerId;
+      const r = root.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY;
+      ox = r.left; oy = r.top;
+      root.style.left = ox + 'px';
+      root.style.top = oy + 'px';
+      root.style.right = 'auto';
+      root.style.bottom = 'auto';
+      try { handle.setPointerCapture(pid); } catch { }
+      e.preventDefault();
     });
-    window.addEventListener('mousemove', (ev) => {
+    window.addEventListener('pointermove', (e) => {
       if (!dragging) return;
-      const x = ev.clientX - dragOffX;
-      const y = ev.clientY - dragOffY;
-      dom.root.style.left = x + 'px';
-      dom.root.style.top = y + 'px';
-      state.ui.panelX = x;
-      state.ui.panelY = y;
-      saveState();
+      if (pid != null && e.pointerId !== pid) return;
+      root.style.left = (ox + (e.clientX - sx)) + 'px';
+      root.style.top = (oy + (e.clientY - sy)) + 'px';
+      root.style.right = 'auto';
+      root.style.bottom = 'auto';
+      clampToViewport(root);
     });
-    window.addEventListener('mouseup', () => { dragging = false; });
-
-    dom.body = el('div', { class: 'ttgm-body' });
-    dom.panel.append(dom.head, dom.body);
-    dom.root.append(dom.panel);
-    document.body.appendChild(dom.root);
-
-    renderAll();
+    window.addEventListener('pointerup', (e) => {
+      if (!dragging) return;
+      if (pid != null && e.pointerId !== pid) return;
+      dragging = false;
+      pid = null;
+      clampToViewport(root);
+    });
+    window.addEventListener('resize', () => clampToViewport(root));
   }
 
-  function renderHeader() {
-    dom.btnToggle.textContent = state.enabled ? 'Running' : 'Stopped';
-    dom.btnToggle.classList.toggle('danger', state.enabled);
-    dom.btnToggle.classList.toggle('primary', !state.enabled);
-    dom.btnMin.textContent = state.minimized ? 'Expand' : 'Minimize';
+  const ui = {
+    root: null, panel: null, header: null, body: null,
+    runBtn: null, dryBtn: null, minBtn: null, scanBtn: null, clearBtn: null,
+    status: null, tableWrap: null, tableBody: null,
+    fields: {}
+  };
+
+  function buildUI() {
+    if (ui.root) return;
+
+    ui.root = el('div', { id: 'ttgm-root' });
+    ui.panel = el('div', { id: 'ttgm-panel' });
+
+    ui.runBtn = el('button', { class: 'ttgm-btn primary', text: state.running ? 'Running' : 'Stopped' });
+    ui.dryBtn = el('button', { class: 'ttgm-btn', text: state.dryRun ? 'Dry: ON' : 'Dry: OFF' });
+    ui.scanBtn = el('button', { class: 'ttgm-btn', text: 'Scan' });
+    ui.clearBtn = el('button', { class: 'ttgm-btn danger', text: 'Clear Orders' });
+    ui.minBtn = el('button', { class: 'ttgm-btn', text: state.minimized ? '▢' : '—' });
+
+    ui.header = el('div', { id: 'ttgm-header' }, [
+      el('div', { id: 'ttgm-title', text: 'Galactic Market Automator' }),
+      el('div', { id: 'ttgm-spacer' }),
+      ui.runBtn, ui.dryBtn, ui.scanBtn, ui.clearBtn, ui.minBtn
+    ]);
+
+    ui.body = el('div', { id: 'ttgm-body' });
+
+    // Settings card
+    const settingsCard = el('div', { class: 'ttgm-card' });
+    settingsCard.innerHTML = `
+      <div class="ttgm-row" style="justify-content:space-between;align-items:flex-end;gap:12px">
+        <div>
+          <div style="font-weight:900">Controls</div>
+          <div class="ttgm-mini ttgm-muted">Writes Market <b>Buy Amount</b> / <b>Sell Amount</b> inputs. Optionally checks market <b>Run</b>.</div>
+        </div>
+        <div class="ttgm-mini ttgm-muted" id="ttgm-pills"></div>
+      </div>
+
+      <div class="ttgm-row" style="margin-top:10px;gap:10px;align-items:center">
+        <span class="ttgm-badge">Tick (ms)</span>
+        <input class="ttgm-input" id="ttgm-tick" type="number" min="200" max="5000" step="10" style="width:92px">
+
+        <span class="ttgm-badge">Reserve (s)</span>
+        <input class="ttgm-input" id="ttgm-reserve" type="number" min="0" max="600" step="1" style="width:72px">
+
+        <span class="ttgm-badge">Buy horizon (s)</span>
+        <input class="ttgm-input" id="ttgm-buyh" type="number" min="1" max="3600" step="1" style="width:72px">
+
+        <span class="ttgm-badge">Sell horizon (s)</span>
+        <input class="ttgm-input" id="ttgm-sellh" type="number" min="1" max="3600" step="1" style="width:72px">
+
+        <span class="ttgm-badge">Min funding</span>
+        <input class="ttgm-input" id="ttgm-minfund" type="text" style="width:110px">
+
+        <span class="ttgm-badge">Desired funding</span>
+        <input class="ttgm-input" id="ttgm-desfund" type="text" style="width:110px">
+
+        <label class="ttgm-mini ttgm-muted" style="display:flex;align-items:center;gap:8px;margin-left:auto">
+          <input id="ttgm-manageRun" type="checkbox">
+          Manage Market Run
+        </label>
+      </div>
+    `;
+    ui.body.appendChild(settingsCard);
+
+    // Status card
+    ui.status = el('div', { class: 'ttgm-card' });
+    ui.status.innerHTML = `<div class="ttgm-mini ttgm-muted">Status: starting…</div>`;
+    ui.body.appendChild(ui.status);
+
+    // Table
+    const tableCard = el('div', { class: 'ttgm-card' });
+    tableCard.innerHTML = `
+      <div style="font-weight:900;margin-bottom:8px">Per-resource policy</div>
+      <div class="ttgm-tablewrap">
+        <table class="ttgm-table">
+          <colgroup>
+            <col style="width:46px">
+            <col>
+            <col style="width:96px">
+            <col style="width:96px">
+            <col style="width:96px">
+            <col style="width:64px">
+            <col style="width:260px">
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="ttgm-center">Use</th>
+              <th>Resource</th>
+              <th class="ttgm-right">Hard min</th>
+              <th class="ttgm-right">Buy floor</th>
+              <th class="ttgm-right">Sell ceil</th>
+              <th class="ttgm-right">Prio</th>
+              <th>Live (val / net / plan)</th>
+            </tr>
+          </thead>
+          <tbody id="ttgm-tbody">
+            <tr><td colspan="7" class="ttgm-muted">Scan market…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    `;
+    ui.tableBody = tableCard.querySelector('#ttgm-tbody');
+    ui.body.appendChild(tableCard);
+
+    ui.panel.appendChild(ui.header);
+    ui.panel.appendChild(ui.body);
+    ui.root.appendChild(ui.panel);
+    document.body.appendChild(ui.root);
+
+    loadPos(ui.root);
+    enableDrag(ui.root, ui.header);
+
+    // Wire header buttons
+    ui.runBtn.addEventListener('click', () => {
+      state.running = !state.running;
+      ui.runBtn.textContent = state.running ? 'Running' : 'Stopped';
+      saveSettings();
+    });
+    ui.dryBtn.addEventListener('click', () => {
+      state.dryRun = !state.dryRun;
+      ui.dryBtn.textContent = state.dryRun ? 'Dry: ON' : 'Dry: OFF';
+      saveSettings();
+    });
+    ui.minBtn.addEventListener('click', () => {
+      state.minimized = !state.minimized;
+      ui.minBtn.textContent = state.minimized ? '▢' : '—';
+      ui.body.style.display = state.minimized ? 'none' : 'flex';
+      saveSettings();
+      clampToViewport(ui.root);
+    });
+    ui.scanBtn.addEventListener('click', () => {
+      scanMarket();
+      rebuildTable();
+      renderStatusLine('Manual scan complete.');
+    });
+    ui.clearBtn.addEventListener('click', () => {
+      clearAllMarketOrders();
+    });
+
+    // Wire settings fields
+    ui.fields.tick = settingsCard.querySelector('#ttgm-tick');
+    ui.fields.reserve = settingsCard.querySelector('#ttgm-reserve');
+    ui.fields.buyh = settingsCard.querySelector('#ttgm-buyh');
+    ui.fields.sellh = settingsCard.querySelector('#ttgm-sellh');
+    ui.fields.minfund = settingsCard.querySelector('#ttgm-minfund');
+    ui.fields.desfund = settingsCard.querySelector('#ttgm-desfund');
+    ui.fields.manageRun = settingsCard.querySelector('#ttgm-manageRun');
+
+    function syncSettingsInputs() {
+      ui.fields.tick.value = String(clamp(toNum(state.tickMs, 650), 200, 5000));
+      ui.fields.reserve.value = String(clamp(toNum(state.reserveSeconds, 8), 0, 600));
+      ui.fields.buyh.value = String(clamp(toNum(state.buyHorizonSec, 10), 1, 3600));
+      ui.fields.sellh.value = String(clamp(toNum(state.sellHorizonSec, 10), 1, 3600));
+      ui.fields.minfund.value = String(toNum(state.minFundingBuffer, 0));
+      ui.fields.desfund.value = String(toNum(state.desiredFunding, 0));
+      ui.fields.manageRun.checked = !!state.manageMarketRun;
+    }
+    syncSettingsInputs();
+
+    ui.fields.tick.addEventListener('change', () => { state.tickMs = clamp(parseNumber(ui.fields.tick.value), 200, 5000); saveSettings(); });
+    ui.fields.reserve.addEventListener('change', () => { state.reserveSeconds = clamp(parseNumber(ui.fields.reserve.value), 0, 600); saveSettings(); });
+    ui.fields.buyh.addEventListener('change', () => { state.buyHorizonSec = clamp(parseNumber(ui.fields.buyh.value), 1, 3600); saveSettings(); });
+    ui.fields.sellh.addEventListener('change', () => { state.sellHorizonSec = clamp(parseNumber(ui.fields.sellh.value), 1, 3600); saveSettings(); });
+    ui.fields.minfund.addEventListener('change', () => { state.minFundingBuffer = Math.max(0, parseNumber(ui.fields.minfund.value)); saveSettings(); });
+    ui.fields.desfund.addEventListener('change', () => { state.desiredFunding = Math.max(0, parseNumber(ui.fields.desfund.value)); saveSettings(); });
+    ui.fields.manageRun.addEventListener('change', () => { state.manageMarketRun = !!ui.fields.manageRun.checked; saveSettings(); });
+
+    ui.body.style.display = state.minimized ? 'none' : 'flex';
   }
 
-  function renderAll() {
-    renderHeader();
-    dom.body.innerHTML = '';
+  function rebuildTable() {
+    if (!ui.tableBody) return;
 
-    if (state.minimized) {
-      dom.body.append(el('div', { class: 'ttgm-muted', text: 'Minimized.' }));
+    const names = Object.keys(state.resources).sort((a, b) => a.localeCompare(b));
+    if (!names.length) {
+      ui.tableBody.innerHTML = `<tr><td colspan="7" class="ttgm-muted">No market resources detected yet. Open the Galactic Market panel then click Scan.</td></tr>`;
       return;
     }
 
-    const row1 = el('div', { class: 'ttgm-row' }, [
-      el('div', { class: 'ttgm-pill' }, [
-        el('span', { text: 'Tick (ms):' }),
-        (() => {
-          const inp = el('input', { class: 'ttgm-input small', value: String(state.tickMs) });
-          inp.addEventListener('change', () => { state.tickMs = clamp(tryParseNum(inp.value, 650), 200, 5000); saveState(); });
-          return inp;
-        })()
-      ]),
-      el('div', { class: 'ttgm-pill' }, [
-        el('span', { text: 'Reserve (s):' }),
-        (() => {
-          const inp = el('input', { class: 'ttgm-input small', value: String(state.reserveSeconds) });
-          inp.addEventListener('change', () => { state.reserveSeconds = clamp(tryParseNum(inp.value, 8), 0, 120); saveState(); });
-          return inp;
-        })()
-      ]),
-      el('div', { class: 'ttgm-pill' }, [
-        el('span', { text: 'Buy horizon (s):' }),
-        (() => {
-          const inp = el('input', { class: 'ttgm-input small', value: String(state.buyHorizonSec) });
-          inp.addEventListener('change', () => { state.buyHorizonSec = clamp(tryParseNum(inp.value, 10), 1, 120); saveState(); });
-          return inp;
-        })()
-      ]),
-      el('div', { class: 'ttgm-pill' }, [
-        el('span', { text: 'Sell horizon (s):' }),
-        (() => {
-          const inp = el('input', { class: 'ttgm-input small', value: String(state.sellHorizonSec) });
-          inp.addEventListener('change', () => { state.sellHorizonSec = clamp(tryParseNum(inp.value, 10), 1, 120); saveState(); });
-          return inp;
-        })()
-      ]),
-      el('div', { class: 'ttgm-pill' }, [
-        el('span', { text: 'Funding buffer:' }),
-        (() => {
-          const inp = el('input', { class: 'ttgm-input small', value: String(state.fundingBuffer) });
-          inp.addEventListener('change', () => { state.fundingBuffer = Math.max(0, tryParseNum(inp.value, 0)); saveState(); });
-          return inp;
-        })()
-      ]),
-      el('div', { class: 'ttgm-pill' }, [
-        el('span', { text: 'Min runway (s):' }),
-        (() => {
-          const inp = el('input', { class: 'ttgm-input small', value: String(state.fundingMinRunwaySec) });
-          inp.addEventListener('change', () => { state.fundingMinRunwaySec = clamp(tryParseNum(inp.value, 20), 5, 300); saveState(); });
-          return inp;
-        })()
-      ])
-    ]);
+    ui.tableBody.innerHTML = '';
+    for (const name of names) {
+      const rc = cfg(name);
+      const tr = document.createElement('tr');
+      tr.setAttribute('data-name', name);
+      tr.innerHTML = `
+        <td class="ttgm-center"><input type="checkbox" data-field="enabled" ${rc.enabled ? 'checked' : ''}></td>
+        <td class="ttgm-name" title="${escapeHtml(name)}">${escapeHtml(name)}</td>
+        <td class="ttgm-right"><input class="ttgm-input ttgm-small" type="text" data-field="hardMin" value="${rc.hardMin || 0}"></td>
+        <td class="ttgm-right"><input class="ttgm-input ttgm-small" type="text" data-field="buyFloor" value="${rc.buyFloor || 0}"></td>
+        <td class="ttgm-right"><input class="ttgm-input ttgm-small" type="text" data-field="sellCeiling" value="${rc.sellCeiling || 0}"></td>
+        <td class="ttgm-right"><input class="ttgm-input ttgm-pri" type="text" data-field="priority" value="${rc.priority ?? 3}"></td>
+        <td class="ttgm-mini ttgm-muted" data-cell="live">—</td>
+      `;
 
-    dom.body.append(row1, el('div', { class: 'ttgm-hr' }));
+      const bind = (field, fn) => {
+        const inp = tr.querySelector(`[data-field="${field}"]`);
+        if (!inp) return;
+        inp.addEventListener('change', () => fn(inp));
+      };
 
-    const hdr = el('div', { class: 'ttgm-grid' }, [
-      el('div', { class: 'hdr', text: 'Resource' }),
-      el('div', { class: 'hdr', text: 'Use' }),
-      el('div', { class: 'hdr', text: 'Buy floor' }),
-      el('div', { class: 'hdr', text: 'Sell ceil' }),
-      el('div', { class: 'hdr', text: 'Hard min' }),
-      el('div', { class: 'hdr', text: 'Prio' }),
-      el('div', { class: 'hdr', text: 'Live (val / net / auto)' }),
-    ]);
-    dom.body.append(hdr);
+      const chk = tr.querySelector('[data-field="enabled"]');
+      chk.addEventListener('change', () => {
+        state.resources[name].enabled = !!chk.checked;
+        saveSettings();
+      });
 
-    dom.resList = el('div', {});
-    dom.body.append(dom.resList);
+      bind('hardMin', (inp) => { state.resources[name].hardMin = Math.max(0, parseNumber(inp.value)); inp.value = String(state.resources[name].hardMin); saveSettings(); });
+      bind('buyFloor', (inp) => { state.resources[name].buyFloor = Math.max(0, parseNumber(inp.value)); inp.value = String(state.resources[name].buyFloor); saveSettings(); });
+      bind('sellCeiling', (inp) => { state.resources[name].sellCeiling = Math.max(0, parseNumber(inp.value)); inp.value = String(state.resources[name].sellCeiling); saveSettings(); });
+      bind('priority', (inp) => { state.resources[name].priority = clamp(parseNumber(inp.value), 1, 9); inp.value = String(state.resources[name].priority); saveSettings(); });
 
-    dom.body.append(el('div', { class: 'ttgm-hr' }));
-    dom.status = el('div', { class: 'ttgm-status ttgm-muted', text: 'Status: waiting for snapshot...' });
-    dom.body.append(dom.status);
-  }
-
-  function renderResourceRows(snapshot) {
-    if (!dom.resList) return;
-    dom.resList.innerHTML = '';
-
-    for (const r of snapshot.res) {
-      const cfg = ensureResCfg(r.key);
-
-      const nameCell = el('div', { class: 'ttgm-cell', text: `${r.rk}` });
-
-      const useCell = el('div', { class: 'ttgm-cell' }, [
-        (() => {
-          const cb = el('input', { type: 'checkbox' });
-          cb.checked = !!cfg.enabled;
-          cb.addEventListener('change', () => { cfg.enabled = cb.checked; saveState(); });
-          return el('label', { class: 'ttgm-toggle' }, [cb, el('span', { text: '' })]);
-        })()
-      ]);
-
-      const buyCell = el('div', { class: 'ttgm-cell' }, [
-        (() => {
-          const inp = el('input', { class: 'ttgm-input', value: String(cfg.buyFloor) });
-          inp.addEventListener('change', () => { cfg.buyFloor = Math.max(0, tryParseNum(inp.value, 0)); saveState(); });
-          return inp;
-        })()
-      ]);
-
-      const sellCell = el('div', { class: 'ttgm-cell' }, [
-        (() => {
-          const inp = el('input', { class: 'ttgm-input', value: String(cfg.sellCeiling) });
-          inp.addEventListener('change', () => { cfg.sellCeiling = Math.max(0, tryParseNum(inp.value, 0)); saveState(); });
-          return inp;
-        })()
-      ]);
-
-      const hardCell = el('div', { class: 'ttgm-cell' }, [
-        (() => {
-          const inp = el('input', { class: 'ttgm-input', value: String(cfg.hardMin) });
-          inp.addEventListener('change', () => { cfg.hardMin = Math.max(0, tryParseNum(inp.value, 0)); saveState(); });
-          return inp;
-        })()
-      ]);
-
-      const prioCell = el('div', { class: 'ttgm-cell' }, [
-        (() => {
-          const inp = el('input', { class: 'ttgm-input', value: String(cfg.priority) });
-          inp.addEventListener('change', () => { cfg.priority = clamp(Math.floor(tryParseNum(inp.value, 50)), 0, 999); saveState(); });
-          return inp;
-        })()
-      ]);
-
-      const live = ` ${fmtInt(r.value)} / ${fmt2(r.net)}/s / auto ${fmt2(r.autoCost)}/s${r.autobuildShortage ? ' ⚠' : ''}`;
-      const liveCell = el('div', { class: 'ttgm-cell ttgm-muted', text: live });
-
-      dom.resList.append(el('div', { class: 'ttgm-grid' }, [nameCell, useCell, buyCell, sellCell, hardCell, prioCell, liveCell]));
+      ui.tableBody.appendChild(tr);
     }
   }
 
-  function renderStatus(snapshot, plan) {
-    const f = snapshot.funding;
-    const fundingText = f
-      ? `Funding: ${fmtInt(f.value)} (net ${fmt2(f.net)}/s)`
-      : 'Funding: ?';
+  function renderStatusLine(msg) {
+    if (!ui.status) return;
+    ui.status.innerHTML = `<div class="ttgm-mini ttgm-muted">${escapeHtml(msg)}</div>`;
+  }
 
-    const marketText = snapshot.market
-      ? `Market: ${snapshot.market.exists ? 'found' : 'missing'}, unlocked=${!!snapshot.market.unlocked}, repeatCount=${snapshot.market.repeatCount}`
-      : 'Market: ?';
-
-    if (!plan || plan.reason) {
-      dom.status.textContent = `Status:\n${marketText}\n${fundingText}\n${plan && plan.reason ? ('\n' + plan.reason) : ''}`;
+  /********************************************************************
+   * Apply to market UI
+   ********************************************************************/
+  function clearAllMarketOrders() {
+    if (!market.detected || market.rows.size === 0) {
+      renderStatusLine('Clear: market not detected.');
       return;
     }
-
-    dom.status.textContent =
-      `Status:\n${marketText}\n${fundingText}\n\n` +
-      `Planned:\n` +
-      `  Buy cost/s: ${fmt2(plan.debug.totalBuyCostPerSec)}\n` +
-      `  Sell gain/s: ${fmt2(plan.debug.totalSellGainPerSec)}\n` +
-      `  Net funding/s: ${fmt2(plan.debug.netFundingPerSec)}\n` +
-      `  Buys: ${plan.orders.buy.length}, Sells: ${plan.orders.sell.length}\n`;
+    if (state.dryRun) {
+      renderStatusLine('DRY: would clear all market orders.');
+      return;
+    }
+    for (const row of market.rows.values()) {
+      if (row.sellInput) setNativeValue(row.sellInput, 0);
+      if (row.buyInput) setNativeValue(row.buyInput, 0);
+    }
+    renderStatusLine('Cleared all Buy/Sell Amount inputs to 0.');
   }
 
-  /* =========================
-   * Main loop
-   * ========================= */
-  let lastUiKey = '';
-  let lastApplyAt = 0;
+  function applyPlanToMarket(plan) {
+    if (!plan) return;
 
-  async function tick() {
-    const api = getApi();
-    if (!api || !api.ready()) return;
-
-    const snap = api.snapshot();
-
-    const key = snap.res.map(r => r.key).join('|');
-    if (!dom.resList || key !== lastUiKey) {
-      lastUiKey = key;
-      if (!state.minimized) renderResourceRows(snap);
-    }
-
-    const plan = planOrders(snap, api);
-    if (!state.minimized) renderStatus(snap, plan);
-
-    if (state.enabled && !plan.reason) {
-      const t = now();
-      if (t - lastApplyAt >= state.applyThrottleMs) {
-        lastApplyAt = t;
-        await TT.runExclusive('tt-market-apply', async () => {
-          api.apply(plan.orders);
-        });
+    // Manage Market Run checkbox if requested
+    if (state.manageMarketRun && market.runCheckbox) {
+      const wantOn = state.running; // keep run on while our automation running
+      if (!!market.runCheckbox.checked !== wantOn) {
+        if (!state.dryRun) market.runCheckbox.click();
       }
     }
-  }
 
-  async function loop() {
-    while (true) {
-      try { await tick(); } catch (e) { console.error(e); }
-      await sleep(state.tickMs);
+    // Write inputs
+    for (const [name, row] of market.rows.entries()) {
+      const rc = cfg(name);
+      const cell = ui.tableBody?.querySelector(`tr[data-name="${CSS.escape(name)}"] [data-cell="live"]`) || null;
+
+      const rs = plan._resIndex ? getResForMarketName(plan._resIndex, name) : null;
+      const val = rs ? toNum(rs.value, NaN) : NaN;
+      const net = rs ? toNum(rs.net, NaN) : NaN;
+
+      const p = plan.planned.get(name) || { buy: 0, sell: 0 };
+      const live = `${Number.isFinite(val) ? fmtNum(val) : '—'} / ${Number.isFinite(net) ? fmtNum(net) + '/s' : '—'} / buy ${fmtNum(p.buy)} · sell ${fmtNum(p.sell)}`;
+      if (cell) cell.textContent = live;
+
+      if (!state.running || state.dryRun) continue;
+
+      if (!rc.enabled) {
+        // If disabled, force to 0 so we don't leave stale orders
+        if (row.sellInput) setNativeValue(row.sellInput, 0);
+        if (row.buyInput) setNativeValue(row.buyInput, 0);
+        continue;
+      }
+
+      if (row.sellInput) setNativeValue(row.sellInput, p.sell || 0);
+      if (row.buyInput) setNativeValue(row.buyInput, p.buy || 0);
     }
   }
 
+  /********************************************************************
+   * Main tick
+   ********************************************************************/
+  function tick() {
+    injectBridge();
+
+    const api = getApi();
+    const ready = api && typeof api.ready === 'function' && api.ready();
+    if (!ready) {
+      renderStatusLine('Status: waiting for game globals (resources)…');
+      return;
+    }
+
+    // Refresh market scan occasionally (or when missing)
+    if (!market.detected || market.rows.size === 0) {
+      scanMarket();
+      rebuildTable();
+    } else {
+      // Lightweight re-scan every few seconds in case new rows unlock
+      if (!tick._lastScanAt || (Date.now() - tick._lastScanAt) > 3500) {
+        tick._lastScanAt = Date.now();
+        const beforeSig = market.lastSig;
+        scanMarket();
+        if (market.lastSig !== beforeSig) rebuildTable();
+      }
+    }
+
+    if (!market.detected) {
+      renderStatusLine('Status: Galactic Market panel not detected. Open Colony → Resources → Galactic Market, then click Scan.');
+      return;
+    }
+
+    const snap = api.snapshot ? api.snapshot() : null;
+    const resIndex = buildResourceIndex(snap);
+
+    const plan = computePlan(snap, resIndex);
+    plan._resIndex = resIndex;
+
+    // Pills
+    const pills = [];
+    pills.push(`<span class="ttgm-badge">Market: ${market.rows.size} rows</span>`);
+    pills.push(`<span class="ttgm-badge">Run checkbox: ${market.runCheckbox ? 'found' : 'missing'}</span>`);
+    if (plan.fundingKnown) {
+      pills.push(`<span class="ttgm-badge">Funding: ${fmtNum(plan.funding)}</span>`);
+      pills.push(`<span class="ttgm-badge">${plan.fundingShort ? 'Funding: LOW' : 'Funding: OK'}</span>`);
+    } else {
+      pills.push(`<span class="ttgm-badge">Funding: (unknown)</span>`);
+    }
+    pills.push(`<span class="ttgm-badge">${state.dryRun ? 'DRY' : 'LIVE'}</span>`);
+    const pillsEl = ui.body?.querySelector('#ttgm-pills');
+    if (pillsEl) pillsEl.innerHTML = pills.join(' ');
+
+    // Apply
+    applyPlanToMarket(plan);
+
+    // Status line
+    const anyOrders = Array.from(plan.planned.values()).some(x => (x.buy > 0 || x.sell > 0));
+    renderStatusLine(
+      !state.running
+        ? 'Status: Stopped (no writes).'
+        : state.dryRun
+          ? `Status: DRY (computed ${anyOrders ? 'orders' : 'idle'}).`
+          : `Status: Running (${anyOrders ? 'writing orders' : 'idle'}).`
+    );
+  }
+
+  /********************************************************************
+   * Boot
+   ********************************************************************/
   buildUI();
-  loop();
+  injectBridge();
+  scanMarket();
+  rebuildTable();
+  tick();
+
+  // Use shared lock so we don't collide with other scripts spamming the DOM
+  setInterval(() => {
+    TT.runExclusive('galacticMarket', 800, tick);
+  }, clamp(toNum(state.tickMs, 650), 200, 5000));
 
 })();
