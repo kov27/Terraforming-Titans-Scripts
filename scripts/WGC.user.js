@@ -1,15 +1,14 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager (Stability Fix)
 // @namespace    tt-wgc
-// @version      1.2.4-fix
-// @description  Fixes HUD drag, idle-team deployment, keep-going checkbox handling, and tick reliability.
+// @version      1.2.4-fix2
+// @description  Fixes HUD drag, iframe execution, idle-team deployment, keep-going checkbox handling, and tick reliability.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
 // @match        https://*.ssl.hwcdn.net/html/*/index.html
 // @match        https://*.hwcdn.net/html/*/index.html
 // @run-at       document-idle
 // @grant        none
-// @noframes
 // ==/UserScript==
 
 (() => {
@@ -34,7 +33,9 @@
     hudGrip: 20, // keep at least 20px visible so it can be grabbed back
   };
 
-  // Exposed API for you
+  // ----------------------------
+  // Exposed API (IN THIS FRAME)
+  // ----------------------------
   const API = {
     CFG,
     getWGC: () => window.warpGateCommand || null,
@@ -49,7 +50,7 @@
   // LOGGING (compact)
   // ---------------------------------------------------------------------------
   const LOG = {
-    v: '1.2.4-fix',
+    v: '1.2.4-fix2',
     t: Date.now(),
     cfg: {},
     perf: { ticks: 0, lastMs: 0 },
@@ -63,16 +64,23 @@
     const ts = Date.now();
     const aa = window.resources?.special?.alienArtifact?.value ?? 0;
     const ta = wgc?.totalArtifacts ?? 0;
+
     artSamples.push([ts, aa, ta]);
     while (artSamples.length && (ts - artSamples[0][0]) > 3.7e6) artSamples.shift(); // keep ~62m
+
     const rate = (ms) => {
       const cut = ts - ms;
-      const a = [...artSamples].reverse().find(x => x[0] <= cut);
+      // find nearest sample <= cut
+      let a = null;
+      for (let i = artSamples.length - 1; i >= 0; i--) {
+        if (artSamples[i][0] <= cut) { a = artSamples[i]; break; }
+      }
       if (!a) return 0;
       const dt = (ts - a[0]) / 3600000;
       const dta = ta - a[2];
       return dt > 0 ? dta / dt : 0;
     };
+
     LOG.art = { aa, ta, n10: rate(600000), n60: rate(3600000) };
   }
 
@@ -111,19 +119,20 @@
   // DOM HELPERS (fallback start + checkbox)
   // ---------------------------------------------------------------------------
   function getTeamCard(teamIndex) {
-    // In WGC UI, team cards live in #wgc-team-cards
-    const container = document.querySelector('#wgc-team-cards');
-    if (!container) return null;
+    // WGC UI commonly uses #wgc-team-cards; if renamed, fallback to any .team-card with data-team
+    const container = document.querySelector('#wgc-team-cards') || document;
     return container.querySelector(`.team-card[data-team="${teamIndex}"]`) ||
            container.querySelector(`.wgc-team-card[data-team="${teamIndex}"]`) ||
-           container.querySelector(`.team-card:nth-child(${teamIndex+1})`) ||
+           container.querySelector(`.team-card:nth-of-type(${teamIndex+1})`) ||
            null;
   }
 
   function setKeepGoingCheckbox(teamIndex, want) {
     const card = getTeamCard(teamIndex);
     if (!card) return false;
-    const cb = card.querySelector('input.wgc-auto-start-checkbox');
+    // per your file: input.wgc-auto-start-checkbox inside the start button
+    const cb = card.querySelector('button.start-button input.wgc-auto-start-checkbox') ||
+               card.querySelector('input.wgc-auto-start-checkbox');
     if (!cb) return false;
     if (cb.checked === !!want) return true;
     cb.checked = !!want;
@@ -146,11 +155,8 @@
   function applyIdleSettingsOnly(wgc, teamIndex) {
     const op = wgc.operations?.[teamIndex];
     if (!op) return;
+    if (op.active) return; // never touch active ops
 
-    // Do NOT change anything while active
-    if (op.active) return;
-
-    // Keep-going checkbox & op.autoStart state
     op.autoStart = !!CFG.keepGoing;
     setKeepGoingCheckbox(teamIndex, CFG.keepGoing);
   }
@@ -162,10 +168,9 @@
     const op = wgc.operations?.[teamIndex];
     if (!op || op.active) return false;
 
-    // Ensure keep-going is consistent before starting
     applyIdleSettingsOnly(wgc, teamIndex);
 
-    // Prefer direct method
+    // Prefer direct method if present in this build
     if (typeof wgc.startOperation === 'function') {
       const diff = Math.floor(Math.max(0, op.difficulty || 0));
       const ok = wgc.startOperation(teamIndex, diff);
@@ -173,7 +178,7 @@
       if (ok) return true;
     }
 
-    // DOM fallback
+    // DOM fallback: click the actual UI button
     const ok2 = domClickStart(teamIndex);
     pushEv(ok2 ? 'D' : 'X', teamIndex, 0, 0, 0);
     return ok2;
@@ -187,10 +192,11 @@
     const t0 = performance.now();
     try {
       if (!CFG.enabled) return;
+
       const wgc = window.warpGateCommand;
       if (!wgc) return;
 
-      // IMPORTANT FIX: old code bailed if wgc.enabled missing
+      // IMPORTANT FIX: only treat enabled===false as disabled (missing property should NOT stop us)
       if (wgc.enabled === false) return;
 
       sampleArtifacts(wgc);
@@ -216,16 +222,13 @@
 
         LOG.tm.push([ti, active, ready, op?.difficulty || 0, op?.autoStart ? 1 : 0]);
 
-        // If idle & ready => start
         if (!active && ready) {
           startTeam(wgc, ti);
         } else {
-          // keep checkbox synced when idle
           applyIdleSettingsOnly(wgc, ti);
         }
       }
 
-      // update UI if possible
       if (typeof window.updateWGCUI === 'function') window.updateWGCUI();
 
     } catch (e) {
@@ -257,7 +260,6 @@
     const h = window.innerHeight;
     const grip = CFG.hudGrip;
 
-    // allow it off-screen, but keep "grip" visible
     hudPos.x = Math.max(-(hud.offsetWidth - grip), Math.min(w - grip, hudPos.x));
     hudPos.y = Math.max(-(hud.offsetHeight - grip), Math.min(h - grip, hudPos.y));
   }
@@ -273,9 +275,10 @@
       border-radius:10px;
       color:#e8eefc;
       font:12px system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      min-width:220px;
+      min-width:240px;
       box-shadow:0 10px 30px rgba(0,0,0,0.45);
       user-select:none;
+      pointer-events:auto;
     `;
 
     hud.innerHTML = `
@@ -294,13 +297,14 @@
     document.body.appendChild(hud);
     hudHeader = hud.querySelector('#tt-wgc-hud-header');
 
-    // Drag ONLY on header (fixes “grabs on hover” and “can’t unclick” issues)
+    // Drag ONLY on header
     hudHeader.addEventListener('pointerdown', (e) => {
       dragging = true;
       hudHeader.setPointerCapture(e.pointerId);
       dragOff.x = e.clientX - hudPos.x;
       dragOff.y = e.clientY - hudPos.y;
       e.preventDefault();
+      e.stopPropagation();
     });
 
     hudHeader.addEventListener('pointermove', (e) => {
@@ -311,21 +315,26 @@
       hud.style.left = hudPos.x + 'px';
       hud.style.top = hudPos.y + 'px';
       saveHudPos();
+      e.preventDefault();
+      e.stopPropagation();
     });
 
-    hudHeader.addEventListener('pointerup', () => { dragging = false; });
+    hudHeader.addEventListener('pointerup', (e) => {
+      dragging = false;
+      e.preventDefault();
+      e.stopPropagation();
+    });
 
-    hud.querySelector('#tt-wgc-hide').addEventListener('click', () => {
+    hud.querySelector('#tt-wgc-hide').addEventListener('click', (e) => {
       hud.style.display = 'none';
+      e.stopPropagation();
     });
 
-    hud.querySelector('#tt-wgc-copy').addEventListener('click', async () => {
+    hud.querySelector('#tt-wgc-copy').addEventListener('click', async (e) => {
       const s = dumpLog();
-      try {
-        await navigator.clipboard.writeText(s);
-      } catch {
-        prompt('Copy log:', s);
-      }
+      try { await navigator.clipboard.writeText(s); }
+      catch { prompt('Copy log:', s); }
+      e.stopPropagation();
     });
 
     // Hotkey to restore HUD if you lose it: Alt+W
@@ -338,11 +347,24 @@
         saveHudPos();
       }
     });
+
+    updateHud();
   }
 
   function updateHud() {
     if (!hud || hud.style.display === 'none') return;
     const body = hud.querySelector('#tt-wgc-body');
+
+    const wgc = window.warpGateCommand || null;
+    if (!wgc) {
+      body.innerHTML = `
+        <div><b>Waiting for WGC…</b></div>
+        <div style="opacity:0.85">Open the WGC tab in-game.</div>
+        <div style="opacity:0.65;margin-top:6px">If you’re in the wrong DevTools frame, switch to the game iframe.</div>
+      `;
+      return;
+    }
+
     const a = LOG.art;
     body.innerHTML = `
       <div>AA: <b>${(a.aa ?? 0).toFixed(1)}</b> | Total(WGC): <b>${(a.ta ?? 0).toFixed(0)}</b></div>
@@ -357,23 +379,26 @@
   // ---------------------------------------------------------------------------
   function boot() {
     makeHud();
-    updateHud();
 
-    // Run immediately once (so Team 2 at 100% should start quickly)
-    safeTick(true);
+    // fast loop (keeps HUD fresh & reacts quickly after you open WGC)
+    setInterval(() => {
+      safeTick(false);
+      updateHud();
+    }, 1000);
 
-    // Then run on timer
-    setInterval(() => safeTick(false), 1000);
-
-    // The “real” manager cadence
+    // “real” management cadence
     setInterval(() => safeTick(true), CFG.tickMs);
+
+    // immediate kick
+    safeTick(true);
   }
 
-  const wait = setInterval(() => {
-    if (document.body && window.warpGateCommand) {
-      clearInterval(wait);
+  // Always boot once DOM is ready (even before warpGateCommand exists)
+  const ready = setInterval(() => {
+    if (document.body) {
+      clearInterval(ready);
       boot();
     }
-  }, 250);
+  }, 100);
 
 })();
