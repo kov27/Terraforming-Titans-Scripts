@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.2.2
+// @version      1.2.3
 // @description  Deterministic WGC optimiser/manager. Performance-focused: cooperative time-slicing + fewer evals (no game freezes).
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -62,6 +62,12 @@
     sampleEveryMs: 15_000,        // artifact sampling interval
     window10mMs: 10 * 60_000,
     window60mMs: 60 * 60_000,
+
+    // Minimal on-screen HUD (so you can see it's working)
+    showHud: true,
+    hudUpdateMs: 2000,
+    hudStartMinimized: false,
+    hudAllowAlmostOffscreen: true,
   };
 
   const W = window;
@@ -1408,7 +1414,7 @@
     for (const v of planByTeam.values()) pred += (v.plan?.metrics?.artifactsPerHour || 0);
 
     return {
-      v: '1.2.2',
+      v: '1.2.3',
       t: now(),
       cfg: cfgCompact(),
       perf: {
@@ -1436,8 +1442,223 @@
 
   function dumpLog() {
     try { return JSON.stringify(dumpLogObject()); }
-    catch (_) { return '{"v":"1.2.2","err":1}'; }
+    catch (_) { return '{"v":"1.2.3","err":1}'; }
   }
+
+
+/********************************************************************
+ * MINIMAL HUD (non-intrusive, draggable, persistent)
+ ********************************************************************/
+const HUD_KEY = 'tt_wgc_hud_v1';
+let hudEl = null;
+let hudMin = false;
+
+function loadHudState() {
+  try {
+    const raw = localStorage.getItem(HUD_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (_) { return null; }
+}
+function saveHudState(st) {
+  try { localStorage.setItem(HUD_KEY, JSON.stringify(st)); } catch (_) {}
+}
+
+function ensureHud() {
+  if (!CFG.showHud) return;
+  if (hudEl && document.contains(hudEl)) return;
+
+  // If the game wipes body, re-attach to documentElement.
+  const host = document.body || document.documentElement;
+  if (!host) return;
+
+  const st = loadHudState() || {};
+  hudMin = (typeof st.min === 'boolean') ? st.min : !!CFG.hudStartMinimized;
+
+  const el = document.createElement('div');
+  el.id = 'tt-wgc-hud';
+  el.style.cssText = [
+    'position:fixed',
+    `left:${Number.isFinite(st.x) ? st.x : 12}px`,
+    `top:${Number.isFinite(st.y) ? st.y : 12}px`,
+    'z-index:2147483647',
+    'background:rgba(18,22,30,0.90)',
+    'color:#e8eefc',
+    'border:1px solid rgba(255,255,255,0.14)',
+    'border-radius:12px',
+    'box-shadow:0 12px 40px rgba(0,0,0,0.45)',
+    'font:12px/1.25 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif',
+    'min-width:220px',
+    'max-width:320px',
+    'user-select:none',
+    'pointer-events:auto',
+  ].join(';');
+
+  el.innerHTML = `
+    <div id="tt-wgc-hud-hdr" style="display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:grab;">
+      <div style="font-weight:800;letter-spacing:0.2px;flex:1;">WGC</div>
+      <button data-act="min" title="Minimise" style="all:unset;cursor:pointer;padding:2px 6px;border-radius:8px;background:rgba(255,255,255,0.10);border:1px solid rgba(255,255,255,0.14);">—</button>
+      <button data-act="copy" title="Copy log" style="all:unset;cursor:pointer;padding:2px 6px;border-radius:8px;background:rgba(255,255,255,0.10);border:1px solid rgba(255,255,255,0.14);">Copy</button>
+      <button data-act="hide" title="Hide HUD" style="all:unset;cursor:pointer;padding:2px 6px;border-radius:8px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.10);">×</button>
+    </div>
+    <div id="tt-wgc-hud-body" style="padding:8px 10px;border-top:1px solid rgba(255,255,255,0.10);"></div>
+  `;
+
+  // Stop the game from seeing pointer events.
+  ['pointerdown','pointerup','pointermove','mousedown','mouseup','mousemove','click','wheel'].forEach(evt => {
+    el.addEventListener(evt, (e) => { e.stopPropagation(); }, { capture: true });
+  });
+
+  // Drag handle
+  const hdr = el.querySelector('#tt-wgc-hud-hdr');
+  let drag = null;
+
+  hdr.addEventListener('pointerdown', (e) => {
+    // Only start drag when pressing on the header, not buttons.
+    const t = e.target;
+    if (t && t.closest && t.closest('button')) return;
+
+    hdr.style.cursor = 'grabbing';
+    hdr.setPointerCapture(e.pointerId);
+
+    const rect = el.getBoundingClientRect();
+    drag = { id: e.pointerId, ox: e.clientX - rect.left, oy: e.clientY - rect.top };
+    e.preventDefault();
+  });
+
+  hdr.addEventListener('pointermove', (e) => {
+    if (!drag || drag.id !== e.pointerId) return;
+    const vw = window.innerWidth || 800;
+    const vh = window.innerHeight || 600;
+
+    const w = el.offsetWidth || 260;
+    const h = el.offsetHeight || 80;
+
+    let x = e.clientX - drag.ox;
+    let y = e.clientY - drag.oy;
+
+    if (CFG.hudAllowAlmostOffscreen) {
+      const m = 24;
+      x = clamp(x, -w + m, vw - m);
+      y = clamp(y, -h + m, vh - m);
+    } else {
+      x = clamp(x, 0, Math.max(0, vw - w));
+      y = clamp(y, 0, Math.max(0, vh - h));
+    }
+
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+  });
+
+  hdr.addEventListener('pointerup', (e) => {
+    if (!drag || drag.id !== e.pointerId) return;
+    hdr.style.cursor = 'grab';
+    try { hdr.releasePointerCapture(e.pointerId); } catch (_) {}
+    drag = null;
+    persistHudPos();
+  });
+
+  function persistHudPos() {
+    const rect = el.getBoundingClientRect();
+    const cur = loadHudState() || {};
+    cur.x = Math.round(rect.left);
+    cur.y = Math.round(rect.top);
+    cur.min = !!hudMin;
+    saveHudState(cur);
+  }
+
+  // Buttons
+  el.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const act = btn.getAttribute('data-act');
+      if (act === 'min') {
+        hudMin = !hudMin;
+        persistHudPos();
+        updateHud();
+      } else if (act === 'copy') {
+        const txt = dumpLog();
+        try {
+          await navigator.clipboard.writeText(txt);
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = 'Copy'; }, 900);
+        } catch (_) {
+          // Fallback: prompt
+          prompt('Copy log:', txt);
+        }
+      } else if (act === 'hide') {
+        CFG.showHud = false;
+        persistHudPos();
+        el.remove();
+        hudEl = null;
+      }
+      e.preventDefault();
+    });
+  });
+
+  host.appendChild(el);
+  hudEl = el;
+
+  // Reattach if something removes it
+  if (!ensureHud._obs) {
+    const obs = new MutationObserver(() => {
+      if (CFG.showHud && (!hudEl || !document.contains(hudEl))) {
+        hudEl = null;
+        ensureHud();
+      }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+    ensureHud._obs = obs;
+  }
+
+  updateHud();
+}
+
+function updateHud() {
+  if (!CFG.showHud) return;
+  if (!hudEl || !document.contains(hudEl)) { ensureHud(); }
+  if (!hudEl) return;
+
+  const body = hudEl.querySelector('#tt-wgc-hud-body');
+  if (!body) return;
+
+  const wgc = getWGC();
+  const r10 = rateForWindow(CFG.window10mMs);
+  const r60 = rateForWindow(CFG.window60mMs);
+
+  let pred = 0;
+  for (const v of planByTeam.values()) pred += (v.plan?.metrics?.artifactsPerHour || 0);
+
+  const q = taskQueue.length;
+  const lastMs = Math.round(perf.lastSliceMs);
+  const evals = perf.evalCount;
+
+  const teams = buildTeamSummary();
+  const active = teams.reduce((s, t) => s + (t[1] ? 1 : 0), 0);
+
+  if (hudMin) {
+    body.style.display = 'none';
+    hudEl.style.minWidth = '170px';
+    hudEl.querySelector('#tt-wgc-hud-hdr').querySelector('div').textContent =
+      `WGC • ${active} active • ${Math.round(r60.gross)}g/hr`;
+    return;
+  } else {
+    body.style.display = 'block';
+    hudEl.style.minWidth = '220px';
+    hudEl.querySelector('#tt-wgc-hud-hdr').querySelector('div').textContent = 'WGC';
+  }
+
+  const av = getAlienArtifactValue();
+  body.innerHTML = `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;opacity:0.95;">
+      <div>AA: <b>${(typeof av === 'number') ? av.toFixed(1) : '—'}</b></div>
+      <div>10m: <b>${Math.round(r10.gross)}</b>g / <b>${Math.round(r10.net)}</b>n hr</div>
+      <div>60m: <b>${Math.round(r60.gross)}</b>g / <b>${Math.round(r60.net)}</b>n hr</div>
+    </div>
+    <div style="margin-top:6px;opacity:0.88;">
+      Pred(sum): <b>${Math.round(pred)}</b>/hr • Queue: <b>${q}</b> • Slice: <b>${lastMs}ms</b> • Evals: <b>${evals}</b>
+    </div>
+  `;
+}
 
   /********************************************************************
    * PUBLIC API
@@ -1445,6 +1666,9 @@
   const API = {
     CFG,
     getWGC,
+    toggleHud: () => { CFG.showHud = !CFG.showHud; if (CFG.showHud) ensureHud(); else if (hudEl) { hudEl.remove(); hudEl=null; } },
+    showHud: () => { CFG.showHud = true; ensureHud(); },
+    hideHud: () => { CFG.showHud = false; if (hudEl) { hudEl.remove(); hudEl=null; } },
     forceRecalc: () => {
       lastOptimiseAt = 0;
       logEv('F', 0, 0, 0, 0);
@@ -1459,6 +1683,10 @@
    * BOOT
    ********************************************************************/
   function boot() {
+    // HUD is optional (can be disabled via CFG.showHud)
+    ensureHud();
+    setInterval(() => { try { updateHud(); } catch (_) {} }, CFG.hudUpdateMs);
+
     takeArtSample();
     setInterval(() => {
       const ts = now();
