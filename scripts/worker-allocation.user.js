@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Terraforming Titans Worker Allocator (Live + Scaled Safeguards + Max Learn) [Firefox Fixed + UI Dock]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      1.0.8
+// @version      1.0.5
 // @description  Worker allocator overlay + safeguards + MAX weight learning + compact copy-to-clipboard log. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis structures to realize a target allocation plan.
 // @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  var TTWA_VER = '1.0.8';
+  var TTWA_VER = '1.0.5';
 
   // ===================== TT Shared Runtime (cross-script contract) =====================
   // Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
@@ -2121,66 +2121,15 @@
     }
 
     assigned = assignedTotalWorkers();
-    // Inactive worker reassignment: spend slack to activate built-but-inactive copies first (no new construction),
-    // then (if slack remains) apply the original one-shot bump to the highest-weight row.
-    var fillInactiveUsedWorkers = 0;
-    var fillInactiveAddedCount = 0;
-
     if (assigned < workerCap - 1e-6) {
       var slack = workerCap - assigned;
-
-      // Keep the same sort order the allocator uses (highest weight first).
-      enabled.sort(function (a, b) { return b.w - a.w; });
-
-      // Step 1: activate already-built but currently inactive copies (built > target).
-      // This consumes idle workers immediately without forcing new construction.
-      if (slack > 1e-6 && enabled.length) {
-        for (var fi = 0; fi < enabled.length; fi++) {
-          if (slack <= 1e-6) break;
-
-          var bFi = enabled[fi].b;
-          var kFi = bFi.key;
-          var effFi = toNum(bFi.effNeed, 0);
-          if (effFi <= 0) continue;
-
-          var builtFi = toNum(bFi.built, 0);
-          if (builtFi <= 0) continue;
-
-          var curFi = toNum(targetCountByKey[kFi], 0);
-          var needFi = Math.floor((builtFi - curFi) + 1e-9);
-          if (needFi <= 0) continue;
-
-          var canAddFi = Math.floor((slack / effFi) + 1e-9);
-          if (canAddFi <= 0) continue;
-
-          var addFi = (needFi < canAddFi) ? needFi : canAddFi;
-          if (addFi <= 0) continue;
-
-          targetCountByKey[kFi] = curFi + addFi;
-
-          var usedW = addFi * effFi;
-          slack -= usedW;
-
-          fillInactiveUsedWorkers += usedW;
-          fillInactiveAddedCount += addFi;
-        }
+      if (enabled.length) {
+        enabled.sort(function (a, b) { return b.w - a.w; });
+        var best = enabled[0].b;
+        var effB = Math.max(1e-9, toNum(best.effNeed, 0));
+        var add = Math.floor(slack / effB);
+        if (add > 0) targetCountByKey[best.key] = (targetCountByKey[best.key] || 0) + add;
       }
-
-      // Step 2 (original behaviour): if slack remains, add it to the best weight row (may build/activate new copies).
-      if (slack > 1e-6 && enabled.length) {
-        var bBest = enabled[0].b;
-        var kBest = bBest.key;
-        var effBest = toNum(bBest.effNeed, 0);
-        if (effBest > 0) {
-          var add = Math.floor((slack / effBest) + 1e-9);
-          if (add > 0) {
-            var cur = toNum(targetCountByKey[kBest], 0);
-            targetCountByKey[kBest] = cur + add;
-          }
-        }
-      }
-
-      assigned = assignedTotalWorkers();
     }
 
     var percentByKey = {};
@@ -2196,7 +2145,7 @@
       workerShareByKey[b4.key] = (workerCap > 0) ? (workers / workerCap) : 0;
 
       var base = Math.max(0, toNum(baseByKey[b4.key], 0));
-      percentByKey[b4.key] = (base > 0) ? (workers * 100 / base) : 0;
+      percentByKey[b4.key] = (base > 0) ? (cnt4 * 100 / base) : 0;
     }
 
     var allocWorkersTotal = 0;
@@ -2209,8 +2158,6 @@
     return {
       workerCap: workerCap,
       workerFree: toNum(snapshot.workerFree, 0),
-      fillInactiveWorkers: fillInactiveUsedWorkers,
-      fillInactiveCount: fillInactiveAddedCount,
       pop: pop, popCap: popCap,
       fixedWorkers: fixedWorkers,
       remainder: remainder,
@@ -2523,9 +2470,6 @@
         + ' weights ' + fmtNum(p.weightedWorkersUsed)
         + ' rem ' + fmtNum(p.remainder)
         + ' alloc ' + allocN + ' en ' + enabledN + ' nz ' + nonzeroN;
-      if (p.fillInactiveWorkers && p.fillInactiveWorkers > 0) {
-        wStr += ' fillI ' + fmtNum(p.fillInactiveWorkers) + ' +' + fmtNum(p.fillInactiveCount);
-      }
     } else if (s) {
       wStr += 'cap/free ' + fmtNum(s.workerCap) + '/' + fmtNum(s.workerFree);
     } else {
