@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Terraforming Titans Worker Allocator (Live + Scaled Safeguards + Max Learn) [Firefox Fixed + UI Dock]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      1.0.6
+// @version      1.0.6a
 // @description  Worker allocator overlay + safeguards + MAX weight learning + compact copy-to-clipboard log. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis structures to realize a target allocation plan.
 // @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
