@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Terraforming Titans Worker Allocator (Live + Scaled Safeguards + Max Learn) [Firefox Fixed + UI Dock]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      1.0.3
-// @description  Worker allocator overlay + safeguards + MAX weight learning. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis structures to realize a target allocation plan.
+// @version      1.0.4
+// @description  Worker allocator overlay + safeguards + MAX weight learning + compact copy-to-clipboard log. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis structures to realize a target allocation plan.
 // @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -18,6 +18,8 @@
 
 (function () {
   'use strict';
+
+  var TTWA_VER = '1.0.4';
 
   // ===================== TT Shared Runtime (cross-script contract) =====================
   // Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
@@ -151,16 +153,6 @@
    *         - final overshoot trimming + slack fill
    *   (6) applyPlan(plan) writes autoBuildPercent for each worker-basis structure:
    *         pct = targetBuildingCount / autoBuildBase * 100
-   *
-   * Invariants / constraints:
-   *   - We only touch worker-basis structures (autoBuildBasis === 'workers') for allocation.
-   *   - We only write to structures that are unlocked AND not hidden in the Structures UI.
-   *   - Game interprets autoBuildPercent with base = structure.getAutoBuildBase(pop, workerCap, collection),
-   *     which may differ from raw workerCap due to base modifiers and min-ratio logic.
-   *   - Colonists + Androids are treated as cap-maintained resources:
-   *         * request positive net until near-cap (even if consumption==0)
-   *         * if consumption>0, enforce a small positive margin
-   *         * emergency severity includes cap-deficit term (works even when consumption==0)
    */
 
   // ---------------- VM/Firefox sandbox bridge ----------------
@@ -417,6 +409,7 @@
       + "  function getResState(cat,res){ try{ var r=resources&&resources[cat]?resources[cat][res]:null; if(!r) return null; var prod=safeNumber(r.productionRate); var cons=safeNumber(r.consumptionRate); return { value:safeNumber(r.value), cap:safeNumber(r.cap), prod:prod, cons:cons, net:prod-cons, overflow:safeNumber(r.overflowRate), unlocked:!!r.unlocked }; }catch(e){ return null; } }\n"
       + "  function isVisibleStruct(b){ try{ if(b && typeof b.isVisible==='function') return !!b.isVisible(); return !!b.unlocked && !b.isHidden; }catch(e){ return !!b && !!b.unlocked && !b.isHidden; } }\n"
       + "  window.__TT_WORKER_ALLOC__={\n"
+      + "    mode:'injected',\n"
       + "    ready:function(){ try{ var hasRes=(typeof resources!=='undefined')&&resources&&resources.colony&&resources.colony.workers; var hasStruct=(typeof structures!=='undefined'&&structures)||(typeof buildings!=='undefined'&&buildings); return !!(hasRes && hasStruct); }catch(e){ return false; } },\n"
       + "    snapshot:function(){\n"
       + "      var popV=safeNumber(getPath(resources,['colony','colonists','value']));\n"
@@ -513,6 +506,16 @@
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
     });
   }
+  function clipStr(s, n) {
+    s = String(s == null ? '' : s);
+    n = Math.max(0, n | 0);
+    if (s.length <= n) return s;
+    return s.slice(0, Math.max(0, n - 1)) + '…';
+  }
+  function msLeft(ts) {
+    var d = toNum(ts, 0) - Date.now();
+    return d > 0 ? Math.round(d) : 0;
+  }
 
   // ---------------- settings/state ----------------
   var DEFAULTS = {
@@ -577,7 +580,6 @@
     document.head.appendChild(s);
   }
 
-  // Visually distinct from game dark mode: slightly tinted background + higher-contrast border + stronger shadow.
   addStyle(
     "#ttwa-root{position:fixed;top:88px;right:16px;z-index:999999;font:12px/1.25 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;color:#eaeaf0}" +
     "#ttwa-root *{box-sizing:border-box}" +
@@ -655,11 +657,9 @@
     var vw = window.innerWidth || 0;
     var vh = window.innerHeight || 0;
 
-    // Place near cursor but clamp within viewport.
     var tx = x + 14;
     var ty = y + 14;
 
-    // Need measure after display.
     var r = tip.getBoundingClientRect();
     if (tx + r.width + pad > vw) tx = Math.max(pad, vw - r.width - pad);
     if (ty + r.height + pad > vh) ty = Math.max(pad, y - r.height - 14);
@@ -811,6 +811,55 @@
     });
   }
 
+  // ---------------- clipboard copy (for Log button) ----------------
+  function copyToClipboard(text) {
+    return new Promise(function (resolve, reject) {
+      try {
+        var s = String(text == null ? '' : text);
+
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          navigator.clipboard.writeText(s).then(resolve).catch(function () { fallbackCopy(s, resolve, reject); });
+          return;
+        }
+        fallbackCopy(s, resolve, reject);
+      } catch (e) {
+        reject(e);
+      }
+    });
+
+    function fallbackCopy(s, resolve, reject) {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = s;
+        ta.setAttribute('readonly', 'readonly');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        var ok = false;
+        try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+        document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error('execCommand(copy) failed'));
+      } catch (e2) {
+        reject(e2);
+      }
+    }
+  }
+
+  function flashBtn(btn, ok, baseText) {
+    if (!btn) return;
+    var old = baseText || btn.textContent || '';
+    btn.textContent = ok ? 'Copied' : 'Copy failed';
+    btn.style.opacity = ok ? '1' : '0.85';
+    setTimeout(function () {
+      btn.textContent = old;
+      btn.style.opacity = '';
+    }, 900);
+  }
+
   // ---------------- UI build ----------------
   var ui = {};
   function buildUI() {
@@ -821,12 +870,14 @@
     ui.root.appendChild(tip);
 
     ui.runBtn = el('button', { class: 'ttwa-btn primary', text: state.running ? 'Stop' : 'Start' });
+    ui.logBtn = el('button', { class: 'ttwa-btn small', text: 'Copy Log' });
     ui.minBtn = el('button', { class: 'ttwa-btn small', text: state.minimized ? '▢' : '—' });
 
     ui.header = el('div', { id: 'ttwa-header' }, [
       el('div', { id: 'ttwa-title', text: 'TT Worker Allocator' }),
       el('div', { id: 'ttwa-spacer' }),
       ui.runBtn,
+      ui.logBtn,
       ui.minBtn
     ]);
 
@@ -866,12 +917,28 @@
       clampRootToViewport(ui.root);
     });
 
+    ui.logBtn.addEventListener('click', function () {
+      var txt = buildLogString();
+      var base = 'Copy Log';
+      copyToClipboard(txt).then(function () {
+        flashBtn(ui.logBtn, true, base);
+      }).catch(function () {
+        flashBtn(ui.logBtn, false, base);
+      });
+    });
+
     ui.body.style.display = state.minimized ? 'none' : 'flex';
 
     setTip(ui.runBtn,
       '<div class="tt">Start / Stop</div>' +
       '<div class="ln"><div class="lk">Effect</div><div class="lv">When <b>Start</b> is on, this script writes <code>autoBuildPercent</code> into worker-basis structures every tick.</div></div>' +
       '<div class="ln"><div class="lk">Safety</div><div class="lv">Stops immediately if bridge apply() fails.</div></div>'
+    );
+
+    setTip(ui.logBtn,
+      '<div class="tt">Copy Log</div>' +
+      '<div class="ln"><div class="lk">Purpose</div><div class="lv">Copies a compact but info-rich diagnostic line you can paste into chat so I can interpret behavior.</div></div>' +
+      '<div class="ln"><div class="lk">Includes</div><div class="lv">API mode/ready, worker breakdown, pop caps, learner state, apply results, emergency targets, and top allocations.</div></div>'
     );
 
     setTip(ui.minBtn,
@@ -891,7 +958,6 @@
     for (var i = 0; i < snapshot.buildings.length; i++) {
       var b = snapshot.buildings[i];
       if (!hasWorkers(b) || isWorkersBasis(b)) continue;
-      // Only reserve for things that are actually in play (unlocked or already built/active).
       if (!(b.unlocked || toNum(b.count, 0) > 0 || toNum(b.active, 0) > 0)) continue;
       out.push(b);
     }
@@ -903,9 +969,7 @@
       var b = snapshot.buildings[i];
       if (!hasWorkers(b)) continue;
       if (!isWorkersBasis(b)) continue;
-      // Hard safety: never allocate to locked/hidden structures.
       if (!isVisibleSnap(b)) continue;
-      // Optional display filter: preserved for backwards settings; now also means visible.
       if (state.showOnlyUnlocked && !isVisibleSnap(b)) continue;
       out.push(b);
     }
@@ -921,12 +985,10 @@
 
   // ---------------- resource filters ----------------
   function isExcludedForSafeguards(resKey) {
-    // Must not attempt to stabilize these; they are system-level / non-buffered.
     var r = String(resKey || '').split(':')[1] || '';
     return (r === 'energy' || r === 'workers' || r === 'funding');
   }
   function isExcludedForMax(resKey) {
-    // Avoid learning against caps/system resources.
     var r = String(resKey || '').split(':')[1] || '';
     return (r === 'energy' || r === 'workers' || r === 'funding' || r === 'colonists');
   }
@@ -991,21 +1053,19 @@
 
     hydrateRowDefaults(snapshot);
 
-    // if selected max building vanished, clear
     if (state.maxBuildingKey) {
       var ok = false;
       for (var mi = 0; mi < alloc.length; mi++) if (alloc[mi].key === state.maxBuildingKey) { ok = true; break; }
       if (!ok) { state.maxBuildingKey = null; state.maxResKey = null; saveSettings(); }
     }
 
-    // Controls + table
     var rowsHtml = '';
     for (var r = 0; r < alloc.length; r++) {
       var b = alloc[r];
       var maxrk = pickMaxResKeyFromBuilding(b);
 
       rowsHtml += ''
-        + '<tr data-key="' + escapeHtml(b.key) + '" data-maxrk="' + escapeHtml(maxrk || '') + '">' 
+        + '<tr data-key="' + escapeHtml(b.key) + '" data-maxrk="' + escapeHtml(maxrk || '') + '">'
         + '  <td class="ttwa-center"><input class="ttwa-use" type="checkbox"></td>'
         + '  <td class="ttwa-center"><input class="ttwa-max" type="checkbox"></td>'
         + '  <td>'
@@ -1075,7 +1135,6 @@
       + '  </table>'
       + '</div>';
 
-    // Wire controls
     var minClonesBtn = ui.allocCard.querySelector('#ttwa-minClones');
     var minAndroidsBtn = ui.allocCard.querySelector('#ttwa-minAndroids');
     var minShipsBtn = ui.allocCard.querySelector('#ttwa-minShips');
@@ -1147,7 +1206,6 @@
       '<div class="ln"><div class="lk">Effect</div><div class="lv">Clears the learner state (observations + current trial). Does <b>not</b> change your saved weights.</div></div>'
     );
 
-    // Learn controls
     var learnAgg = ui.allocCard.querySelector('#ttwa-learnAgg');
     var learnAggVal = ui.allocCard.querySelector('#ttwa-learnAggVal');
     var learnSmooth = ui.allocCard.querySelector('#ttwa-learnSmooth');
@@ -1187,7 +1245,6 @@
       saveSettings();
     });
 
-    // Wire row controls
     var trs = ui.allocCard.querySelectorAll('tr[data-key]');
     for (var t = 0; t < trs.length; t++) {
       (function () {
@@ -1255,8 +1312,8 @@
 
   // ---------------- safeguard model ----------------
   var rt = {
-    resEma: {},         // key -> EMA(net) for smoothing error signals
-    emergEma: {},       // key -> EMA(severity) for emergency floors
+    resEma: {},
+    emergEma: {},
     lastEmergencyAt: 0,
     lastSafeguardAt: 0,
     lastApplyAt: 0,
@@ -1273,7 +1330,15 @@
       lastStepAt: 0,
       trial: null,
       paused: ''
-    }
+    },
+
+    // --- log capture (v1.0.4) ---
+    lastSnapshot: null,
+    lastPlan: null,
+    lastTickAt: 0,
+    lastTickStatus: '',
+    lastApplyRes: null,
+    lastApplyCount: 0
   };
 
   function emaUpdate(key, x, alpha) {
@@ -1343,7 +1408,6 @@
   }
 
   function wantNetDeltaPop(st) {
-    // Cap-fill demand: generate positive net until near cap even if consumption==0.
     var cap = Math.max(0, toNum(st ? st.cap : 0, 0));
     var val = Math.max(0, toNum(st ? st.value : 0, 0));
     var cons = Math.max(0, toNum(st ? st.cons : 0, 0));
@@ -1351,20 +1415,18 @@
     var want = 0;
     if (cap > 0) {
       var band = clamp(toNum(state.popCapBandFrac, 0.002), 1e-5, 0.25);
-      var targetVal = cap * (1 - band * 0.05); // aim extremely close to cap, but avoid numerical chatter
+      var targetVal = cap * (1 - band * 0.05);
       if (val < targetVal) {
         var fillS = clamp(toNum(state.capFillSeconds, 45), 5, 600);
         want = Math.max(want, (targetVal - val) / fillS);
       }
     }
 
-    // If consumption exists, require a small positive margin to stay pinned at cap.
     if (cons > 0) {
       var m = clamp(toNum(state.popConsMarginFrac, 0.002), 0, 0.05);
       want = Math.max(want, cons * m);
     }
 
-    // Do not allow negative "wanted" for pop resources; goal is pinned-to-cap, not buffer decay.
     return Math.max(0, want);
   }
 
@@ -1395,7 +1457,6 @@
   }
 
   function capDeficitSeverity(st) {
-    // Works even if consumption==0. Intended mainly for colonists/androids.
     var cap = Math.max(0, toNum(st ? st.cap : 0, 0));
     if (!(cap > 0)) return 0;
     var val = Math.max(0, toNum(st ? st.value : 0, 0));
@@ -1409,7 +1470,6 @@
   function emergencySeverity(resKey, st, bufferS) {
     if (!st) return 0;
 
-    // Base buffer logic (consumption-driven)
     var cons = Math.max(0, toNum(st.cons, 0));
     var val = Math.max(0, toNum(st.value, 0));
     var sev = 0;
@@ -1444,7 +1504,6 @@
       sev = Math.max(secsTerm, netTerm);
     }
 
-    // Pop resources get cap-deficit severity as an additional driver.
     if (isPopRes(resKey)) sev = Math.max(sev, capDeficitSeverity(st));
 
     return (sev < 0.01) ? 0 : sev;
@@ -1454,7 +1513,6 @@
     var prev = rt.emergEma[resKey];
     if (!Number.isFinite(prev)) prev = 0;
 
-    // faster rise than decay to reduce oscillation
     var up = 6.0;
     var down = 1.4;
     var rate = (target > prev) ? up : down;
@@ -1467,7 +1525,6 @@
     return v;
   }
 
-  // One-hop coupling to reduce component/electronics seesaw.
   var EMERG_DEPS = {
     'colony:electronics': ['colony:components'],
     'colony:superconductors': ['colony:electronics', 'colony:components'],
@@ -1514,7 +1571,6 @@
         var err = want - ema;
         if (err > worstErr) worstErr = err;
 
-        // Decay gating: only decay when "clearly safe" (err well below 0 + not near buffer band).
         var cons = Math.max(1e-9, toNum(st.cons, 0));
         var deadband = cons * 0.001;
 
@@ -1530,13 +1586,11 @@
           if (tBand > graceS) safeToDecay = false;
         }
 
-        // Pop resources: treat any deficit as not safe to decay.
         if (isPopRes(key) && capDeficitSeverity(st) > 0) safeToDecay = false;
       }
 
       var cur = toNum(boostPctByKey[b.key], 0);
       if (worstErr > 0) {
-        // Scale error to avoid pop resources (cons==0) causing gigantic rel => stepUp slams to 95%.
         var scale = 1;
         var popDriven = false;
 
@@ -1547,14 +1601,12 @@
           var st2 = snapshot && snapshot.res ? snapshot.res[k2] : null;
           if (!st2) continue;
 
-          // Normal resources: scale by consumption.
           var cns = Math.max(1e-9, toNum(st2.cons, 0));
           if (cns > scale) scale = cns;
 
-          // Pop resources: scale by cap-fill demand / observed scale so rel is sane.
           if (isPopRes(k2)) {
-            var w = Math.abs(wantNetDelta(k2, st2));            // cap-fill desired net
-            var e = Math.abs(toNum(rt.resEma[k2], 0));          // observed net EMA magnitude
+            var w = Math.abs(wantNetDelta(k2, st2));
+            var e = Math.abs(toNum(rt.resEma[k2], 0));
             if (w > scale) scale = w;
             if (e > scale) scale = e;
           }
@@ -1563,7 +1615,6 @@
         var rel = worstErr / Math.max(1e-9, scale);
         var mag = Math.log10(rel + 1);
 
-        // Pop-driven boosts should rise slower to avoid “pin to cap” demanding 95% instantly.
         var stepUp = popDriven
           ? clamp(0.008 * (1 + 3 * mag), 0.001, 0.05)
           : clamp(0.010 * (1 + 6 * mag), 0.002, 0.18);
@@ -1685,7 +1736,6 @@
     }
     if (!candidates.length) { rt.maxLearn.paused = 'paused (no candidate producers)'; return false; }
 
-    // If all weights are zero, seed candidate producers evenly to bootstrap learning.
     if (!(sumW > 0)) {
       var seed = 100 / candidates.length;
       for (var s = 0; s < enabled.length; s++) rowState[enabled[s].key].weight = 0;
@@ -1699,7 +1749,6 @@
 
     function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
-    // Choose a decrement key from any positive-weight building, preferring outside the chain.
     var posKeys = [];
     for (var k0 = 0; k0 < enabled.length; k0++) {
       var kk = enabled[k0].key;
@@ -1712,7 +1761,6 @@
     for (var po = 0; po < posKeys.length; po++) if (!candSet[posKeys[po]]) posOutside.push(posKeys[po]);
     var decKey = pick(posOutside.length ? posOutside : posKeys);
 
-    // Increment target: prefer direct producers, else any chain producer, else any enabled.
     var incPool = [];
     for (var di = 0; di < direct.length; di++) if (direct[di] !== decKey) incPool.push(direct[di]);
     if (!incPool.length) for (var ci = 0; ci < candidates.length; ci++) if (candidates[ci] !== decKey) incPool.push(candidates[ci]);
@@ -1827,30 +1875,25 @@
     var stColonists = snapshot && snapshot.res ? snapshot.res['colony:colonists'] : null;
     var stAndroids = snapshot && snapshot.res ? snapshot.res['colony:androids'] : null;
 
-    // "Hard-capped" only when hysteresis says capped AND there is no consumption pressure.
     var colonistsCapped = !!rt.capState.colonists && stColonists && stColonists.cap > 0 && (stColonists.cons <= 0);
     var androidsCapped = !!rt.capState.android && stAndroids && stAndroids.cap > 0 && (stAndroids.cons <= 0);
 
-    // Deficit factors (0..1): strong under cap, fades near cap.
     function deficitFactorFor(st) {
       if (!st) return 0;
       if (!(toNum(st.cap, 0) > 0)) return 0;
-      var sev = capDeficitSeverity(st); // already banded 0..1
-      // Keep a tiny floor if consumption exists (avoids "fully off" in steady-state where tiny drops matter).
+      var sev = capDeficitSeverity(st);
       if (toNum(st.cons, 0) > 0) sev = Math.max(sev, 0.10);
       return clamp(sev, 0, 1);
     }
     var defColonists = deficitFactorFor(stColonists);
     var defAndroids = deficitFactorFor(stAndroids);
 
-    // Floors are expressed in workers (not buildings) before conversion; later we ceil by effNeed.
     var floorWorkersByKey = {};
     function addFloorWorkers(k, w) {
       if (!k || !(w > 0)) return;
       floorWorkersByKey[k] = (floorWorkersByKey[k] || 0) + w;
     }
 
-    // Deficit-scaled "Min" floors
     if (state.keepClonesMin && cloneKey && !colonistsCapped) {
       addFloorWorkers(cloneKey, remainder * (clamp(state.minPctClones, 0, 10) / 100) * defColonists);
     }
@@ -1858,14 +1901,12 @@
       addFloorWorkers(androidKey, remainder * (clamp(state.minPctAndroids, 0, 10) / 100) * defAndroids);
     }
     if (state.keepShipsMin && shipKey) {
-      // ships are not cap-stabilized here; min ships is always a fixed minimum when enabled
       addFloorWorkers(shipKey, remainder * (clamp(state.minPctShips, 0, 10) / 100));
     }
     if (state.keepBiodomesMin && biodomeKey && !colonistsCapped) {
       addFloorWorkers(biodomeKey, remainder * (clamp(state.minPctBiodomes, 0, 10) / 100) * defColonists);
     }
 
-    // Emergency floor distribution based on resource severity, plus dependency coupling.
     var producersByRes = {};
     for (var pb = 0; pb < alloc.length; pb++) {
       var pbld = alloc[pb];
@@ -1894,7 +1935,6 @@
       targetSev[rk2] = emergencySeverity(rk2, resMap[rk2], bufferS2);
     }
 
-    // Dependency propagation: if output is severely starved and an input is tight, lift the input severity.
     function depPropagationFactor(depSt, bufferS) {
       if (!depSt) return 0;
 
@@ -1949,6 +1989,9 @@
       if (sevSm > maxSev) maxSev = sevSm;
     }
 
+    var emergBudgetPct = 0;
+    var emergBudgetWorkers = 0;
+
     if (remainder > 0 && emergList.length) {
       emergList.sort(function (a, b) { return b.sev - a.sev; });
       if (emergList.length > 8) emergList.length = 8;
@@ -1959,6 +2002,8 @@
       if (sumTop > 0) {
         var budgetPct = clamp(6 + 49 * maxSev, 0, 55);
         var budgetWorkers = remainder * (budgetPct / 100);
+        emergBudgetPct = budgetPct;
+        emergBudgetWorkers = budgetWorkers;
 
         for (var ei = 0; ei < emergList.length; ei++) {
           var e = emergList[ei];
@@ -1969,14 +2014,12 @@
       }
     }
 
-    // Persistent boosts (controller output from adjustSafeguards)
     for (var a = 0; a < alloc.length; a++) {
       var bb = alloc[a];
       var bp = toNum(boostPctByKey[bb.key], 0);
       if (bp > 0) addFloorWorkers(bb.key, remainder * (bp / 100));
     }
 
-    // --- FLOOR CAP: prevent stacked floors (min + emergency + boost) exceeding remainder ---
     var totalFloorReq = 0;
     for (var fk0 in floorWorkersByKey) {
       if (!floorWorkersByKey.hasOwnProperty(fk0)) continue;
@@ -1997,7 +2040,6 @@
       baseByKey[snapshot.buildings[b2].key] = toNum(snapshot.buildings[b2].autoBuildBase, 0);
     }
 
-    // Convert floor workers -> floor building counts
     var floorCountByKey = {};
     var floorWorkersUsed = 0;
     for (var k in floorWorkersByKey) {
@@ -2012,7 +2054,6 @@
 
     var remainForWeights = Math.max(0, remainder - floorWorkersUsed);
 
-    // Weighted pool (skips pop buildings only when hard-capped)
     var enabled = [];
     var sumW = 0;
     for (var a2 = 0; a2 < alloc.length; a2++) {
@@ -2030,13 +2071,11 @@
     }
 
     var targetCountByKey = {};
-    // Seed from floors
     for (var fk in floorCountByKey) {
       if (!floorCountByKey.hasOwnProperty(fk)) continue;
       targetCountByKey[fk] = (targetCountByKey[fk] || 0) + floorCountByKey[fk];
     }
 
-    // Add weighted distribution
     if (sumW > 0 && remainForWeights > 0) {
       for (var e2 = 0; e2 < enabled.length; e2++) {
         var eb = enabled[e2].b;
@@ -2056,7 +2095,6 @@
       return total;
     }
 
-    // Trim overshoot (never below floor counts)
     var assigned = assignedTotalWorkers();
     if (assigned > workerCap + 1e-6) {
       var overshoot = assigned - workerCap;
@@ -2082,7 +2120,6 @@
       }
     }
 
-    // Fill slack to top weight building (best-effort)
     assigned = assignedTotalWorkers();
     if (assigned < workerCap - 1e-6) {
       var slack = workerCap - assigned;
@@ -2095,7 +2132,6 @@
       }
     }
 
-    // Produce apply pct + worker bars
     var percentByKey = {};
     var workersByKey = {};
     var workerShareByKey = {};
@@ -2112,10 +2148,12 @@
       percentByKey[b4.key] = (base > 0) ? (cnt4 * 100 / base) : 0;
     }
 
-    // Breakdowns for status card
     var allocWorkersTotal = 0;
     for (var i5 = 0; i5 < alloc.length; i5++) allocWorkersTotal += toNum(workersByKey[alloc[i5].key], 0);
     var weightedWorkers = Math.max(0, allocWorkersTotal - floorWorkersUsed);
+
+    var emergTop = [];
+    for (var ee = 0; ee < emergList.length; ee++) emergTop.push({ rk: emergList[ee].rk, sev: emergList[ee].sev });
 
     return {
       workerCap: workerCap,
@@ -2135,7 +2173,13 @@
       percentByKey: percentByKey,
       workersByKey: workersByKey,
       workerShareByKey: workerShareByKey,
-      baseByKey: baseByKey
+      baseByKey: baseByKey,
+
+      // log-only (no behavior impact)
+      emergTop: emergTop,
+      emergMaxSev: maxSev,
+      emergBudgetPct: emergBudgetPct,
+      emergBudgetWorkers: emergBudgetWorkers
     };
   }
 
@@ -2158,22 +2202,23 @@
       }
     }
     var keys = Object.keys(updates);
-    if (!keys.length) return;
+    rt.lastApplyCount = keys.length;
+    if (!keys.length) { rt.lastApplyRes = { ok: true, note: 'no-changes' }; return; }
 
     var api = getApi();
     var res = api && typeof api.apply === 'function' ? api.apply(updates) : null;
+    rt.lastApplyRes = res;
+
     if (res && res.ok === false) {
       state.running = false;
       ui.runBtn.textContent = 'Start';
       saveSettings();
     }
-
-    // v1.0.3: DO NOT call refreshAllAutoBuildTargets() here.
-    // It can cause the Structures UI to re-render, closing open menus/rollers.
   }
 
   function renderWaiting(reason) {
     var msg = reason || 'Waiting for game globals (resources/structures)…';
+    rt.lastTickStatus = 'wait:' + msg;
     ui.statusCard.innerHTML = ''
       + '<div class="ttwa-row" style="justify-content:space-between">'
       + '  <div class="ttwa-kv"><div class="k">Status</div><div class="v"><span class="ttwa-badge">Not ready</span></div></div>'
@@ -2273,12 +2318,10 @@
       var base = toNum(plan.baseByKey[key], 0);
       var pctApply = toNum(plan.percentByKey[key], 0);
 
-      // Workers bar = worker share.
       var pctFill = clamp(share * 100, 0, 100);
       barFill.style.width = pctFill.toFixed(2) + '%';
       barText.textContent = fmtNum(workers);
 
-      // Info tooltip
       var produces = (b.produces || []).filter(function (x) { return x && !isExcludedForSafeguards(x); });
       var prodStr = produces.length ? produces.map(function (x) { return '<code>' + escapeHtml(x) + '</code>'; }).join(' ') : '<span class="ttwa-muted">none</span>';
 
@@ -2300,6 +2343,185 @@
         '<div class="ln"><div class="lk">Workers</div><div class="lv">' + fmtNum(workers) + '</div></div>' +
         '<div class="ln"><div class="lk">Share</div><div class="lv">' + (pctFill.toFixed(3)) + '% of cap</div></div>');
     }
+  }
+
+  // ---------------- compact diagnostic log (v1.0.4) ----------------
+  function buildLogString() {
+    var api = getApi();
+    var apiMode = api ? (api.mode || 'unknown') : 'none';
+    var apiReady = !!(api && typeof api.ready === 'function' && api.ready());
+
+    var s = rt.lastSnapshot;
+    var p = rt.lastPlan;
+
+    var sh = TT && TT.shared ? TT.shared : { masterEnabled: true, pauseUntil: 0, lastError: '', lastAction: '' };
+    var pauseMs = msLeft(sh.pauseUntil || 0);
+
+    function popMini(key) {
+      if (!s || !s.res || !s.res[key]) return key + '=n/a';
+      var st = s.res[key];
+      var v = toNum(st.value, 0), c = toNum(st.cap, 0), n = netIncludingOverflow(st), cons = toNum(st.cons, 0);
+      var fill = (c > 0) ? (v / c * 100) : NaN;
+      return resKeyLabel(key) + '=' + fmtNum(v) + '/' + fmtNum(c) + (Number.isFinite(fill) ? ('(' + fill.toFixed(3) + '%)') : '') + ' net=' + fmtNum(n) + ' cons=' + fmtNum(cons);
+    }
+
+    function resMini(rk, sev) {
+      if (!s || !s.res || !s.res[rk]) return resKeyLabel(rk) + ':' + (Number.isFinite(sev) ? sev.toFixed(3) : '?');
+      var st = s.res[rk];
+      var cons = toNum(st.cons, 0);
+      var secs = cons > 0 ? (toNum(st.value, 0) / cons) : Infinity;
+      var secStr = (secs === Infinity)
+        ? (toNum(st.cap, 0) > 0 ? ('cap' + (toNum(st.value, 0) / Math.max(1e-9, toNum(st.cap, 0)) * 100).toFixed(2) + '%') : 'n/a')
+        : (secs.toFixed(1) + 's');
+      return resKeyLabel(rk) + ':' + (Number.isFinite(sev) ? sev.toFixed(3) : '?') + '(' + secStr + ',net=' + fmtNum(netIncludingOverflow(st)) + ')';
+    }
+
+    // Top allocations (compact)
+    var top = [];
+    var allocN = 0, enabledN = 0, nonzeroN = 0;
+
+    if (p && p.alloc && p.alloc.length) {
+      allocN = p.alloc.length;
+      for (var i = 0; i < p.alloc.length; i++) {
+        var b = p.alloc[i];
+        var rs = rowState[b.key] || {};
+        if (rs.enabled !== false) enabledN++;
+
+        var workers = toNum(p.workersByKey ? p.workersByKey[b.key] : 0, 0);
+        var share = toNum(p.workerShareByKey ? p.workerShareByKey[b.key] : 0, 0) * 100;
+        var wgt = toNum(rs.weight, 0);
+        var floorCnt = toNum(p.floorCountByKey ? p.floorCountByKey[b.key] : 0, 0);
+        var boost = toNum(boostPctByKey[b.key], 0);
+        var pctApply = toNum(p.percentByKey ? p.percentByKey[b.key] : 0, 0);
+        var tgt = toNum(p.targetCountByKey ? p.targetCountByKey[b.key] : 0, 0);
+
+        if (workers > 0) nonzeroN++;
+
+        if (workers > 0 || floorCnt > 0 || boost > 0) {
+          top.push({
+            key: b.key,
+            workers: workers,
+            share: share,
+            wgt: wgt,
+            floor: floorCnt,
+            boost: boost,
+            pct: pctApply,
+            tgt: tgt
+          });
+        }
+      }
+      top.sort(function (a, b) { return b.workers - a.workers; });
+      if (top.length > 10) top.length = 10;
+    }
+
+    function topStr() {
+      if (!top.length) return 'bld=[]';
+      var parts = [];
+      for (var i = 0; i < top.length; i++) {
+        var x = top[i];
+        parts.push(
+          x.key + '('
+          + fmtNum(x.workers) + '@' + x.share.toFixed(1) + '%'
+          + ',w=' + (Number.isFinite(x.wgt) ? x.wgt.toFixed(1) : '0')
+          + (x.floor > 0 ? (',f=' + x.floor) : '')
+          + (x.boost > 0 ? (',b=' + x.boost.toFixed(2) + '%') : '')
+          + ',pct=' + x.pct.toFixed(3)
+          + ',t=' + x.tgt
+          + ')'
+        );
+      }
+      return 'bld=[' + parts.join(';') + ']';
+    }
+
+    // Emergency targets (top few)
+    var emergStr = 'emerg=[]';
+    if (p && p.emergTop && p.emergTop.length) {
+      var parts2 = [];
+      for (var j = 0; j < Math.min(6, p.emergTop.length); j++) {
+        parts2.push(resMini(p.emergTop[j].rk, p.emergTop[j].sev));
+      }
+      emergStr = 'emerg(' + (Number.isFinite(p.emergBudgetPct) ? p.emergBudgetPct.toFixed(1) : '0') + '%)=[ ' + parts2.join(' ; ') + ' ]';
+    }
+
+    // Apply status
+    var applyOk = (rt.lastApplyRes && typeof rt.lastApplyRes.ok === 'boolean') ? rt.lastApplyRes.ok : null;
+    var applyErr = (rt.lastApplyRes && rt.lastApplyRes.ok === false) ? (rt.lastApplyRes.error || 'apply-failed') : '';
+    var applyStr = 'apply=' + (applyOk === null ? 'n/a' : (applyOk ? 'ok' : 'FAIL')) + ' upd=' + (rt.lastApplyCount || 0) + (applyErr ? (' err=' + clipStr(applyErr, 140)) : '');
+
+    // Learner summary
+    var ml = rt.maxLearn || {};
+    var maxStr = 'max=' + (state.maxResKey ? resKeyLabel(state.maxResKey) : 'off');
+    if (state.maxResKey) {
+      maxStr += ' sc=' + (Number.isFinite(ml.lastScore) ? fmtNum(ml.lastScore) : '…')
+        + ' mean=' + (Number.isFinite(ml.mean) ? fmtNum(ml.mean) : '…')
+        + ' mad=' + (Number.isFinite(ml.mad) ? fmtNum(ml.mad) : '…');
+      if (ml.trial) {
+        maxStr += ' trial=' + ml.trial.incKey + '<-' + ml.trial.decKey + ' d=' + fmtNum(ml.trial.delta) + ' settle=' + msLeft(ml.trial.settleUntil) + 'ms';
+      }
+      if (ml.paused) maxStr += ' (' + clipStr(ml.paused, 80) + ')';
+    }
+
+    // Worker summary
+    var wStr = 'W=';
+    if (p) {
+      wStr += 'cap/free ' + fmtNum(p.workerCap) + '/' + fmtNum(p.workerFree)
+        + ' fixed ' + fmtNum(p.fixedWorkers)
+        + ' floors ' + fmtNum(p.floorWorkersUsed)
+        + ' weights ' + fmtNum(p.weightedWorkersUsed)
+        + ' rem ' + fmtNum(p.remainder)
+        + ' alloc ' + allocN + ' en ' + enabledN + ' nz ' + nonzeroN;
+    } else if (s) {
+      wStr += 'cap/free ' + fmtNum(s.workerCap) + '/' + fmtNum(s.workerFree);
+    } else {
+      wStr += 'n/a';
+    }
+
+    // Config summary (compact)
+    var cfg =
+      'cfg='
+      + 'minC ' + (state.keepClonesMin ? 1 : 0) + '@' + toNum(state.minPctClones, 0)
+      + ' minA ' + (state.keepAndroidsMin ? 1 : 0) + '@' + toNum(state.minPctAndroids, 0)
+      + ' minS ' + (state.keepShipsMin ? 1 : 0) + '@' + toNum(state.minPctShips, 0)
+      + ' minB ' + (state.keepBiodomesMin ? 1 : 0) + '@' + toNum(state.minPctBiodomes, 0)
+      + ' buf ' + Math.round(clamp(state.bufferSeconds, 0, 1e9)) + 's'
+      + ' prefNZ ' + (state.preferNetZero ? 1 : 0)
+      + ' band ' + toNum(state.strengthenBand, 0).toFixed(2)
+      + ' fillS ' + Math.round(clamp(state.capFillSeconds, 0, 1e9)) + 's'
+      + ' learn ' + Math.round(clamp(state.learnAgg, 0, 100)) + '/' + Math.round(clamp(state.learnSmooth, 0, 100))
+      + ' step ' + Math.round(clamp(state.learnIntervalSec, 0, 1e9)) + 's'
+      + ' settle ' + Math.round(clamp(state.learnSettleSec, 0, 1e9)) + 's';
+
+    // Pop summary
+    var popStr = 'pop=[' + popMini('colony:colonists') + ' | ' + popMini('colony:androids') + ']';
+
+    // Shared runtime + state
+    var rtStr =
+      'rt='
+      + 'master ' + (sh.masterEnabled ? 1 : 0)
+      + ' pause ' + pauseMs + 'ms'
+      + ' running ' + (state.running ? 1 : 0)
+      + ' min ' + (state.minimized ? 1 : 0)
+      + ' api ' + apiMode + (apiReady ? ':ready' : ':nr')
+      + (rt.lastTickStatus ? (' tick=' + clipStr(rt.lastTickStatus, 90)) : '');
+
+    var errStr = '';
+    if (sh.lastError) errStr = 'err=' + clipStr(sh.lastError, 160);
+
+    // One-line, paste-friendly, minimal-but-rich
+    return [
+      'TTWA v' + TTWA_VER,
+      't=' + new Date().toISOString(),
+      'host=' + location.host,
+      rtStr,
+      wStr,
+      popStr,
+      cfg,
+      maxStr,
+      applyStr,
+      emergStr,
+      topStr(),
+      errStr
+    ].filter(function (x) { return x && String(x).trim().length; }).join(' | ');
   }
 
   // ---------------- main loop ----------------
@@ -2324,6 +2546,12 @@
 
     var plan = computePlan(snapshot);
     applyPlan(plan);
+
+    // log capture
+    rt.lastSnapshot = snapshot;
+    rt.lastPlan = plan;
+    rt.lastTickAt = Date.now();
+    rt.lastTickStatus = 'ok';
 
     renderStatus(snapshot, plan);
     renderTable(snapshot, plan);
