@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  var TTWA_VER = '1.0.5';
+  var TTWA_VER = '1.0.6';
 
   // ===================== TT Shared Runtime (cross-script contract) =====================
   // Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
