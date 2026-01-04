@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Terraforming Titans Worker Allocator (Live + Scaled Safeguards + Max Learn) [Firefox Fixed + UI Dock]
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      1.0.6a
+// @version      1.0.5
 // @description  Worker allocator overlay + safeguards + MAX weight learning + compact copy-to-clipboard log. Firefox/Violentmonkey compatible. Writes autoBuildPercent for worker-basis structures to realize a target allocation plan.
 // @author       kov27
 // @match        https://html-classic.itch.zone/html/*/index.html
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  var TTWA_VER = '1.0.6';
+  var TTWA_VER = '1.0.5';
 
   // ===================== TT Shared Runtime (cross-script contract) =====================
   // Shared across ALL userscripts on the same page via unsafeWindow.__TT_SHARED__
@@ -537,7 +537,6 @@
 
     // safeguard / buffer model
     preferNetZero: true,
-    reallocInactive: true,
     bufferSeconds: 30,
     softHorizonSeconds: 600,
     refillSeconds: 60,
@@ -2134,82 +2133,6 @@
     }
 
     var percentByKey = {};
-
-    // Reallocate free workers by filling built-but-under-target capacity.
-    // This helps when a large portion of the target allocation is tied up in buildings that are not yet built/active,
-    // leaving workers idle (free) despite a full-cap plan.
-    var reallocInfo = {
-      enabled: !!state.reallocInactive,
-      poolWorkers: toNum(workerFree, 0),
-      usedWorkers: 0,
-      touched: 0,
-      addCountByKey: Object.create(null),
-      workersByKey: Object.create(null)
-    };
-
-    if (reallocInfo.enabled && reallocInfo.poolWorkers > 0 && alloc && alloc.length) {
-      var cands = [];
-      for (var rci = 0; rci < alloc.length; rci++) {
-        var bb = alloc[rci];
-        if (!bb || !bb.enabled) continue;
-
-        var eff = toNum(bb.effNeed, 0);
-        if (!(eff > 0)) continue;
-
-        var cnt = toNum(bb.count, 0);
-        var act = toNum(bb.active, 0);
-        var tgt = toNum(targetCountByKey[bb.key], 0);
-
-        // If built count exceeds target, auto-activation may be constrained by the target rather than worker availability.
-        // Also require some built units are currently inactive.
-        var missingTarget = cnt - tgt;
-        var inactiveBuilt = cnt - act;
-        if (missingTarget <= 0 || inactiveBuilt <= 0) continue;
-
-        var maxAddCnt = Math.min(missingTarget, inactiveBuilt);
-        if (!(maxAddCnt > 0)) continue;
-
-        var canUseWorkers = maxAddCnt * eff;
-        if (!(canUseWorkers > 0)) continue;
-
-        cands.push({
-          key: bb.key,
-          eff: eff,
-          maxAddCnt: maxAddCnt,
-          canUseWorkers: canUseWorkers,
-          weight: toNum(weightByKey[bb.key], 0),
-          inactiveBuilt: inactiveBuilt
-        });
-      }
-
-      if (cands.length) {
-        cands.sort(function (a, b) {
-          if (b.weight !== a.weight) return b.weight - a.weight;
-          if (b.canUseWorkers !== a.canUseWorkers) return b.canUseWorkers - a.canUseWorkers;
-          if (b.inactiveBuilt !== a.inactiveBuilt) return b.inactiveBuilt - a.inactiveBuilt;
-          return 0;
-        });
-
-        var pool = reallocInfo.poolWorkers;
-        for (var rcj = 0; rcj < cands.length && pool > 0; rcj++) {
-          var c = cands[rcj];
-          var wantCnt = Math.ceil(pool / c.eff);
-          var addCnt = clamp(wantCnt, 0, c.maxAddCnt);
-          if (!(addCnt > 0)) continue;
-
-          targetCountByKey[c.key] = toNum(targetCountByKey[c.key], 0) + addCnt;
-
-          var used = addCnt * c.eff;
-          pool -= used;
-
-          reallocInfo.usedWorkers += used;
-          reallocInfo.touched += 1;
-          reallocInfo.addCountByKey[c.key] = (reallocInfo.addCountByKey[c.key] || 0) + addCnt;
-          reallocInfo.workersByKey[c.key] = (reallocInfo.workersByKey[c.key] || 0) + used;
-        }
-      }
-    }
-
     var workersByKey = {};
     var workerShareByKey = {};
 
@@ -2236,7 +2159,6 @@
       workerCap: workerCap,
       workerFree: toNum(snapshot.workerFree, 0),
       pop: pop, popCap: popCap,
-      realloc: reallocInfo,
       fixedWorkers: fixedWorkers,
       remainder: remainder,
       floorWorkersUsed: floorWorkersUsed,
@@ -2328,7 +2250,6 @@
       + '    <div class="v">'
       + '      <span class="ttwa-badge">cap ' + fmtNum(plan.workerCap) + '</span>'
       + '      <span class="ttwa-badge">free ' + fmtNum(plan.workerFree) + '</span>'
-      + (plan.realloc && plan.realloc.enabled ? ('      <span class="ttwa-badge">realloc ' + (toNum(plan.realloc.usedWorkers, 0) > 0 ? ('+' + fmtNum(plan.realloc.usedWorkers)) : '0') + (plan.realloc.touched ? (' (' + plan.realloc.touched + ')') : '') + '</span>') : '')
       + '    </div>'
       + '    <div class="ttwa-mini ttwa-muted" style="margin-top:4px">'
       + '      fixed ' + fmtNum(plan.fixedWorkers) + ' · floors ' + fmtNum(plan.floorWorkersUsed) + ' · weights ' + fmtNum(plan.weightedWorkersUsed)
@@ -2414,8 +2335,6 @@
         '<div class="ln"><div class="lk">AutoBuild %</div><div class="lv">' + fmtPct(pctApply) + '</div></div>' +
         '<div class="ln"><div class="lk">Floor buildings</div><div class="lv">' + fmtNum(floorCnt) + (boost > 0 ? (' · boost ' + fmtPct(boost) + '%') : '') + '</div></div>' +
         '<div class="ln"><div class="lk">Target buildings</div><div class="lv">' + fmtNum(tgtCnt) + '</div></div>' +
-        (plan.realloc && plan.realloc.addCountByKey && toNum(plan.realloc.addCountByKey[b.key], 0) > 0 ?
-          ('<div class="ln"><div class="lk">Realloc fill</div><div class="lv">+' + fmtNum(toNum(plan.realloc.workersByKey[b.key], 0)) + ' (' + fmtNum(toNum(plan.realloc.addCountByKey[b.key], 0)) + ' bld)</div></div>') : '') +
         '<div class="ln"><div class="lk">Workers</div><div class="lv">' + fmtNum(workers) + ' (' + pctFill.toFixed(3) + '% cap)</div></div>' +
         '<div class="ln"><div class="lk">Produces</div><div class="lv">' + prodStr + '</div></div>';
 
@@ -2550,8 +2469,7 @@
         + ' floors ' + fmtNum(p.floorWorkersUsed)
         + ' weights ' + fmtNum(p.weightedWorkersUsed)
         + ' rem ' + fmtNum(p.remainder)
-        + ' alloc ' + allocN + ' en ' + enabledN + ' nz ' + nonzeroN
-        + (p.realloc && p.realloc.enabled ? (' ri 1 fill ' + fmtNum(toNum(p.realloc.usedWorkers, 0)) + ' b ' + (p.realloc.touched || 0)) : ' ri 0');
+        + ' alloc ' + allocN + ' en ' + enabledN + ' nz ' + nonzeroN;
     } else if (s) {
       wStr += 'cap/free ' + fmtNum(s.workerCap) + '/' + fmtNum(s.workerFree);
     } else {
