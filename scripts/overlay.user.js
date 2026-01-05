@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Terraforming Titans - Data Inspector HUD (Overlay + Paths + Live Values)
+// @name         Terraforming Titans - Data Inspector HUD (Live Values + Copy Paths)
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts
-// @version      0.6.0
-// @description  Overlay HUD that shows live resources + structures with copyable JS paths and inspectable details. Built to help you write TT scripts.
+// @version      0.6.1
+// @description  Overlay HUD that shows live resources + buildings with copyable JS paths and raw object inspector.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @grant        unsafeWindow
 // @grant        GM_setClipboard
@@ -14,37 +14,36 @@
   var W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
   // --------------------------
-  // Simple helper functions
+  // Tiny helpers (simple + safe)
   // --------------------------
 
-  // "Is this a normal object?" (not null, not array)
   function isObj(x) { return x && typeof x === 'object' && !Array.isArray(x); }
 
-  // Convert anything into a number safely (bad values -> 0)
   function num(x) {
     var n = Number(x);
     return isFinite(n) ? n : 0;
   }
 
-  // Format big numbers so they're readable, but still accurate enough for debugging
   function fmt(n) {
     if (!isFinite(n)) return String(n);
     var abs = Math.abs(n);
-
-    // show integers with commas when they're not huge
     if (abs < 1e6) {
       var s = (Math.round(n) === n) ? String(n) : n.toFixed(3);
-      // add commas to integer part
       var parts = s.split('.');
       parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
       return parts.join('.');
     }
-
-    // otherwise scientific-ish (still readable)
     return n.toExponential(6);
   }
 
-  // Copy text to clipboard (Violentmonkey supports GM_setClipboard)
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   function copyText(text) {
     try {
       if (typeof GM_setClipboard === 'function') {
@@ -64,7 +63,6 @@
     return false;
   }
 
-  // A safe-ish stringify that won’t explode on circular refs, and won’t produce megabytes
   function safeStringify(obj, maxChars) {
     maxChars = maxChars || 30000;
     var seen = new WeakSet();
@@ -76,7 +74,6 @@
           if (seen.has(v)) return '[Circular]';
           seen.add(v);
         }
-        // avoid dumping giant arrays
         if (Array.isArray(v) && v.length > 200) return '[Array len=' + v.length + ']';
         return v;
       }, 2);
@@ -84,20 +81,30 @@
       out = String(e);
     }
 
-    if (out.length > maxChars) {
-      out = out.slice(0, maxChars) + '\n\n[...truncated at ' + maxChars + ' chars...]';
-    }
+    if (out.length > maxChars) out = out.slice(0, maxChars) + '\n\n[...truncated...]';
     return out;
   }
 
   // --------------------------
-  // Read game data
+  // Where are the "buildings" stored?
+  // (Your JSON shows window.buildings exists)
   // --------------------------
 
-  function gameReady() {
-    // These are the main things you want for scripting
-    return !!(W && W.resources && W.structures);
+  function getBuildingsSource() {
+    // returns: { obj, basePath, label }
+    if (isObj(W.structures)) return { obj: W.structures, basePath: 'window.structures', label: 'structures' };
+    if (isObj(W.buildings))  return { obj: W.buildings,  basePath: 'window.buildings',  label: 'buildings' };
+
+    // some versions hide these under game
+    if (isObj(W.game) && isObj(W.game.structures)) return { obj: W.game.structures, basePath: 'window.game.structures', label: 'game.structures' };
+    if (isObj(W.game) && isObj(W.game.buildings))  return { obj: W.game.buildings,  basePath: 'window.game.buildings',  label: 'game.buildings' };
+
+    return null;
   }
+
+  // --------------------------
+  // Read resources
+  // --------------------------
 
   function collectResources() {
     var result = [];
@@ -134,51 +141,57 @@
       });
     });
 
-    // stable ordering
     result.sort(function (a, b) { return a.key.localeCompare(b.key); });
-
     return { list: result, paths: paths };
   }
 
-  function collectStructures() {
+  // --------------------------
+  // Read buildings (from window.structures OR window.buildings)
+  // --------------------------
+
+  function collectBuildings() {
     var result = [];
     var paths = {};
+    var src = getBuildingsSource();
+    if (!src || !isObj(src.obj)) return { list: result, paths: paths, sourceLabel: 'none' };
 
-    if (!isObj(W.structures)) return { list: result, paths: paths };
+    Object.keys(src.obj).forEach(function (k) {
+      var b = src.obj[k];
+      if (!isObj(b)) return;
 
-    Object.keys(W.structures).forEach(function (k) {
-      var s = W.structures[k];
-      if (!isObj(s)) return;
-
-      var path = 'window.structures["' + k + '"]';
+      var path = src.basePath + '["' + k + '"]';
       paths[k] = path;
 
+      // Not all versions use the same field names, so we “try a few”
+      var display = b.displayName || b.name || b.title || k;
+
       result.push({
-        kind: 'structure',
+        kind: 'building',
         key: k,
-        display: String(s.displayName || s.name || k),
-        category: String(s.category || ''),
+        display: String(display),
+        category: String(b.category || b.group || ''),
         path: path,
-        count: num(s.count),
-        active: num(s.active),
-        requiresWorker: num(s.requiresWorker),
-        effWorkerNeed: num(s.effWorkerNeed),
-        autoBuildEnabled: !!s.autoBuildEnabled,
-        autoActiveEnabled: !!s.autoActiveEnabled,
-        autoBuildBasis: String(s.autoBuildBasis || ''),
-        autoBuildPercent: num(s.autoBuildPercent),
-        rawObj: s
+        count: num(b.count),
+        active: num(b.active),
+        requiresWorker: num(b.requiresWorker),
+        effWorkerNeed: num(b.effWorkerNeed),
+        autoBuildEnabled: !!b.autoBuildEnabled,
+        autoActiveEnabled: !!b.autoActiveEnabled,
+        autoBuildBasis: String(b.autoBuildBasis || ''),
+        autoBuildPercent: num(b.autoBuildPercent),
+        rawObj: b,
+        sourceLabel: src.label
       });
     });
 
     result.sort(function (a, b) { return a.display.localeCompare(b.display); });
-
-    return { list: result, paths: paths };
+    return { list: result, paths: paths, sourceLabel: src.label };
   }
 
   function collectKnownGlobals() {
     var names = ['resources', 'structures', 'buildings', 'colonies', 'research', 'game', 'settings'];
     var out = [];
+
     names.forEach(function (n) {
       if (typeof W[n] === 'undefined') return;
       var v = W[n];
@@ -186,33 +199,14 @@
       var summary = '';
       if (isObj(v)) summary = 'keys=' + Object.keys(v).length;
       else if (Array.isArray(v)) summary = 'len=' + v.length;
-      out.push({ name: n, type: type, summary: summary });
+      out.push({ kind: 'global', name: n, type: type, summary: summary, rawObj: v });
     });
+
     return out;
   }
 
-  function buildSnapshot() {
-    var res = collectResources();
-    var bld = collectStructures();
-
-    return {
-      t: Date.now(),
-      deep: false,
-      resources: {
-        list: res.list,
-        paths: res.paths
-      },
-      buildings: {
-        list: bld.list,
-        paths: bld.paths,
-        sources: { structures: true }
-      },
-      knownGlobals: collectKnownGlobals()
-    };
-  }
-
   // --------------------------
-  // HUD / Overlay UI
+  // HUD state
   // --------------------------
 
   var HUD = {
@@ -222,9 +216,14 @@
     tab: 'resources',
     autoRefresh: true,
     intervalMs: 1000,
-    selected: null,
+    selectedKey: null,   // string
+    selectedKind: null,  // 'resource' | 'building' | 'global'
     lastData: null
   };
+
+  // --------------------------
+  // Styles + UI creation
+  // --------------------------
 
   function addStyles() {
     if (document.getElementById('ttdiHudStyles')) return;
@@ -338,6 +337,7 @@
 .ttdiSmall { font-size: 11px; opacity: 0.85; }
 .ttdiBad { color: #ffb0b0; }
 .ttdiGood { color: #b6ffb6; }
+
 pre#ttdiPre {
   white-space: pre-wrap;
   word-break: break-word;
@@ -355,99 +355,11 @@ pre#ttdiPre {
     document.head.appendChild(style);
   }
 
-  function makeHud() {
-    if (HUD.root) return;
-
-    addStyles();
-
-    var root = document.createElement('div');
-    root.id = 'ttdiHud';
-    root.innerHTML = `
-      <div id="ttdiHudHeader">
-        <div id="ttdiTitle">TT Data Inspector HUD</div>
-        <div id="ttdiStatus">Starting…</div>
-      </div>
-
-      <div id="ttdiTopBar">
-        <input id="ttdiSearch" placeholder="Search (e.g. colony:energy, electronicsFactory, waterPump, autoBuild…)" />
-        <div id="ttdiButtons">
-          <button class="ttdiBtn" id="ttdiRefresh">Refresh</button>
-          <button class="ttdiBtn" id="ttdiAuto">Auto: ON</button>
-          <button class="ttdiBtn" id="ttdiCopy">Copy JSON</button>
-        </div>
-      </div>
-
-      <div id="ttdiTabs">
-        <div class="ttdiTab ttdiTabActive" data-tab="resources">Resources</div>
-        <div class="ttdiTab" data-tab="structures">Structures</div>
-        <div class="ttdiTab" data-tab="globals">Globals</div>
-      </div>
-
-      <div id="ttdiBody">
-        <div id="ttdiList"></div>
-        <div id="ttdiDetail">
-          <div class="ttdiSmall">Click a row to inspect it. Use Copy buttons to paste paths into your code.</div>
-          <div id="ttdiDetailInner"></div>
-        </div>
-      </div>
-    `;
-
-    document.body.appendChild(root);
-
-    HUD.root = root;
-    HUD.statusEl = root.querySelector('#ttdiStatus');
-    HUD.searchEl = root.querySelector('#ttdiSearch');
-
-    // Buttons
-    root.querySelector('#ttdiRefresh').addEventListener('click', function () {
-      refreshNow(true);
-    });
-
-    root.querySelector('#ttdiAuto').addEventListener('click', function (e) {
-      HUD.autoRefresh = !HUD.autoRefresh;
-      e.target.textContent = 'Auto: ' + (HUD.autoRefresh ? 'ON' : 'OFF');
-      refreshNow(true);
-    });
-
-    root.querySelector('#ttdiCopy').addEventListener('click', function () {
-      var snap = buildSnapshot();
-      var ok = copyText(JSON.stringify(snap, null, 2));
-      setStatus(ok ? 'Copied snapshot JSON.' : 'Copy failed (logged to console).');
-    });
-
-    // Tabs
-    Array.prototype.slice.call(root.querySelectorAll('.ttdiTab')).forEach(function (el) {
-      el.addEventListener('click', function () {
-        HUD.tab = el.getAttribute('data-tab');
-        Array.prototype.slice.call(root.querySelectorAll('.ttdiTab')).forEach(function (t) {
-          t.classList.toggle('ttdiTabActive', t === el);
-        });
-        render();
-      });
-    });
-
-    // Search rerender
-    HUD.searchEl.addEventListener('input', function () {
-      render();
-    });
-
-    // Make draggable
-    makeDraggable(root, root.querySelector('#ttdiHudHeader'));
-
-    setStatus('HUD ready.');
-  }
-
-  function setStatus(msg) {
-    if (!HUD.statusEl) return;
-    HUD.statusEl.textContent = msg;
-  }
-
   function makeDraggable(panel, handle) {
     var dragging = false;
     var startX = 0, startY = 0;
     var startLeft = 0, startTop = 0;
 
-    // Switch from bottom/right anchoring to top/left when dragging starts
     function ensureTopLeft() {
       var rect = panel.getBoundingClientRect();
       panel.style.left = rect.left + 'px';
@@ -480,13 +392,96 @@ pre#ttdiPre {
     });
   }
 
+  function setStatus(msg) {
+    if (HUD.statusEl) HUD.statusEl.textContent = msg;
+  }
+
+  function makeHud() {
+    if (HUD.root) return;
+
+    addStyles();
+
+    var root = document.createElement('div');
+    root.id = 'ttdiHud';
+    root.innerHTML = `
+      <div id="ttdiHudHeader">
+        <div id="ttdiTitle">TT Data Inspector HUD</div>
+        <div id="ttdiStatus">Starting…</div>
+      </div>
+
+      <div id="ttdiTopBar">
+        <input id="ttdiSearch" placeholder="Search (e.g. colony:energy, electronicsFactory, autoBuild…)" />
+        <div id="ttdiButtons">
+          <button class="ttdiBtn" id="ttdiRefresh">Refresh</button>
+          <button class="ttdiBtn" id="ttdiAuto">Auto: ON</button>
+          <button class="ttdiBtn" id="ttdiCopy">Copy JSON</button>
+        </div>
+      </div>
+
+      <div id="ttdiTabs">
+        <div class="ttdiTab ttdiTabActive" data-tab="resources">Resources</div>
+        <div class="ttdiTab" data-tab="buildings">Buildings</div>
+        <div class="ttdiTab" data-tab="globals">Globals</div>
+      </div>
+
+      <div id="ttdiBody">
+        <div id="ttdiList"></div>
+        <div id="ttdiDetail">
+          <div class="ttdiSmall">Click a row to inspect it. Use Copy buttons to paste paths into your code.</div>
+          <div id="ttdiDetailInner"></div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(root);
+
+    HUD.root = root;
+    HUD.statusEl = root.querySelector('#ttdiStatus');
+    HUD.searchEl = root.querySelector('#ttdiSearch');
+
+    root.querySelector('#ttdiRefresh').addEventListener('click', function () {
+      refreshNow(true);
+    });
+
+    root.querySelector('#ttdiAuto').addEventListener('click', function (e) {
+      HUD.autoRefresh = !HUD.autoRefresh;
+      e.target.textContent = 'Auto: ' + (HUD.autoRefresh ? 'ON' : 'OFF');
+      refreshNow(true);
+    });
+
+    root.querySelector('#ttdiCopy').addEventListener('click', function () {
+      var snap = {
+        t: Date.now(),
+        resources: collectResources(),
+        buildings: collectBuildings(),
+        knownGlobals: collectKnownGlobals()
+      };
+      var ok = copyText(JSON.stringify(snap, null, 2));
+      setStatus(ok ? 'Copied snapshot JSON.' : 'Copy failed (logged to console).');
+    });
+
+    Array.prototype.slice.call(root.querySelectorAll('.ttdiTab')).forEach(function (el) {
+      el.addEventListener('click', function () {
+        HUD.tab = el.getAttribute('data-tab');
+        Array.prototype.slice.call(root.querySelectorAll('.ttdiTab')).forEach(function (t) {
+          t.classList.toggle('ttdiTabActive', t === el);
+        });
+        render();
+      });
+    });
+
+    HUD.searchEl.addEventListener('input', function () { render(); });
+
+    makeDraggable(root, root.querySelector('#ttdiHudHeader'));
+  }
+
   // --------------------------
   // Rendering
   // --------------------------
 
-  function matchesSearch(text, q) {
+  function matchesSearch(obj, q) {
     if (!q) return true;
-    return String(text).toLowerCase().indexOf(q) !== -1;
+    return JSON.stringify(obj).toLowerCase().indexOf(q) !== -1;
   }
 
   function render() {
@@ -502,60 +497,60 @@ pre#ttdiPre {
       return;
     }
 
-    // Build lists per tab
     var rows = [];
     if (HUD.tab === 'resources') rows = HUD.lastData.resources.list;
-    else if (HUD.tab === 'structures') rows = HUD.lastData.structures.list;
-    else if (HUD.tab === 'globals') rows = HUD.lastData.globals.list;
+    else if (HUD.tab === 'buildings') rows = HUD.lastData.buildings.list;
+    else rows = HUD.lastData.globals;
 
-    // Apply search
-    if (q) {
-      rows = rows.filter(function (r) {
-        return matchesSearch(JSON.stringify(r), q);
+    if (q) rows = rows.filter(function (r) { return matchesSearch(r, q); });
+
+    // Keep selection stable across refreshes
+    if (HUD.selectedKey && HUD.selectedKind) {
+      var found = rows.find(function (r) {
+        if (HUD.selectedKind === 'resource') return r.kind === 'resource' && r.key === HUD.selectedKey;
+        if (HUD.selectedKind === 'building') return r.kind === 'building' && r.key === HUD.selectedKey;
+        if (HUD.selectedKind === 'global') return r.kind === 'global' && r.name === HUD.selectedKey;
+        return false;
       });
+      if (found) HUD.selected = found;
     }
 
-    // Render table
-    if (HUD.tab === 'resources') {
-      listHost.innerHTML = renderResourcesTable(rows);
-    } else if (HUD.tab === 'structures') {
-      listHost.innerHTML = renderStructuresTable(rows);
-    } else {
-      listHost.innerHTML = renderGlobalsTable(rows);
-    }
+    if (HUD.tab === 'resources') listHost.innerHTML = renderResourcesTable(rows);
+    else if (HUD.tab === 'buildings') listHost.innerHTML = renderBuildingsTable(rows);
+    else listHost.innerHTML = renderGlobalsTable(rows);
 
-    // Wire row click handlers
     Array.prototype.slice.call(listHost.querySelectorAll('[data-row-index]')).forEach(function (tr) {
       tr.addEventListener('click', function () {
         var idx = Number(tr.getAttribute('data-row-index'));
-        HUD.selected = rows[idx] || null;
+        var row = rows[idx] || null;
+        HUD.selected = row;
+
+        if (row) {
+          if (row.kind === 'resource') { HUD.selectedKind = 'resource'; HUD.selectedKey = row.key; }
+          else if (row.kind === 'building') { HUD.selectedKind = 'building'; HUD.selectedKey = row.key; }
+          else if (row.kind === 'global') { HUD.selectedKind = 'global'; HUD.selectedKey = row.name; }
+        }
+
         renderDetail(detailHost);
-        // highlight selected
+
         Array.prototype.slice.call(listHost.querySelectorAll('.ttdiRow')).forEach(function (rEl) {
           rEl.classList.toggle('ttdiRowSelected', rEl === tr);
         });
       });
     });
 
-    // Re-render details (keeps it updated on refresh)
     renderDetail(detailHost);
   }
 
   function renderResourcesTable(rows) {
     var html = '';
     html += '<table id="ttdiTable">';
-    html += '<thead><tr>' +
-      '<th>Key</th>' +
-      '<th>Value</th>' +
-      '<th>Net</th>' +
-      '<th class="ttdiSmall">Path</th>' +
-    '</tr></thead><tbody>';
+    html += '<thead><tr><th>Key</th><th>Value</th><th>Net</th><th class="ttdiSmall">Path</th></tr></thead><tbody>';
 
     rows.forEach(function (r, i) {
-      var bad = (r.key === 'colony:workers' && r.value < 0);
       var netClass = (r.net >= 0) ? 'ttdiGood' : 'ttdiBad';
       html += '<tr class="ttdiRow" data-row-index="' + i + '">' +
-        '<td class="' + (bad ? 'ttdiBad' : '') + '">' + escapeHtml(r.key) + '</td>' +
+        '<td>' + escapeHtml(r.key) + '</td>' +
         '<td class="ttdiMono">' + escapeHtml(fmt(r.value)) + '</td>' +
         '<td class="ttdiMono ' + netClass + '">' + escapeHtml(fmt(r.net)) + '</td>' +
         '<td class="ttdiMono ttdiSmall">' + escapeHtml(r.path) + '</td>' +
@@ -566,28 +561,20 @@ pre#ttdiPre {
     return html;
   }
 
-  function renderStructuresTable(rows) {
+  function renderBuildingsTable(rows) {
     var html = '';
     html += '<table id="ttdiTable">';
-    html += '<thead><tr>' +
-      '<th>Name</th>' +
-      '<th>Count / Active</th>' +
-      '<th>Auto</th>' +
-      '<th class="ttdiSmall">Path</th>' +
-    '</tr></thead><tbody>';
+    html += '<thead><tr><th>Name</th><th>Count / Active</th><th class="ttdiSmall">Source</th><th class="ttdiSmall">Path</th></tr></thead><tbody>';
 
-    rows.forEach(function (s, i) {
-      var auto = (s.autoBuildEnabled ? 'Build ' : '') + (s.autoActiveEnabled ? 'Active' : '');
-      if (!auto) auto = '—';
-
+    rows.forEach(function (b, i) {
       html += '<tr class="ttdiRow" data-row-index="' + i + '">' +
         '<td>' +
-          '<div>' + escapeHtml(s.display) + '</div>' +
-          '<div class="ttdiSmall ttdiMono">' + escapeHtml(s.key) + '</div>' +
+          '<div>' + escapeHtml(b.display) + '</div>' +
+          '<div class="ttdiSmall ttdiMono">' + escapeHtml(b.key) + '</div>' +
         '</td>' +
-        '<td class="ttdiMono">' + escapeHtml(fmt(s.count)) + ' / ' + escapeHtml(fmt(s.active)) + '</td>' +
-        '<td class="ttdiMono">' + escapeHtml(auto) + '</td>' +
-        '<td class="ttdiMono ttdiSmall">' + escapeHtml(s.path) + '</td>' +
+        '<td class="ttdiMono">' + escapeHtml(fmt(b.count)) + ' / ' + escapeHtml(fmt(b.active)) + '</td>' +
+        '<td class="ttdiMono ttdiSmall">' + escapeHtml(b.sourceLabel || '') + '</td>' +
+        '<td class="ttdiMono ttdiSmall">' + escapeHtml(b.path) + '</td>' +
       '</tr>';
     });
 
@@ -598,11 +585,7 @@ pre#ttdiPre {
   function renderGlobalsTable(rows) {
     var html = '';
     html += '<table id="ttdiTable">';
-    html += '<thead><tr>' +
-      '<th>Name</th>' +
-      '<th>Type</th>' +
-      '<th>Summary</th>' +
-    '</tr></thead><tbody>';
+    html += '<thead><tr><th>Name</th><th>Type</th><th>Summary</th></tr></thead><tbody>';
 
     rows.forEach(function (g, i) {
       html += '<tr class="ttdiRow" data-row-index="' + i + '">' +
@@ -627,40 +610,21 @@ pre#ttdiPre {
 
     var title = '';
     var path = '';
-    var body = '';
+    var raw = sel.rawObj || sel;
+    var readSnippet = '';
 
     if (sel.kind === 'resource') {
       title = sel.key;
       path = sel.path;
-
-      body += '<div><b>Current</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.value)) + '</span></div>';
-      body += '<div><b>Cap</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.cap)) + '</span></div>';
-      body += '<div><b>Prod</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.prod)) + '</span></div>';
-      body += '<div><b>Cons</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.cons)) + '</span></div>';
-      body += '<div><b>Net</b>: <span class="ttdiMono ' + (sel.net >= 0 ? 'ttdiGood' : 'ttdiBad') + '">' + escapeHtml(fmt(sel.net)) + '</span></div>';
-      body += '<div><b>Unlocked</b>: <span class="ttdiMono">' + escapeHtml(String(sel.unlocked)) + '</span></div>';
-      body += '<div class="ttdiSmall" style="margin-top:6px;">Helpful code:</div>';
-      body += '<div class="ttdiMono ttdiSmall">Read value → <span class="ttdiMono">(' + escapeHtml(path) + '.value)</span></div>';
-      body += '<div class="ttdiMono ttdiSmall">Read net → <span class="ttdiMono">(' + escapeHtml(path) + '.productionRate - ' + escapeHtml(path) + '.consumptionRate)</span></div>';
-
-    } else if (sel.kind === 'structure') {
+      readSnippet = path + '.value';
+    } else if (sel.kind === 'building') {
       title = sel.display + ' (' + sel.key + ')';
       path = sel.path;
-
-      body += '<div><b>Count</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.count)) + '</span></div>';
-      body += '<div><b>Active</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.active)) + '</span></div>';
-      body += '<div><b>requiresWorker</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.requiresWorker)) + '</span></div>';
-      body += '<div><b>effWorkerNeed</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.effWorkerNeed)) + '</span></div>';
-      body += '<div><b>autoBuildEnabled</b>: <span class="ttdiMono">' + escapeHtml(String(sel.autoBuildEnabled)) + '</span></div>';
-      body += '<div><b>autoActiveEnabled</b>: <span class="ttdiMono">' + escapeHtml(String(sel.autoActiveEnabled)) + '</span></div>';
-      body += '<div><b>autoBuildBasis</b>: <span class="ttdiMono">' + escapeHtml(sel.autoBuildBasis) + '</span></div>';
-      body += '<div><b>autoBuildPercent</b>: <span class="ttdiMono">' + escapeHtml(fmt(sel.autoBuildPercent)) + '</span></div>';
-      body += '<div class="ttdiSmall" style="margin-top:6px;">Helpful code:</div>';
-      body += '<div class="ttdiMono ttdiSmall">Read count → <span class="ttdiMono">(' + escapeHtml(path) + '.count)</span></div>';
-      body += '<div class="ttdiMono ttdiSmall">Set autobuild → <span class="ttdiMono">(' + escapeHtml(path) + '.autoBuildPercent = 1)</span></div>';
+      readSnippet = path + '.count';
     } else {
       title = sel.name || 'Global';
       path = 'window.' + (sel.name || '');
+      readSnippet = path;
     }
 
     host.innerHTML =
@@ -669,79 +633,49 @@ pre#ttdiPre {
       '<div class="ttdiMono" style="margin-bottom:8px;">' + escapeHtml(path) + '</div>' +
       '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
         '<button class="ttdiBtn" id="ttdiCopyPath">Copy Path</button>' +
-        '<button class="ttdiBtn" id="ttdiCopyValue">Copy “Read Value”</button>' +
+        '<button class="ttdiBtn" id="ttdiCopyRead">Copy “Read Value”</button>' +
         '<button class="ttdiBtn" id="ttdiCopyObj">Copy Object JSON</button>' +
       '</div>' +
-      '<div style="margin-top:10px;">' + body + '</div>' +
-      '<div class="ttdiSmall" style="margin-top:10px;">Raw object (for variable names / keys):</div>' +
-      '<pre id="ttdiPre">' + escapeHtml(safeStringify(sel.rawObj || sel, 25000)) + '</pre>';
+      '<div class="ttdiSmall" style="margin-top:10px;">Raw object (variable names / keys):</div>' +
+      '<pre id="ttdiPre">' + escapeHtml(safeStringify(raw, 25000)) + '</pre>';
 
-    // Wire detail buttons
     var btnPath = HUD.root.querySelector('#ttdiCopyPath');
-    var btnValue = HUD.root.querySelector('#ttdiCopyValue');
+    var btnRead = HUD.root.querySelector('#ttdiCopyRead');
     var btnObj = HUD.root.querySelector('#ttdiCopyObj');
 
-    if (btnPath) btnPath.onclick = function () {
-      copyText(path);
-      setStatus('Copied path.');
-    };
-
-    if (btnValue) btnValue.onclick = function () {
-      var snippet = '';
-      if (sel.kind === 'resource') snippet = path + '.value';
-      else if (sel.kind === 'structure') snippet = path + '.count';
-      else snippet = path;
-      copyText(snippet);
-      setStatus('Copied read snippet.');
-    };
-
-    if (btnObj) btnObj.onclick = function () {
-      var txt = safeStringify(sel.rawObj || sel, 50000);
-      copyText(txt);
-      setStatus('Copied object JSON.');
-    };
-  }
-
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+    if (btnPath) btnPath.onclick = function () { copyText(path); setStatus('Copied path.'); };
+    if (btnRead) btnRead.onclick = function () { copyText(readSnippet); setStatus('Copied read snippet.'); };
+    if (btnObj) btnObj.onclick = function () { copyText(safeStringify(raw, 50000)); setStatus('Copied object JSON.'); };
   }
 
   // --------------------------
-  // Data refresh loop
+  // Refresh loop
   // --------------------------
 
   function refreshNow(forceRender) {
     if (!HUD.root) return;
 
-    if (!gameReady()) {
-      setStatus('Waiting for game objects (resources/structures)…');
-      HUD.lastData = null;
-      if (forceRender) render();
-      return;
-    }
-
-    // Gather the data we show in the HUD
-    var res = collectResources();
-    var st = collectStructures();
-    var gl = collectKnownGlobals();
+    var hasResources = isObj(W.resources);
+    var b = collectBuildings();
+    var hasBuildings = b.list.length > 0;
 
     HUD.lastData = {
-      resources: res,
-      structures: st,
-      globals: gl
+      resources: collectResources(),
+      buildings: b,
+      globals: collectKnownGlobals()
     };
 
-    setStatus('Live. Resources: ' + res.list.length + ' | Structures: ' + st.list.length);
+    var status = '';
+    status += hasResources ? 'Resources OK' : 'No resources yet';
+    status += ' | ';
+    status += hasBuildings ? ('Buildings OK (' + b.sourceLabel + ')') : 'No buildings yet';
+    setStatus(status);
+
     if (forceRender) render();
   }
 
   function loop() {
     if (!HUD.root) return;
-
     if (HUD.autoRefresh) refreshNow(true);
     setTimeout(loop, HUD.intervalMs);
   }
@@ -750,16 +684,13 @@ pre#ttdiPre {
   // Boot
   // --------------------------
 
-  function initWhenBodyReady() {
-    if (!document.body) {
-      setTimeout(initWhenBodyReady, 200);
-      return;
-    }
+  function initWhenReady() {
+    if (!document.body) return setTimeout(initWhenReady, 200);
     makeHud();
     refreshNow(true);
     loop();
   }
 
-  initWhenBodyReady();
+  initWhenReady();
 
 })();
