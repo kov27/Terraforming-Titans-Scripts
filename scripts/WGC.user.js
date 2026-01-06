@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.2.1
+// @version      1.2.3
 // @description  Async/non-freezing WGC optimiser + actual artifacts/hr (unit-correct) + compact export log.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -447,37 +447,43 @@
       wgc.__ttSpendPatched = true;
 
       // Wrap purchaseUpgrade to measure actual pool delta (value units) + infer unitScale.
-      if (typeof wgc.purchaseUpgrade === 'function') {
-        const orig = wgc.purchaseUpgrade.bind(wgc);
-        wgc.purchaseUpgrade = function(upKey) {
-          const vBefore = getArtifactValueUnits();
-          let rawCost = 0;
-          if (upKey === 'wgtEquipment' && typeof wgc.getUpgradeCost === 'function') {
-            try { rawCost = wgc.getUpgradeCost('wgtEquipment') || 0; } catch (_) { rawCost = 0; }
-          }
+if (typeof wgc.purchaseUpgrade === 'function') {
+  const orig = wgc.purchaseUpgrade.bind(wgc);
 
-          const ok = orig(upKey);
+  wgc.purchaseUpgrade = function(upKey) {
+    const vBefore = getArtifactValueUnits();
 
-          if (ok && upKey === 'wgtEquipment') {
-            const vAfter = getArtifactValueUnits();
-            const deltaUnits = (vBefore != null && vAfter != null) ? Math.max(0, vBefore - vAfter) : 0;
+    let rawCost = 0;
+    if (typeof wgc.getUpgradeCost === 'function') {
+      try { rawCost = wgc.getUpgradeCost(upKey) || 0; } catch (_) { rawCost = 0; }
+    }
 
-            if (rawCost > 0) artTrack.spentArtifacts += rawCost;
-            if (deltaUnits > 0) artTrack.spentValueUnits += deltaUnits;
+    const ok = orig(upKey);
 
-            updateUnitScaleFromPurchase(rawCost, deltaUnits);
+    if (ok) {
+      const vAfter = getArtifactValueUnits();
+      const deltaUnits = (vBefore != null && vAfter != null) ? Math.max(0, vBefore - vAfter) : 0;
 
-            // Log: 'S' = spend; a=rawCost, b=deltaUnits*1e6 rounded, c=scale*1000 rounded
-            logEvt('S',
-              Math.round(rawCost),
-              Math.round(deltaUnits * 1e6),
-              Math.round(artTrack.unitScale * 1000),
-              0
-            );
-          }
-          return ok;
-        };
+      if (rawCost > 0) artTrack.spentArtifacts += rawCost;
+      if (deltaUnits > 0) artTrack.spentValueUnits += deltaUnits;
+
+      if (rawCost > 0 && deltaUnits > 0) updateUnitScaleFromPurchase(rawCost, deltaUnits);
+
+      // 'S' spend event (rawCost, deltaVU*1e6, unitScale*1000, 0)
+      if (rawCost > 0 || deltaUnits > 0) {
+        logEvt('S',
+          Math.round(rawCost),
+          Math.round(deltaUnits * 1e6),
+          Math.round(artTrack.unitScale * 1000),
+          0
+        );
       }
+    }
+
+    return ok;
+  };
+}
+
     }
 
     /********************************************************************
@@ -1060,30 +1066,98 @@
     /********************************************************************
      * Spending
      ********************************************************************/
-    function tryAutoBuyWgtEquipment() {
-      const wgc = getWGC();
-      if (!wgc || !CFG.autoBuyWgtEquipment) return;
+function tryAutoBuyWgtEquipment() {
+  const wgc = getWGC();
+  if (!wgc || !CFG.autoBuyWgtEquipment) return;
 
-      const res = getResources();
-      const art = res?.special?.alienArtifact;
-      if (!art || typeof art.value !== 'number') return;
+  const res = getResources();
+  const art = res?.special?.alienArtifact;
+  if (!art || typeof art.value !== 'number') return;
 
-      const up = wgc.rdUpgrades?.wgtEquipment;
-      if (!up) return;
+  const ups = wgc.rdUpgrades || {};
+  const reserveVU = (CFG.alienArtifactReserve || 0) / Math.max(1e-9, artTrack.unitScale);
 
-      // Keep this conservative: at most a few purchases per cycle to avoid bursty spend.
-      let buys = 0;
-      while (up.purchases < (up.max || 900) && buys < 3) {
-        const cost = (typeof wgc.getUpgradeCost === 'function') ? (wgc.getUpgradeCost('wgtEquipment') || 0) : (up.purchases + 1);
-        // Compare in "real artifacts": reserve applies in real units.
-        const reserveValueUnits = CFG.alienArtifactReserve / Math.max(1e-9, artTrack.unitScale);
-        if ((art.value - (cost / Math.max(1e-9, artTrack.unitScale))) < reserveValueUnits) break;
+  const isMaxed = (k) => {
+    const up = ups[k];
+    if (!up) return true;
+    const mx = (typeof up.max === 'number') ? up.max : null;
+    return (mx != null) ? ((up.purchases || 0) >= mx) : false;
+  };
 
-        const ok = wgc.purchaseUpgrade && wgc.purchaseUpgrade('wgtEquipment');
-        if (!ok) break;
-        buys++;
+  const isAvailable = (k) => {
+    const up = ups[k];
+    if (!up) return false;
+
+    // Some upgrades use an "enabled" flag in the game's data
+    if (up.enabled === false) return false;
+
+    // Special gate: superalloyEfficiency only when research is complete AND upgrade is enabled
+    if (k === 'superalloyEfficiency') {
+      const rm = getLex('researchManager') || globalThis.researchManager;
+      if (!rm?.researchComplete?.superalloys) return false;
+      if (!up.enabled) return false;
+    }
+    return true;
+  };
+
+  const getCost = (k) => {
+    try {
+      if (typeof wgc.getUpgradeCost === 'function') return (wgc.getUpgradeCost(k) || 0);
+    } catch (_) {}
+    // Fallback (should rarely be used)
+    const up = ups[k];
+    return up ? ((up.purchases || 0) + 1) : 0;
+  };
+
+  const pickCheapestOtherUpgrade = () => {
+    let bestKey = null;
+    let bestCost = Infinity;
+
+    for (const k of Object.keys(ups)) {
+      if (k === 'wgtEquipment') continue;
+      if (!isAvailable(k)) continue;
+      if (isMaxed(k)) continue;
+
+      const c = getCost(k);
+      if (!(c > 0)) continue;
+
+      if (c < bestCost) {
+        bestCost = c;
+        bestKey = k;
       }
     }
+    return bestKey;
+  };
+
+  // Conservative limit per cycle to avoid burst spend + UI hitching
+  let buys = 0;
+  while (buys < 3) {
+    let key = null;
+
+    if (ups.wgtEquipment && !isMaxed('wgtEquipment')) {
+      key = 'wgtEquipment';
+    } else {
+      key = pickCheapestOtherUpgrade();
+    }
+
+    if (!key) break;
+
+    const cost = getCost(key);
+    if (!(cost > 0)) break;
+
+    // Reserve check only if unitScale is known; otherwise let game reject unaffordable purchases.
+    if (artTrack.unitScaleConf > 0) {
+      const costVU = cost / Math.max(1e-9, artTrack.unitScale);
+      if ((art.value - costVU) < reserveVU) break;
+    }
+
+    const ok = wgc.purchaseUpgrade && wgc.purchaseUpgrade(key);
+    if (!ok) break;
+
+    buys++;
+  }
+}
+
 
     function tryAutoUpgradeFacility() {
       const wgc = getWGC();
