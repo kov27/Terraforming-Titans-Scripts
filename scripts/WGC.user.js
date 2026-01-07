@@ -1084,21 +1084,17 @@ function tryAutoBuyWgtEquipment() {
     return (mx != null) ? ((up.purchases || 0) >= mx) : false;
   };
 
-  const isAvailable = (k) => {
-    const up = ups[k];
-    if (!up) return false;
+const isAvailable = (k) => {
+  const up = ups[k];
+  if (!up) return false;
 
-    // Some upgrades use an "enabled" flag in the game's data
-    if (up.enabled === false) return false;
+  // Only respect the upgrade's own enabled flag (if present).
+  // Do NOT hard-gate on research flags; the game will refuse purchase if locked.
+  if (up.enabled === false) return false;
 
-    // Special gate: superalloyEfficiency only when research is complete AND upgrade is enabled
-    if (k === 'superalloyEfficiency') {
-      const rm = getLex('researchManager') || globalThis.researchManager;
-      if (!rm?.researchComplete?.superalloys) return false;
-      if (!up.enabled) return false;
-    }
-    return true;
-  };
+  return true;
+};
+
 
   const getCost = (k) => {
     try {
