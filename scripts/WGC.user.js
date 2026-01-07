@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.2.4
+// @version      1.2.5
 // @description  Async/non-freezing WGC optimiser + actual artifacts/hr (unit-correct) + compact export log.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -1075,84 +1075,79 @@ function tryAutoBuyWgtEquipment() {
   if (!art || typeof art.value !== 'number') return;
 
   const ups = wgc.rdUpgrades || {};
-  const reserveVU = (CFG.alienArtifactReserve || 0) / Math.max(1e-9, artTrack.unitScale);
 
-  const isMaxed = (k) => {
+  const unitScale = Math.max(1e-9, artTrack.unitScale);
+  const reserveReal = CFG.alienArtifactReserve || 0;
+  const reserveVU = reserveReal / unitScale;
+
+  const hasRoom = (k) => {
     const up = ups[k];
-    if (!up) return true;
+    if (!up) return false;
     const mx = (typeof up.max === 'number') ? up.max : null;
-    return (mx != null) ? ((up.purchases || 0) >= mx) : false;
+    return (mx == null) ? true : ((up.purchases || 0) < mx);
   };
-
-const isAvailable = (k) => {
-  const up = ups[k];
-  if (!up) return false;
-
-  // Only respect the upgrade's own enabled flag (if present).
-  // Do NOT hard-gate on research flags; the game will refuse purchase if locked.
-  if (up.enabled === false) return false;
-
-  return true;
-};
-
 
   const getCost = (k) => {
     try {
-      if (typeof wgc.getUpgradeCost === 'function') return (wgc.getUpgradeCost(k) || 0);
-    } catch (_) {}
-    // Fallback (should rarely be used)
-    const up = ups[k];
-    return up ? ((up.purchases || 0) + 1) : 0;
-  };
-
-  const pickCheapestOtherUpgrade = () => {
-    let bestKey = null;
-    let bestCost = Infinity;
-
-    for (const k of Object.keys(ups)) {
-      if (k === 'wgtEquipment') continue;
-      if (!isAvailable(k)) continue;
-      if (isMaxed(k)) continue;
-
-      const c = getCost(k);
-      if (!(c > 0)) continue;
-
-      if (c < bestCost) {
-        bestCost = c;
-        bestKey = k;
+      if (typeof wgc.getUpgradeCost === 'function') {
+        const c = wgc.getUpgradeCost(k);
+        return Number.isFinite(c) ? c : 0;
       }
-    }
-    return bestKey;
+    } catch (_) {}
+    return 0;
   };
 
-  // Conservative limit per cycle to avoid burst spend + UI hitching
+  // Reserve check: only enforce reserve once unitScale is known.
+  const canSpend = (cost) => {
+    if (!(cost > 0)) return false;
+    if (reserveReal <= 0) return true;
+    if (artTrack.unitScaleConf <= 0) return false;
+    const costVU = cost / unitScale;
+    return (art.value - costVU) >= reserveVU;
+  };
+
+  // These are the actual R&D upgrade keys in the game.
+  const OTHER_KEYS = [
+    'componentsEfficiency',
+    'electronicsEfficiency',
+    'superconductorEfficiency',
+    'androidsEfficiency',
+    'superalloyEfficiency',
+    'foodProduction',
+  ];
+
+  // Don’t hard-gate on up.enabled — the game gates via researchManager inside purchaseUpgrade().
+  // Also: if a purchase fails, try the next cheapest instead of stopping the whole loop.
+  const failed = new Set();
+
   let buys = 0;
   while (buys < 3) {
-    let key = null;
+    const keys = hasRoom('wgtEquipment')
+      ? ['wgtEquipment']
+      : OTHER_KEYS.filter(k => k in ups);
 
-    if (ups.wgtEquipment && !isMaxed('wgtEquipment')) {
-      key = 'wgtEquipment';
-    } else {
-      key = pickCheapestOtherUpgrade();
+    const options = keys
+      .filter(k => !failed.has(k) && hasRoom(k))
+      .map(k => ({ k, cost: getCost(k) }))
+      .filter(x => x.cost > 0 && canSpend(x.cost))
+      .sort((a, b) => a.cost - b.cost);
+
+    if (!options.length) break;
+
+    let bought = false;
+    for (const { k, cost } of options) {
+      if (!canSpend(cost)) { failed.add(k); continue; }
+
+      const ok = (typeof wgc.purchaseUpgrade === 'function') ? wgc.purchaseUpgrade(k) : false;
+      if (ok) { buys++; bought = true; break; }
+
+      failed.add(k);
     }
 
-    if (!key) break;
-
-    const cost = getCost(key);
-    if (!(cost > 0)) break;
-
-    // Reserve check only if unitScale is known; otherwise let game reject unaffordable purchases.
-    if (artTrack.unitScaleConf > 0) {
-      const costVU = cost / Math.max(1e-9, artTrack.unitScale);
-      if ((art.value - costVU) < reserveVU) break;
-    }
-
-    const ok = wgc.purchaseUpgrade && wgc.purchaseUpgrade(key);
-    if (!ok) break;
-
-    buys++;
+    if (!bought) break;
   }
 }
+
 
 
     function tryAutoUpgradeFacility() {
