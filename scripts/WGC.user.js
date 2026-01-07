@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.2.3
+// @version      1.2.4
 // @description  Async/non-freezing WGC optimiser + actual artifacts/hr (unit-correct) + compact export log.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
