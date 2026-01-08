@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TT - WGC Optimiser & Manager
 // @namespace    tt-wgc-optimizer
-// @version      1.2.5
+// @version      1.2.6
 // @description  Async/non-freezing WGC optimiser + actual artifacts/hr (unit-correct) + compact export log.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @match        https://html.itch.zone/html/*/index.html
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
-  v1.2.1 fixes based on your export log:
+  v1.2.6 fixes based on your export log:
 
   1) Actual artifacts/hr unit mismatch FIXED:
      Your log shows AA value ~18.3 while a single spend was ~654. That implies the internal AA pool is stored in "k-units"
@@ -39,8 +39,8 @@
 
 (() => {
   'use strict';
-  if (window.__ttWgcOptimiserInjectedV121__) return;
-  window.__ttWgcOptimiserInjectedV121__ = true;
+  if (window.__ttWgcOptimiserInjectedV126__) return;
+  window.__ttWgcOptimiserInjectedV126__ = true;
 
   function injectedMain() {
     'use strict';
@@ -51,6 +51,16 @@
      ********************************************************************/
     const CFG = {
       enabled: true,
+triageMode: true,
+triageAssumedOpMinutes: 10,      // tweak if your ops are typically longer
+triageMinBenefitMinutes: 0.5,    // only do it if it saves at least this much time
+triageMinHpRatioToSend: 0.25,    // never send a team if the worst member is below this ratio
+triageDifficulty: 0,             // keep it zero: avoids damage entirely (scaledDifficulty = 0)
+triageHazardStance: 'Neutral',
+triageArtifactStance: 'Neutral',
+triageOnlyWhenSingleInjured: true,
+
+      rdMaxOtherUpgrades: Infinity,  // Infinity = unchanged behavior; set e.g. 50 to cap other R&D upgrades
 
       // Cadence
       optimiseEveryMs: 60_000,     // schedule a cycle each minute
@@ -114,11 +124,23 @@
      * Lexical access helpers (game uses lexical globals)
      ********************************************************************/
     function getLex(name) {
-      try { // eslint-disable-next-line no-new-func
-        return Function(`return (typeof ${name} !== "undefined") ? ${name} : undefined;`)();
-      } catch (_) { return undefined; }
-    }
-    function getWGC() { const wgc = getLex('warpGateCommand'); return (wgc && typeof wgc === 'object') ? wgc : null; }
+  // Prefer globals first (avoids needing Function when not necessary)
+  try {
+    if (name in globalThis) return globalThis[name];
+  } catch (_) {}
+
+  try { // eslint-disable-next-line no-new-func
+    return Function(`return (typeof ${name} !== "undefined") ? ${name} : undefined;`)();
+  } catch (_) {
+    return undefined;
+  }
+}
+
+// IMPORTANT: add globalThis fallback here
+function getWGC() {
+  const wgc = getLex('warpGateCommand') || globalThis.warpGateCommand;
+  return (wgc && typeof wgc === 'object') ? wgc : null;
+}
     function getResources() { return getLex('resources') || globalThis.resources; }
     function getStories() { return getLex('WGC_OPERATION_STORIES') || globalThis.WGC_OPERATION_STORIES || null; }
 
@@ -240,6 +262,13 @@
       if (needed <= 1) return 1;
       if (needed > 20) return 0;
       return (21 - needed) / 20;
+    }
+    function prob1d20SuccessWithCrit(dcMinusSkill) {
+      const needed = Math.ceil(dcMinusSkill);
+      if (needed <= 1) return 1;
+      if (needed <= 20) return (21 - needed) / 20;
+      // Natural 20 always succeeds in the game
+      return 1 / 20;
     }
     function prob4d20Success(dcMinusSkill) {
       const needed = Math.ceil(dcMinusSkill);
@@ -546,16 +575,16 @@ if (typeof wgc.purchaseUpgrade === 'function') {
           const st = baseSkill + leaderBonus;
 
           const dcLocal = Math.max(0, (10 + 1.5 * difficultyForCheck) * stanceMod);
-          const p0 = prob1d20Success(dcLocal - st);
+          const p0 = prob1d20SuccessWithCrit(dcLocal - st);
 
           let pInitSuccess = p0;
           if (hasFailSafe) pInitSuccess = 1;
           else if (hasReroll) pInitSuccess = 1 - Math.pow(1 - p0, 2);
           const pInitFail = 1 - pInitSuccess;
 
-          const needed = Math.ceil(dcLocal - st);
-          const twentyIsInitSuccess = needed <= 20;
-          const pFinalRoll20 = (twentyIsInitSuccess ? (1 / 20) : 0) + ((1 - p0) * (hasReroll ? (1 / 20) : 0));
+          // Natural 20 always succeeds, regardless of DC.
+          // If we reroll on failure, we can also hit a 20 on the reroll.
+          const pFinalRoll20 = (1 / 20) + (hasReroll ? ((1 - p0) * (1 / 20)) : 0);
 
           entries.push({ m, pSelect, p0, pInitSuccess, pInitFail, pFinalRoll20, dcLocal, skillTotal: st });
         }
@@ -595,9 +624,7 @@ if (typeof wgc.purchaseUpgrade === 'function') {
         let pInitSuccessNonCritW = 0;
         for (const e of individualSelection.entries) {
           pFinal20 += e.pSelect * e.pFinalRoll20;
-          const needed = Math.ceil(e.dcLocal - e.skillTotal);
-          const twentyIsInitSuccess = needed <= 20;
-          const pInitSuccessNonCrit = e.pInitSuccess - (twentyIsInitSuccess ? e.pFinalRoll20 : 0);
+          const pInitSuccessNonCrit = Math.max(0, e.pInitSuccess - e.pFinalRoll20);
           pInitSuccessNonCritW += e.pSelect * pInitSuccessNonCrit;
         }
         expectedArtifacts = reward * (pFinal20 + pInitSuccessNonCritW * chance);
@@ -674,17 +701,25 @@ if (typeof wgc.purchaseUpgrade === 'function') {
     /********************************************************************
      * Story evaluation
      ********************************************************************/
-    function buildStoryEvents(story, hazardStance) {
-      const raw = story && Array.isArray(story.events) ? story.events.slice(0, 10) : [];
-      const out = [];
-      for (const se of raw) {
-        const template = baseEventTemplatesByName[se.name] || null;
-        const ev = template ? { ...template } : { name: se.name, type: se.type, skill: se.skill, specialty: se.specialty, escalate: !!se.escalate };
-        ev._stanceMod = stanceDifficultyModifier(ev, hazardStance);
-        out.push(ev);
-      }
-      return out;
-    }
+function buildStoryEvents(story, hazardStance) {
+  const raw = story && Array.isArray(story.events) ? story.events.slice(0, 10) : [];
+  const out = [];
+  for (const se of raw) {
+    const template = baseEventTemplatesByName[se.name] || null;
+    const ev = template
+      ? { ...template }
+      : { name: se.name, type: se.type, skill: se.skill, specialty: se.specialty, escalate: !!se.escalate };
+
+    // Overlay story-specific fields if present
+    if (se && 'escalate' in se) ev.escalate = !!se.escalate;
+    if (se && 'artifactMultiplier' in se && Number.isFinite(se.artifactMultiplier)) ev.artifactMultiplier = se.artifactMultiplier;
+
+    ev._stanceMod = stanceDifficultyModifier(ev, hazardStance);
+    out.push(ev);
+  }
+  return out;
+}
+
 
     const storyListsCache = new Map(); // hazardStance -> lists
     function getStoryEventLists(hazardStance) {
@@ -1076,6 +1111,15 @@ function tryAutoBuyWgtEquipment() {
 
   const ups = wgc.rdUpgrades || {};
 
+  const otherCap = Number.isFinite(CFG.rdMaxOtherUpgrades) ? CFG.rdMaxOtherUpgrades : Infinity;
+
+  const effectiveMax = (k) => {
+    const up = ups[k];
+    const mx = (typeof up?.max === 'number') ? up.max : Infinity;
+    if (k === 'wgtEquipment') return mx; // always allow full max for WGT equipment
+    return Math.min(mx, otherCap);
+  };
+  
   const unitScale = Math.max(1e-9, artTrack.unitScale);
   const reserveReal = CFG.alienArtifactReserve || 0;
   const reserveVU = reserveReal / unitScale;
@@ -1083,8 +1127,7 @@ function tryAutoBuyWgtEquipment() {
   const hasRoom = (k) => {
     const up = ups[k];
     if (!up) return false;
-    const mx = (typeof up.max === 'number') ? up.max : null;
-    return (mx == null) ? true : ((up.purchases || 0) < mx);
+    return (up.purchases || 0) < effectiveMax(k);
   };
 
   const getCost = (k) => {
@@ -1098,13 +1141,14 @@ function tryAutoBuyWgtEquipment() {
   };
 
   // Reserve check: only enforce reserve once unitScale is known.
-  const canSpend = (cost) => {
-    if (!(cost > 0)) return false;
-    if (reserveReal <= 0) return true;
-    if (artTrack.unitScaleConf <= 0) return false;
-    const costVU = cost / unitScale;
-    return (art.value - costVU) >= reserveVU;
-  };
+const canSpend = (cost) => {
+  if (!(cost > 0)) return false;
+  if (reserveReal <= 0) return true;
+  if (artTrack.unitScaleConf <= 0) return true; // don't deadlock; learn scale first
+  const costVU = cost / unitScale;
+  return (art.value - costVU) >= reserveVU;
+};
+
 
   // These are the actual R&D upgrade keys in the game.
   const OTHER_KEYS = [
@@ -1122,9 +1166,12 @@ function tryAutoBuyWgtEquipment() {
 
   let buys = 0;
   while (buys < 3) {
-    const keys = hasRoom('wgtEquipment')
-      ? ['wgtEquipment']
-      : OTHER_KEYS.filter(k => k in ups);
+    const wgtUp = ups.wgtEquipment;
+    const wgtNotMaxed = !!wgtUp && (wgtUp.purchases || 0) < effectiveMax('wgtEquipment');
+    // Force WGT equipment first until maxed
+    const keys = wgtNotMaxed
+        ? ['wgtEquipment']
+      : OTHER_KEYS.filter(k => (k in ups));
 
     const options = keys
       .filter(k => !failed.has(k) && hasRoom(k))
@@ -1249,6 +1296,82 @@ function tryAutoBuyWgtEquipment() {
       return minR;
     }
     function teamReady(team) { return teamHpRatio(team) >= CFG.minDeployHpRatio; }
+function infirmaryPercentHeal(inf) {
+  if (inf >= 100) return 0.2;
+  if (inf >= 50) return 0.15;
+  if (inf >= 25) return 0.1;
+  if (inf >= 10) return 0.05;
+  return 0;
+}
+
+// Decide if triage is worthwhile vs just resting.
+// Returns null if not worth it; otherwise returns { benefitSec, idleSec, triageSec }.
+function triageDecision(team, facilities) {
+  if (!CFG.triageMode) return null;
+
+  const members = team.filter(Boolean);
+  if (!members.length) return null;
+
+  const worstRatio = teamHpRatio(team);
+  if (worstRatio < CFG.triageMinHpRatioToSend) return null;
+
+  const targetR = CFG.minDeployHpRatio;
+  const deficits = members.map(m => {
+    const maxHp = (m.maxHealth > 0) ? m.maxHealth : 0;
+    const need = targetR * maxHp - (m.health || 0);
+    return Math.max(0, need);
+  });
+
+  const injuredCount = deficits.filter(d => d > 0).length;
+  if (injuredCount === 0) return null;
+  if (CFG.triageOnlyWhenSingleInjured && injuredCount !== 1) return null;
+
+  const inf = facilities?.infirmary || 0;
+  const healMult = 1 + inf * 0.01;
+
+  const triageDurSec = Math.max(1, CFG.triageAssumedOpMinutes) * 60;
+  const activeHeal = (triageDurSec / 60) * 1 * healMult;         // matches your existing model
+  const pct = infirmaryPercentHeal(inf);
+  const idleHealPerSec = (50 / 60) * healMult;
+
+  if (!(idleHealPerSec > 0)) return null;
+
+  const idleSec = Math.max(...deficits) / idleHealPerSec;
+
+  const remaining = members.map((m, i) => {
+    const maxHp = (m.maxHealth > 0) ? m.maxHealth : 0;
+    const triageHeal = activeHeal + pct * maxHp;
+    return Math.max(0, deficits[i] - triageHeal);
+  });
+
+  const triageSec = triageDurSec + (Math.max(...remaining) / idleHealPerSec);
+  const benefitSec = idleSec - triageSec;
+
+  if (benefitSec >= (CFG.triageMinBenefitMinutes * 60)) return { benefitSec, idleSec, triageSec };
+  return null;
+}
+
+function startTriage(teamIndex) {
+  const wgc = getWGC();
+  if (!wgc) return false;
+  if (typeof wgc.startOperation !== 'function') return false;
+
+  if (typeof wgc.setStance === 'function') wgc.setStance(teamIndex, CFG.triageHazardStance);
+  if (typeof wgc.setArtifactStance === 'function') wgc.setArtifactStance(teamIndex, CFG.triageArtifactStance);
+
+  const d = Math.max(0, Math.floor(CFG.triageDifficulty || 0));
+  wgc.startOperation(teamIndex, d);
+
+  // keep-going behavior consistent with your script
+  if (CFG.keepGoingMode === 'native' && CFG.forceKeepGoingTick) setKeepGoing(teamIndex, true);
+  if (CFG.keepGoingMode === 'script') setKeepGoing(teamIndex, false);
+
+  tryUpdateWgcUI();
+
+  const hp = Math.round(teamHpRatio(wgc.teams?.[teamIndex] || []) * 100);
+  logEvt('H', teamIndex, hp, Math.round(CFG.triageAssumedOpMinutes * 60), d); // H = triage heal op
+  return true;
+}
 
     /********************************************************************
      * Recalc throttling queue
@@ -1345,12 +1468,16 @@ function tryAutoBuyWgtEquipment() {
       // Decide which teams may do heavy recompute this cycle
       let heavySlots = CFG.maxRecalcTeamsPerCycle;
       const heavyAllow = new Set();
-      while (heavySlots > 0 && recalcQueue.length > 0) {
-        heavyAllow.add(recalcQueue[0]);
+
+      // Pick the first eligible teams from the queue (don’t stall on an ineligible front item)
+      for (let qi = 0; qi < recalcQueue.length && heavySlots > 0; qi++) {
+        const ti = recalcQueue[qi];
+        if (typeof wgc.isTeamUnlocked === 'function' && !wgc.isTeamUnlocked(ti)) continue;
+        const team = wgc.teams?.[ti];
+        if (!Array.isArray(team) || team.some(m => !m)) continue;
+        heavyAllow.add(ti);
         heavySlots--;
-        // keep in queue until successfully computed (removed there)
-        break;
-      }
+}
 
       // Predicted total
       let predTotal = 0;
@@ -1373,15 +1500,19 @@ function tryAutoBuyWgtEquipment() {
           pendingRetune.delete(ti);
           applyPlanIfIdle(ti, plan);
 
-          if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
-            const hp = Math.round(teamHpRatio(team)*100);
-            wgc.startOperation(ti, plan.difficulty);
-            if (CFG.keepGoingMode === 'native' && CFG.forceKeepGoingTick) setKeepGoing(ti, true);
-            tryUpdateWgcUI();
-            logEvt('T', ti, hp, 0, plan.difficulty);
-          }
-          await maybeYield(budget);
-          continue;
+if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
+  const hp = Math.round(teamHpRatio(team)*100);
+  wgc.startOperation(ti, plan.difficulty);
+  if (CFG.keepGoingMode === 'native' && CFG.forceKeepGoingTick) setKeepGoing(ti, true);
+  tryUpdateWgcUI();
+  logEvt('T', ti, hp, 0, plan.difficulty);
+} else if (CFG.triageMode && !teamReady(team)) {
+  const dec = triageDecision(team, wgc.facilities || {});
+  if (dec) startTriage(ti);
+}
+await maybeYield(budget);
+continue;
+
         }
 
         const allowHeavy = heavyAllow.has(ti);
@@ -1417,15 +1548,26 @@ function tryAutoBuyWgtEquipment() {
 
         applyPlanIfIdle(ti, plan);
 
-        if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
-          const hp = Math.round(teamHpRatio(team)*100);
-          wgc.startOperation(ti, plan.difficulty);
-          if (CFG.keepGoingMode === 'native' && CFG.forceKeepGoingTick) setKeepGoing(ti, true);
-          tryUpdateWgcUI();
-          logEvt('T', ti, hp, 0, plan.difficulty);
-        } else {
-          logEvt('N', ti, Math.round(teamHpRatio(team)*100), 0, plan.difficulty);
-        }
+if (CFG.autoStartIdleTeams && teamReady(team) && typeof wgc.startOperation === 'function') {
+  const hp = Math.round(teamHpRatio(team)*100);
+  wgc.startOperation(ti, plan.difficulty);
+  if (CFG.keepGoingMode === 'native' && CFG.forceKeepGoingTick) setKeepGoing(ti, true);
+  tryUpdateWgcUI();
+  logEvt('T', ti, hp, 0, plan.difficulty);
+} else {
+  // Not ready -> triage if it's worth it, otherwise rest
+  if (CFG.triageMode && !teamReady(team)) {
+    const dec = triageDecision(team, wgc.facilities || {});
+    if (dec) {
+      startTriage(ti);
+    } else {
+      logEvt('N', ti, Math.round(teamHpRatio(team)*100), 0, plan.difficulty);
+    }
+  } else {
+    logEvt('N', ti, Math.round(teamHpRatio(team)*100), 0, plan.difficulty);
+  }
+}
+
 
         await maybeYield(budget);
       }
@@ -1461,9 +1603,26 @@ function tryAutoBuyWgtEquipment() {
     /********************************************************************
      * UI (draggable)
      ********************************************************************/
-    const LS_POS_KEY = 'ttWgcOpt.panelPos.v121';
+    const LS_POS_KEY = 'ttWgcOpt.panelPos.v126';
     let panel = null;
 
+    const LS_RD_CAP_KEY = 'ttWgcOpt.rdCapOther.v126';
+    (function loadRdCap(){
+      try {
+        const raw = localStorage.getItem(LS_RD_CAP_KEY);
+        if (raw == null) return;
+        const v = Number(raw);
+        if (Number.isFinite(v) && v >= 0) CFG.rdMaxOtherUpgrades = v;
+      } catch (_) {}
+    })();
+    function saveRdCap(v) {
+  try {
+    if (v == null || v === Infinity) localStorage.removeItem(LS_RD_CAP_KEY);
+    else localStorage.setItem(LS_RD_CAP_KEY, String(Math.max(0, Math.floor(v))));
+  } catch (_) {}
+}
+
+    
     function loadPos() { try { const raw = localStorage.getItem(LS_POS_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } }
     function savePos(left, top) { try { localStorage.setItem(LS_POS_KEY, JSON.stringify({ left, top })); } catch (_) {} }
     function clampToViewport(left, top, rect) {
@@ -1483,6 +1642,11 @@ function tryAutoBuyWgtEquipment() {
 
     function refreshPanel() {
       if (!panel) return;
+// keep R&D cap input synced (unless focused)
+const capInput = panel.querySelector('#tt-wgc-rdcap');
+if (capInput && document.activeElement !== capInput) {
+  capInput.value = Number.isFinite(CFG.rdMaxOtherUpgrades) ? String(CFG.rdMaxOtherUpgrades) : '';
+}
 
       const wgc = getWGC();
       const vUnits = getArtifactValueUnits();
@@ -1605,6 +1769,14 @@ function tryAutoBuyWgtEquipment() {
             Enabled
           </label>
           <button id="tt-wgc-recalc" title="Queues recalculation (spread across cycles)." style="${btnCss('rgba(255,255,255,0.10)','rgba(255,255,255,0.14)')}">Recalc</button>
+        <label title="Caps purchases of non-WGT R&D upgrades (WGT equipment is always maxed first)."
+       style="display:flex;gap:6px;align-items:center;opacity:0.95;">
+  R&D cap
+  <input id="tt-wgc-rdcap" type="number" min="0" step="1"
+         style="width:72px;background:rgba(255,255,255,0.10);border:1px solid rgba(255,255,255,0.18);border-radius:8px;padding:3px 6px;color:#e8eefc;"
+         value="">
+</label>
+
         </div>
 
         <div id="tt-wgc-status" style="margin-top:2px;opacity:0.92;line-height:1.35;"></div>
@@ -1621,6 +1793,37 @@ function tryAutoBuyWgtEquipment() {
         refreshPanel();
       });
       panel.querySelector('#tt-wgc-recalc').addEventListener('click', () => { forceRecalc(); refreshPanel(); });
+// R&D cap input wiring
+const capInput = panel.querySelector('#tt-wgc-rdcap');
+
+function syncCapInput() {
+  if (!capInput) return;
+  if (document.activeElement === capInput) return; // don't fight while typing
+  capInput.value = Number.isFinite(CFG.rdMaxOtherUpgrades) ? String(CFG.rdMaxOtherUpgrades) : '';
+}
+
+syncCapInput();
+
+capInput.addEventListener('change', () => {
+  const raw = (capInput.value || '').trim();
+  if (raw === '') {
+    CFG.rdMaxOtherUpgrades = Infinity;
+    saveRdCap(Infinity);
+  } else {
+    const v = Math.floor(Number(raw));
+    if (Number.isFinite(v) && v >= 0) {
+      CFG.rdMaxOtherUpgrades = v;
+      saveRdCap(v);
+    } else {
+      // invalid -> revert to Infinity
+      CFG.rdMaxOtherUpgrades = Infinity;
+      saveRdCap(Infinity);
+      capInput.value = '';
+    }
+  }
+  scheduleCycle();
+  refreshPanel();
+});
 
       // Drag (movement threshold + global release)
       const drag = panel.querySelector('#tt-wgc-dragbar');
@@ -1712,7 +1915,7 @@ function tryAutoBuyWgtEquipment() {
       }
 
       const payload = {
-        v: '1.2.1',
+        v: '1.2.6',
         t: now(),
         cfg: {
           e:+CFG.enabled,
@@ -1783,7 +1986,7 @@ function tryAutoBuyWgtEquipment() {
 
   // Inject into PAGE scope
   const s = document.createElement('script');
-  s.id = 'tt-wgc-optimiser-injected-v121';
+  s.id = 'tt-wgc-optimiser-injected-v126';
   s.textContent = `(${injectedMain.toString()})();`;
   (document.documentElement || document.head || document.body).appendChild(s);
   s.remove();
