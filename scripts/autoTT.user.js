@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto TT
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts/scripts/autoTT.user.js
-// @version      0.0.4
+// @version      0.0.5
 // @description  automation for Terraforming Titans.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @grant        none
@@ -10,40 +10,41 @@
 (() => {
   'use strict';
 
-  console.log('[autoTT] loaded ✅', { url: location.href, readyState: document.readyState });
+  console.log('[autoTT] loaded ✅');
 
-  // Show iframes (if the game UI is inside one, we need to match that iframe URL too)
-  const frames = [...document.querySelectorAll('iframe')].map(f => f.src).filter(Boolean);
-  console.log('[autoTT] iframes found:', frames);
+  function readTerraformingStats() {
+    const el = document.querySelector('#world-terraforming');
+    if (!el) {
+      console.log('[autoTT] #world-terraforming not found');
+      return null;
+    }
 
-  // Attach click listener immediately (no DOMContentLoaded needed)
-  document.addEventListener(
-    'click',
-    (e) => {
-      // This should log on ANY click anywhere in this document
-      console.log('[autoTT] click detected', {
-        alt: e.altKey,
-        shift: e.shiftKey,
-        ctrl: e.ctrlKey,
-        meta: e.metaKey,
-        targetTag: e.target?.tagName?.toLowerCase() || null,
-        targetId: e.target?.id || null,
-      });
+    const text = el.textContent.trim().replace(/\s+/g, ' ');
+    // Example: "Pop: 47.5Q CO2: 0.00 kPa"
 
-      // Only do the "picker" output when Alt is held
-      if (!e.altKey) return;
+    // Capture numbers + suffix letters (K/M/B/T/Q etc) for Pop, and a float for CO2
+    const popMatch = text.match(/Pop:\s*([0-9.]+[A-Za-z]?)/);
+    const co2Match = text.match(/CO2:\s*([0-9.]+)/);
 
-      const el = e.target;
-      const selector = el?.id ? `#${CSS.escape(el.id)}` : null;
+    const stats = {
+      rawText: text,
+      pop: popMatch ? popMatch[1] : null,
+      co2: co2Match ? Number(co2Match[1]) : null,
+    };
 
-      console.log('[autoTT] Alt+Click PICK:', {
-        selector,
-        tag: el?.tagName?.toLowerCase() || null,
-        id: el?.id || null,
-        classes: el?.className || null,
-        text: (el?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80) || null,
-      }, el);
-    },
-    true // capture phase helps catch clicks before the game eats them
-  );
+    console.log('[autoTT] stats:', stats);
+    return stats;
+  }
+
+  // Hotkey: press "T" to log stats
+  document.addEventListener('keydown', (e) => {
+    // ignore when typing in inputs (safe habit)
+    const tag = document.activeElement?.tagName?.toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return;
+
+    if (e.key.toLowerCase() === 't') {
+      readTerraformingStats();
+    }
+  });
 })();
+
