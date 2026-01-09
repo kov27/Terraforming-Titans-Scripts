@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto TT
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts/scripts/autoTT.user.js
-// @version      0.0.3
+// @version      0.0.4
 // @description  automation for Terraforming Titans.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @grant        none
