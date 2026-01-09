@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto TT
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts/scripts/autoTT.user.js
-// @version      0.0.2
+// @version      0.0.3
 // @description  automation for Terraforming Titans.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @grant        none
@@ -10,40 +10,40 @@
 (() => {
   'use strict';
 
-  console.log('[autoTT] loaded ✅');
+  console.log('[autoTT] loaded ✅', { url: location.href, readyState: document.readyState });
 
-  // Build a simple CSS selector for an element.
-  // Best case: it has an id, because #id is very reliable.
-  function simpleSelector(el) {
-    if (!el) return null;
+  // Show iframes (if the game UI is inside one, we need to match that iframe URL too)
+  const frames = [...document.querySelectorAll('iframe')].map(f => f.src).filter(Boolean);
+  console.log('[autoTT] iframes found:', frames);
 
-    if (el.id) return `#${CSS.escape(el.id)}`;
+  // Attach click listener immediately (no DOMContentLoaded needed)
+  document.addEventListener(
+    'click',
+    (e) => {
+      // This should log on ANY click anywhere in this document
+      console.log('[autoTT] click detected', {
+        alt: e.altKey,
+        shift: e.shiftKey,
+        ctrl: e.ctrlKey,
+        meta: e.metaKey,
+        targetTag: e.target?.tagName?.toLowerCase() || null,
+        targetId: e.target?.id || null,
+      });
 
-    // If no id, fall back to tag + first class (less reliable, but useful for exploration)
-    const tag = el.tagName ? el.tagName.toLowerCase() : 'unknown';
-    const firstClass = el.classList && el.classList.length ? `.${CSS.escape(el.classList[0])}` : '';
-    return tag + firstClass;
-  }
-
-  // Wait until the HTML is loaded before wiring events
-  document.addEventListener('DOMContentLoaded', () => {
-    console.log('[autoTT] DOM ready ✅');
-
-    // Alt+Click anywhere to inspect what you clicked
-    document.addEventListener('click', (e) => {
-      if (!e.altKey) return; // only do this when Alt is held
+      // Only do the "picker" output when Alt is held
+      if (!e.altKey) return;
 
       const el = e.target;
+      const selector = el?.id ? `#${CSS.escape(el.id)}` : null;
 
-      const info = {
-        selector: simpleSelector(el),
-        tag: el.tagName?.toLowerCase() || null,
-        id: el.id || null,
-        classes: el.className || null,
-        text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80) || null,
-      };
-
-      console.log('[autoTT] Alt+Click picked:', info, el);
-    });
-  });
+      console.log('[autoTT] Alt+Click PICK:', {
+        selector,
+        tag: el?.tagName?.toLowerCase() || null,
+        id: el?.id || null,
+        classes: el?.className || null,
+        text: (el?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80) || null,
+      }, el);
+    },
+    true // capture phase helps catch clicks before the game eats them
+  );
 })();
