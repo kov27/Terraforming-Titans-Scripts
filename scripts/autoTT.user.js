@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto TT
 // @namespace    https://github.com/kov27/Terraforming-Titans-Scripts/scripts/autoTT.user.js
-// @version      0.0.6
+// @version      0.0.7
 // @description  automation for Terraforming Titans.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @grant        none
@@ -12,60 +12,52 @@
 
   console.log('[autoTT] loaded ✅');
 
-  function readTerraformingStats() {
-    const el = document.querySelector('#world-terraforming');
-    if (!el) return null;
+  // Turn an element into a CSS selector we can use later with querySelector()
+  function makeSelector(el) {
+    // Best: use the nearest parent that has an id (often buttons contain inner spans/divs)
+    const withId = el.id ? el : el.closest?.('[id]');
+    if (withId && withId.id) return `#${CSS.escape(withId.id)}`;
 
-    const text = el.textContent.trim().replace(/\s+/g, ' ');
-    const popMatch = text.match(/Pop:\s*([0-9.]+[A-Za-z]?)/);
-    const co2Match = text.match(/CO2:\s*([0-9.]+)/);
-
-    return {
-      rawText: text,
-      pop: popMatch ? popMatch[1] : null,
-      co2: co2Match ? Number(co2Match[1]) : null,
-    };
+    // Fallback: tag + first class (useful for exploring, but not always stable)
+    const tag = el.tagName ? el.tagName.toLowerCase() : 'unknown';
+    const firstClass = el.classList?.length ? `.${CSS.escape(el.classList[0])}` : '';
+    return tag + firstClass;
   }
 
-  // Create a small overlay once
-  function createOverlay() {
-    const box = document.createElement('div');
-    box.id = 'autoTT-overlay';
-    box.style.position = 'fixed';
-    box.style.top = '10px';
-    box.style.left = '10px';
-    box.style.zIndex = '999999';
-    box.style.padding = '8px 10px';
-    box.style.borderRadius = '10px';
-    box.style.background = 'rgba(0,0,0,0.75)';
-    box.style.color = 'white';
-    box.style.font = '12px/1.2 sans-serif';
-    box.textContent = 'autoTT: (press T)';
+  // Alt+Click anything to log what it is
+  document.addEventListener(
+    'click',
+    (e) => {
+      if (!e.altKey) return;
 
-    document.documentElement.appendChild(box);
-    return box;
-  }
+      const el = e.target;
+      const selector = makeSelector(el);
 
-  const overlay = createOverlay();
+      const text = (el.textContent || '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .slice(0, 80);
 
-  function updateOverlay() {
-    const stats = readTerraformingStats();
-    if (!stats) {
-      overlay.textContent = 'autoTT: stats not found';
-      return;
-    }
+      console.log('[autoTT PICK]', {
+        selector,
+        tag: el.tagName?.toLowerCase() || null,
+        id: el.id || null,
+        classes: el.className || null,
+        textPreview: text || null,
+      }, el);
 
-    overlay.textContent = `autoTT | Pop: ${stats.pop} | CO2: ${stats.co2} kPa`;
-    console.log('[autoTT] stats:', stats);
-  }
+      // Optional: Alt+Shift+Click copies the selector to clipboard
+      if (e.shiftKey) {
+        navigator.clipboard.writeText(selector).then(
+          () => console.log('[autoTT] copied:', selector),
+          () => console.log('[autoTT] copy failed (browser blocked it):', selector)
+        );
+      }
 
-  // Press "T" to update overlay + log stats
-  document.addEventListener('keydown', (e) => {
-    const tag = document.activeElement?.tagName?.toLowerCase();
-    if (tag === 'input' || tag === 'textarea') return;
-
-    if (e.key.toLowerCase() === 't') {
-      updateOverlay();
-    }
-  });
+      // Stop the game also handling this click
+      e.preventDefault();
+      e.stopPropagation();
+    },
+    true // capture phase helps if the game consumes clicks
+  );
 })();
