@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto TT
-// @namespace    auto-tt
-// @version      0.0.1
+// @namespace    https://github.com/kov27/Terraforming-Titans-Scripts/scripts/autoTT.user.js
+// @version      0.0.2
 // @description  automation for Terraforming Titans.
 // @match        https://html-classic.itch.zone/html/*/index.html
 // @grant        none
@@ -10,22 +10,40 @@
 (() => {
   'use strict';
 
-  // 1) Console proof (open DevTools -> Console)
-  console.log('[autoTT] userscript loaded ✅', { url: location.href, time: new Date().toISOString() });
+  console.log('[autoTT] loaded ✅');
 
-  // 2) On-page proof (a small banner)
-  const badge = document.createElement('div');
-  badge.textContent = 'autoTT loaded ✅';
-  badge.style.position = 'fixed';
-  badge.style.top = '10px';
-  badge.style.right = '10px';
-  badge.style.zIndex = '999999';
-  badge.style.padding = '6px 10px';
-  badge.style.font = '12px/1.2 sans-serif';
-  badge.style.background = 'rgba(0,0,0,0.75)';
-  badge.style.color = 'white';
-  badge.style.borderRadius = '8px';
-  document.documentElement.appendChild(badge);
+  // Build a simple CSS selector for an element.
+  // Best case: it has an id, because #id is very reliable.
+  function simpleSelector(el) {
+    if (!el) return null;
 
-  setTimeout(() => badge.remove(), 2500);
+    if (el.id) return `#${CSS.escape(el.id)}`;
+
+    // If no id, fall back to tag + first class (less reliable, but useful for exploration)
+    const tag = el.tagName ? el.tagName.toLowerCase() : 'unknown';
+    const firstClass = el.classList && el.classList.length ? `.${CSS.escape(el.classList[0])}` : '';
+    return tag + firstClass;
+  }
+
+  // Wait until the HTML is loaded before wiring events
+  document.addEventListener('DOMContentLoaded', () => {
+    console.log('[autoTT] DOM ready ✅');
+
+    // Alt+Click anywhere to inspect what you clicked
+    document.addEventListener('click', (e) => {
+      if (!e.altKey) return; // only do this when Alt is held
+
+      const el = e.target;
+
+      const info = {
+        selector: simpleSelector(el),
+        tag: el.tagName?.toLowerCase() || null,
+        id: el.id || null,
+        classes: el.className || null,
+        text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80) || null,
+      };
+
+      console.log('[autoTT] Alt+Click picked:', info, el);
+    });
+  });
 })();
